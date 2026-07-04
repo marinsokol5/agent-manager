@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+*.xcodeproj
+homes/
+.DS_Store
+
+# Local Claude Code settings (personal paths / machine-specific permissions)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Internal-only notes (strategy / product proposals) — not for the public repo
+internal/
