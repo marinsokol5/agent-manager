@@ -34,13 +34,14 @@ RELEASE_ZIP = .build/AgentManager-$(VERSION).zip
 APP_BUNDLE = .build/AgentManager.app
 CONTENTS = $(APP_BUNDLE)/Contents
 
-.PHONY: build run clean release
+.PHONY: build run clean release icon
 
 build:
 	swift build -c $(CONFIG)
 	rm -rf $(APP_BUNDLE)
 	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources $(CONTENTS)/Library/LaunchDaemons
 	cp Support/Info.plist $(CONTENTS)/Info.plist
+	cp Support/AgentManager.icns $(CONTENTS)/Resources/
 	cp Support/com.agent-manager.wake-helper.plist $(CONTENTS)/Library/LaunchDaemons/
 	cp $(BIN_DIR)/AgentManager $(BIN_DIR)/am $(BIN_DIR)/am-wake-helper $(CONTENTS)/MacOS/
 	cp -R $(BIN_DIR)/AgentManager_AgentManager.bundle $(CONTENTS)/Resources/
@@ -66,6 +67,17 @@ release:
 	xcrun stapler staple $(APP_BUNDLE)
 	ditto -c -k --keepParent $(APP_BUNDLE) $(RELEASE_ZIP)
 	@echo "==> Notarized, stapled release ready: $(RELEASE_ZIP)"
+
+# Regenerate Support/AgentManager.icns from the code-defined brand mark.
+# The .icns is committed, so normal builds don't run this; rerun (and commit
+# the result) after changing AgentManagerLogo.
+icon:
+	mkdir -p .build
+	swiftc -O -parse-as-library \
+		Scripts/render-icon.swift \
+		Sources/AgentManager/AgentManagerLogo.swift \
+		-o .build/render-icon
+	.build/render-icon Support/AgentManager.icns
 
 clean:
 	swift package clean

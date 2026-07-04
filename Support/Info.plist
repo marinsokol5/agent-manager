@@ -6,6 +6,8 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>AgentManager</string>
+	<key>CFBundleIconFile</key>
+	<string>AgentManager</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.agent-manager.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>
