@@ -10,6 +10,29 @@ import SwiftUI
 enum ProviderBrandIcon {
     private static var cache: [Provider: NSImage] = [:]
 
+    /// The SwiftPM resource bundle carrying the brand SVGs, resolved ourselves
+    /// rather than via `Bundle.module`.
+    ///
+    /// `Bundle.module`'s generated accessor looks for the bundle next to
+    /// `Bundle.main.bundleURL` — the *app root* for a packaged `.app` — and
+    /// otherwise falls back to a build-dir path baked in at compile time. In a
+    /// shipped `.app` the bundle lives in `Contents/Resources` (a resource bundle
+    /// can't sit at the app root — codesign rejects unsealed contents there), and
+    /// the build path is absent on any machine but the builder's, so
+    /// `Bundle.module` `fatalError`s at launch on a user's machine. We instead
+    /// look under `resourceURL` (which is `Contents/Resources` for the `.app` and
+    /// the executable's directory for a bare `swift build` binary — both correct),
+    /// and degrade to the SF Symbol fallback if it's ever missing (never crash).
+    private static let resourceBundle: Bundle? = {
+        let name = "AgentManager_AgentManager.bundle"
+        for base in [Bundle.main.resourceURL, Bundle.main.bundleURL] {
+            if let url = base?.appendingPathComponent(name), let bundle = Bundle(url: url) {
+                return bundle
+            }
+        }
+        return nil
+    }()
+
     /// Resource basename for each provider's bundled SVG.
     private static func resourceName(for provider: Provider) -> String {
         switch provider {
@@ -29,7 +52,7 @@ enum ProviderBrandIcon {
 
     static func image(for provider: Provider) -> NSImage? {
         if let cached = cache[provider] { return cached }
-        guard let url = Bundle.module.url(forResource: resourceName(for: provider), withExtension: "svg"),
+        guard let url = resourceBundle?.url(forResource: resourceName(for: provider), withExtension: "svg"),
               let image = NSImage(contentsOf: url)
         else {
             return nil
