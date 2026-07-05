@@ -1,10 +1,10 @@
 # Agent Manager
 
-MacOS app for juggling multiple Claude Code and Codex accounts on the same machine. 
+A macOS app for juggling multiple Claude Code and Codex accounts on the same machine.
 
-Allows you to run each account as separate agent session, keep an
+It lets you run each account as a separate agent session, keep an
 eye on how much usage each one has left, and warm up an account's usage
-window to increase the amount of tokens available.
+window to increase the number of tokens available.
 
 > Agent Manager only touches accounts **you own and pay for**. It drives the
 > official `claude` / `codex` CLIs and never proxies or stores your OAuth tokens —
@@ -14,7 +14,7 @@ window to increase the amount of tokens available.
 
 ### 1. Run any account independently
 
-![](screenshots/agents-view.png)
+![Agents screen: each account listed with its provider, connection status, and remaining usage](screenshots/agents-view.png)
 
 ```bash
 am run <id> [<args forwarded to claude/codex>]
@@ -38,9 +38,9 @@ The **Source home** effectively groups accounts: everything pointing at the
 same folder shares settings and history, so you can run a few work accounts
 off one source home and your personal ones off another, fully apart.
 
-### 2. Easily track usage
+### 2. Track usage at a glance
 
-Track each account usage from the menu bar (
+Track each account's usage from the menu bar (
 individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 
 <table align="center">
@@ -49,20 +49,20 @@ individual menu bar entries or one collapsed) or from the CLI (`am usage`).
     <th>Menu bar — merged</th>
   </tr>
   <tr valign="top">
-    <td><img src="screenshots/menu-bar-individual-expanded.png" width="375"></td>
-    <td><img src="screenshots/menu-bar-collapsed.png" width="375"></td>
+    <td><img src="screenshots/menu-bar-individual-expanded.png" width="375" alt="Menu bar dropdown showing each account as its own entry with its usage"></td>
+    <td><img src="screenshots/menu-bar-collapsed.png" width="375" alt="Menu bar dropdown with all accounts merged into one collapsed entry"></td>
   </tr>
   <tr>
     <th colspan="2">CLI — <code>am usage</code></th>
   </tr>
   <tr>
-    <td colspan="2"><img src="screenshots/cli-usage-new.png" width="760"></td>
+    <td colspan="2"><img src="screenshots/cli-usage.png" width="760" alt="am usage output: a one-row capacity table across all connected accounts"></td>
   </tr>
 </table>
 
 ### 3. Warm up token windows
 
-Don't start your subscription's 5-hour usage window on your first request, but at fixed moment before, to maximize amount of tokens available when working.
+Instead of starting your subscription's 5-hour usage window on your first request, start it at a fixed time beforehand, to maximize the number of tokens available when working.
 
 Simply paint your working hours in the app, flip the **Scheduler active**
 switch, and Agent Manager fires a small ping to open each account's window just
@@ -81,7 +81,7 @@ am ping <id>             # open <id>'s 5h window now (also what the scheduler ru
 
 Each ping is a real interactive turn in the official CLI over a terminal —
 never an SDK or programmatic call — to stay future-proof and not lose access
-through campaigns like
+through policy changes like
 [this one](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 
 Pings stay minimal — a couple around the edges of your day, not all night. A
@@ -92,7 +92,7 @@ ping the Mac slept through is skipped, not fired late.
 seconds before each ping, the ping runs, and the Mac goes back to sleep if
 nobody's around. Firmware rule: a closed lid only wakes on AC power.
 
-**Lid closed *on battery*?** That's the one case no software can wake on Mac, so for Claude Code accounts we use routine's compute to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences.  It keeps a tiny one-shot routine — "AgentManager Routine",
+**Lid closed *on battery*?** That's the one case no software can wake the Mac, so for Claude Code accounts we use a cloud routine's compute to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences. It keeps a tiny one-shot routine — "AgentManager Routine",
 visible at claude.ai/code/routines — armed 5 minutes after each scheduled ping.
 A ping that runs locally disarms the pending routine, so it never fires; but a ping
 the sleeping Mac misses lets Anthropic's cloud run it instead (one minimal
@@ -102,7 +102,7 @@ wake.
 ## CLI reference
 
 ```
-am run <id> [<args>]     launch a session as <id>; remaining args go to claude/codex
+am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
 am list                   list accounts with status + provider
 am usage [<id>]           capacity for connected accounts (--week, --provider, --sort, --no-color)
 am ping <id>              fire one ping now — opens <id>'s 5h window
@@ -142,7 +142,7 @@ Adding and connecting accounts, and painting your work hours, happen in the app
 ## Build & run
 
 ```bash
-git clone <your-fork-url> agent-manager
+git clone https://github.com/marinsokol5/agent-manager.git agent-manager
 cd agent-manager
 
 swift build            # library, CLI, and app
@@ -192,3 +192,10 @@ the app and CLI are thin layers over it.
 ## License
 
 [MIT](LICENSE) © 2026 Marin Sokol
+
+---
+
+_Agent Manager is an independent project — not affiliated with, endorsed by, or
+sponsored by Anthropic or OpenAI. "Claude", "Claude Code", and "Codex" are
+trademarks of their respective owners. It manages only accounts you own and pay
+for, and drives each provider's official CLI._

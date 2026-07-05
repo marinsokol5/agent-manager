@@ -43,16 +43,25 @@ build:
 	cp Support/Info.plist $(CONTENTS)/Info.plist
 	cp Support/AgentManager.icns $(CONTENTS)/Resources/
 	cp Support/com.agent-manager.wake-helper.plist $(CONTENTS)/Library/LaunchDaemons/
-	cp $(BIN_DIR)/AgentManager $(BIN_DIR)/am $(BIN_DIR)/am-wake-helper $(CONTENTS)/MacOS/
+	cp $(BIN_DIR)/am $(BIN_DIR)/am-wake-helper $(CONTENTS)/MacOS/
+	cp $(BIN_DIR)/AgentManager "$(CONTENTS)/MacOS/Agent Manager"
 	cp -R $(BIN_DIR)/AgentManager_AgentManager.bundle $(CONTENTS)/Resources/
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(CONTENTS)/MacOS/am-wake-helper
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(CONTENTS)/MacOS/am
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(APP_BUNDLE)
 
 run: build
-	pkill -x AgentManager 2>/dev/null || true
+	pkill -x "Agent Manager" 2>/dev/null || true
 	sleep 0.2
 	open $(APP_BUNDLE)
+
+# release progress helpers -------------------------------------------------
+# `make release` stamps an epoch at the top of the recipe and timestamps each
+# phase, so the long notarization wait shows elapsed [mm:ss] instead of going
+# silent. $(call elapsed,<msg>) prints "==> [mm:ss] <msg>"; messages must not
+# contain commas — $(call) treats a comma as an argument separator.
+RELEASE_START = .build/.release-start
+elapsed = t=$$(( $$(date +%s) - $$(cat $(RELEASE_START)) )); printf '==> [%02d:%02d] %s\n' $$((t/60)) $$((t%60)) "$(1)"
 
 # Build, notarize, and staple a distributable zip at $(RELEASE_ZIP).
 # The zip is submitted for notarization, the *app* gets the ticket stapled
@@ -60,12 +69,20 @@ run: build
 # stapled app so offline Gatekeeper checks pass for downloaders.
 # Publishing is then e.g.: gh release create v$(VERSION) $(RELEASE_ZIP)
 release:
+	@mkdir -p .build && date +%s > $(RELEASE_START)
+	@$(call elapsed,running tests)
 	swift test
+	@$(call elapsed,building signed release bundle)
 	$(MAKE) build CONFIG=release CODESIGN_FLAGS="--options runtime --timestamp"
+	@$(call elapsed,zipping bundle for notary submission)
 	ditto -c -k --keepParent $(APP_BUNDLE) $(RELEASE_ZIP)
+	@$(call elapsed,submitting to Apple notary — the slow part (usually 1-15 min))
 	xcrun notarytool submit $(RELEASE_ZIP) --keychain-profile $(NOTARY_PROFILE) --wait
+	@$(call elapsed,stapling notarization ticket to the app)
 	xcrun stapler staple $(APP_BUNDLE)
+	@$(call elapsed,re-zipping the stapled app)
 	ditto -c -k --keepParent $(APP_BUNDLE) $(RELEASE_ZIP)
+	@$(call elapsed,done)
 	@echo "==> Notarized, stapled release ready: $(RELEASE_ZIP)"
 
 # Regenerate Support/AgentManager.icns from the code-defined brand mark.
