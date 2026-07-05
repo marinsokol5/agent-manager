@@ -1,4 +1,7 @@
-# Agent Manager
+<h1>
+  <img src="assets/logo.png" width="32" alt="" align="center">
+  Agent Manager
+</h1>
 
 A macOS app for juggling multiple Claude Code and Codex accounts on the same machine.
 
