@@ -398,11 +398,14 @@ public actor SchedulerDaemon {
 
     // MARK: - the real ping runner
 
-    /// Spawn `am ping <id> --root <root> --manage-sleep --scheduled-for <epoch>`
-    /// and wait for it, appending its output to the same per-account log files
-    /// launchd used to write. A hard `timeout` (well past the ping's own internal
-    /// one) guards the sequential queue against a wedged PTY: SIGTERM, then
-    /// SIGKILL if the child ignores it.
+    /// Spawn `am ping <id> --manage-sleep --scheduled-for <epoch>` — the
+    /// workspace root travels as `AGENT_MANAGER_ROOT` in the child's env, set
+    /// explicitly (not just inherited) so a hand-run daemon serving a custom
+    /// root still points its pings at that root — and wait for it, appending
+    /// its output to the same per-account log files launchd used to write. A
+    /// hard `timeout` (well past the ping's own internal one) guards the
+    /// sequential queue against a wedged PTY: SIGTERM, then SIGKILL if the
+    /// child ignores it.
     public static func spawningPingRunner(
         program: String,
         workspace: Workspace,
@@ -421,10 +424,11 @@ public actor SchedulerDaemon {
             process.executableURL = URL(fileURLWithPath: program)
             process.arguments = [
                 "ping", request.accountID,
-                "--root", root,
                 "--manage-sleep",
                 "--scheduled-for", String(Int(request.scheduledFor.timeIntervalSince1970)),
             ]
+            process.environment = ProcessInfo.processInfo.environment
+                .merging(["AGENT_MANAGER_ROOT": root]) { _, ours in ours }
             let out = appendHandle(logsDir.appendingPathComponent("\(request.accountID).out.log"), fileManager: fileManager)
             let err = appendHandle(logsDir.appendingPathComponent("\(request.accountID).err.log"), fileManager: fileManager)
             process.standardOutput = out ?? FileHandle.nullDevice

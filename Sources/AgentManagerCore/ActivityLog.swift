@@ -47,20 +47,8 @@ public struct ActivityLog {
     public func append(_ record: ActivityRecord) {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard var data = try? encoder.encode(record) else { return }
-        data.append(0x0A)
-
-        let dir = fileURL.deletingLastPathComponent()
-        if !fileManager.fileExists(atPath: dir.path) {
-            try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: fileURL, options: [.atomic])
-        }
+        guard let data = try? encoder.encode(record) else { return }
+        JSONLAppend.appendLine(data, to: fileURL, fileManager: fileManager)
     }
 
     /// Persist a failed ping's PTY transcript so it can be inspected later;

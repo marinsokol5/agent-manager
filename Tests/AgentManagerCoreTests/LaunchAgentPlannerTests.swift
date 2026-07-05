@@ -74,8 +74,10 @@ final class LaunchAgentPlannerTests: XCTestCase {
         XCTAssertTrue(p.contains("<string>/usr/local/bin/am</string>"))
         XCTAssertTrue(p.contains("<string>scheduler</string>"))
         XCTAssertTrue(p.contains("<string>run</string>"))
-        XCTAssertTrue(p.contains("<string>--root</string>"))
-        XCTAssertTrue(p.contains("<string>/ws/root</string>"))
+        // The workspace root travels as env, never as an argument — `am` owns
+        // no flags, so `am run` passthrough stays verbatim.
+        XCTAssertFalse(p.contains("--root"))
+        XCTAssertTrue(p.contains("<key>AGENT_MANAGER_ROOT</key><string>/ws/root</string>"))
         XCTAssertTrue(p.contains("<key>KeepAlive</key>"))
         XCTAssertTrue(p.contains("<key>RunAtLoad</key>"))
         XCTAssertTrue(p.contains("<key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string>"))
@@ -84,10 +86,11 @@ final class LaunchAgentPlannerTests: XCTestCase {
         XCTAssertFalse(p.contains("StartCalendarInterval"))
     }
 
-    func testSchedulerPlistOmitsEnvBlockWhenNoEnv() {
+    func testSchedulerPlistBakesRootEvenWithNoOtherEnv() {
         let p = LaunchAgentPlanner.renderSchedulerAgentPlist(
             program: "/usr/local/bin/am", root: "/ws", logDir: "/ws/logs")
-        XCTAssertFalse(p.contains("EnvironmentVariables"))
+        XCTAssertTrue(p.contains("<key>EnvironmentVariables</key>"))
+        XCTAssertTrue(p.contains("<key>AGENT_MANAGER_ROOT</key><string>/ws</string>"))
     }
 
     /// The no-notification invariant depends on the rendering being a pure

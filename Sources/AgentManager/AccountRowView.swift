@@ -66,9 +66,10 @@ struct AccountRowView: View {
         HStack(spacing: 12) {
             reorderControl
 
-            Circle()
-                .fill(Color(hex: account.color))
-                .frame(width: 12, height: 12)
+            ProviderGlyph(provider: account.provider, size: 18)
+                .foregroundStyle(Color(hex: account.color))
+                .frame(width: 22)
+                .help("\(account.provider.displayName) · tinted with this agent's color")
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
@@ -240,9 +241,8 @@ struct AccountRowView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
 
-            touchRow("house", "Config home", account.home)
+            touchRow("house", "Config home", abbreviatingHome(account.home))
             touchRow("key.horizontal", credentialLabel, credentialValue)
-            touchRow("clock.badge", "Background job", jobLabelText)
 
             Text("All local. Tokens never leave this Mac, and your default \(account.provider.displayName) login is never modified or swapped.")
                 .font(.system(size: 10.5))
@@ -287,15 +287,6 @@ struct AccountRowView: View {
         case .codex:
             return "\(account.provider.identityFileName) (in home)"
         }
-    }
-
-    /// This agent's slice of the resident scheduler (one launchd agent fires
-    /// every account's pings; there is no per-account job anymore).
-    private var jobLabelText: String {
-        guard let status = model.schedulerStatus?.accounts.first(where: { $0.accountID == account.id }),
-              status.scheduled
-        else { return "not scheduled" }
-        return "\(LaunchAgentPlanner.schedulerLabel) · \(status.pingsPerWeek) pings/wk"
     }
 
     // MARK: Usage

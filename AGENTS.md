@@ -174,6 +174,63 @@ Secrets are *not* among these: Claude's token stays in the login Keychain
 (read-only, keyed by config-dir hash); Codex's tokens stay in the per-account
 `auth.json` the CLI wrote inside the `0o700` home.
 
+## Runbook: what happened last night?
+
+Everything below lives in the workspace root above. The three logs are
+append-only JSONL with ISO-8601 timestamps **in UTC** — convert before
+correlating with wall-clock reports or `pmset` output, which are local time.
+Parse defensively (`jq -cR 'fromjson? | select(type == "object") | …'`): the
+in-app readers skip undecodable lines, and so should you. Monitoring shows a
+rolling recent window of the same files — for forensics, read the files.
+
+Work the chain in this order:
+
+1. **Was the daemon alive?** `scheduler-status.json` is the heartbeat,
+   rewritten every tick. `updatedAt` more than ~3 min stale at some point
+   means the daemon was dead or unloaded then; `startedAt`/`pid` reveal
+   restarts; `lastHandled` is the per-account watermark of the last fire it
+   handled (fired *or* deliberately dropped); `upcoming` is what it planned
+   next. `am scheduler status` pretty-prints it.
+2. **Did each fire happen, skip, or fail?** `audit.log.jsonl`, keyed by the
+   dotted `action` field: `scheduler.start` marks a daemon (re)launch; each
+   attempt is `ping.start` → `ping` (with `ok` and a one-line `detail`);
+   deliberate drops are `ping.skip`, whose detail says why — `"stale ping
+   (due 34m ago)"`, `"N stale pings (slept through…)"`, or `"cloud routine
+   covered this fire"`. Cloud-fallback arming appears as `routine.create` /
+   `routine.arm` / `routine.disable` — and since `cloud-fallback-state.json`
+   only holds the *current* arming, the last `routine.arm` with `ok: true`
+   before the night is what tells you what was armed going in. Caveat: a
+   plain "stale ping" skip does *not* rule out cloud coverage — the daemon
+   can only log `"cloud routine covered…"` when it can reach the routines
+   API at tick time (an expired token there means it reports a bare stale
+   skip); cross-check with the anchor time in step 4. Audit timestamps are
+   also a sleep proxy: on a closed-lid Mac the daemon only ticks during dark
+   wakes, so gaps between entries mirror when the machine was actually up.
+3. **Did the window actually anchor?** `activity.jsonl` has one record per
+   ping outcome, and `anchored` is the truth signal, not `ok`: a stale skip
+   is `ok: true, anchored: false`, while a cloud-covered fire is
+   `anchored: true` with no local ping. A failed ping's `transcriptPath`
+   points at the saved PTY transcript (`logs/<account>-<epoch>.transcript`) —
+   read that to see what the official CLI actually printed.
+4. **What went over the wire?** `network.jsonl` records every HTTP exchange
+   (usage fetches, trigger calls) with request and response, credential
+   headers redacted, bodies capped at 16 KB. A run of 429s here explains
+   empty usage readings (see also `usage-ratelimit.json` for the backoff).
+   The captured usage *response bodies* are also the ground truth for when a
+   window anchored: `resets_at − 5 h` is the anchor time — an anchor while
+   the Mac was provably asleep is the cloud routine's fingerprint.
+5. **Sleep/wake questions.** The root wake helper never writes to the
+   workspace; it logs via os.log — `log show --last 12h --predicate
+   'subsystem == "com.agent-manager"'`. For ground truth on the machine
+   itself, `pmset -g log | grep -E "DarkWake|Entering Sleep| Wake "` gives
+   just the transitions (unfiltered output is dominated by driver-ack noise;
+   timestamps are local, not UTC), and `pmset -g sched` lists currently
+   armed RTC wakes.
+
+Exit codes, when reading daemon ↔ child traces: `am ping` exits 0 = anchored,
+2 = failed, 3 = stale-skip (`PingOutcome`); the daemon reads any unknown code
+as failed.
+
 ## Testing
 
 - `Tests/AgentManagerCoreTests` covers Core: scheduling engine, launchd plist
@@ -246,9 +303,9 @@ Secrets are *not* among these: Claude's token stays in the login Keychain
   the files are the control channel, same as the scheduler); its inputs are
   untrusted (bounded decode, ≤12 wakes ≤48 h out, no file content in logs); and
   it installs as the bundled `SMAppService` daemon (app toggle → one-time
-  System Settings approval; no `--root` arg — it discovers `/Users/*`
-  workspaces itself) with the classic root-owned-copy install as the
-  bare-binary fallback. Firmware rule: a
+  System Settings approval; no pinned workspace — it discovers `/Users/*`
+  workspaces itself) with the classic root-owned-copy install (workspace
+  pinned via `AGENT_MANAGER_ROOT` in its plist) as the bare-binary fallback. Firmware rule: a
   closed lid honors RTC wakes on **AC power only**; open lids wake on battery
   too. The RTC wake is a *dark* wake with a ~30 s leash — `SchedulerDaemon`
   bridges it with a timed `caffeinate -i -t` whenever the next fire is ≤90 s

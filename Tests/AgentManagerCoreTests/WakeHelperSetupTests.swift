@@ -52,8 +52,8 @@ final class WakeHelperSetupTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: setup.installedBinary), Data("helper-v1".utf8))
         let plist = try String(contentsOf: setup.installedPlist, encoding: .utf8)
         XCTAssertTrue(plist.contains("<string>\(WakeHelperSetup.label)</string>"))
-        XCTAssertTrue(plist.contains("<string>--root</string>"))
-        XCTAssertTrue(plist.contains("<string>\(ws.root.path)</string>"))
+        XCTAssertFalse(plist.contains("--root")) // root travels as env, never a flag
+        XCTAssertTrue(plist.contains("<key>AGENT_MANAGER_ROOT</key><string>\(ws.root.path)</string>"))
         XCTAssertTrue(plist.contains("<key>KeepAlive</key><true/>"))
         // Bootstrapped into the *system* domain — the whole point of the helper.
         XCTAssertTrue(fake.calls.contains { $0 == ["bootstrap", "system", setup.installedPlist.path] })
@@ -138,6 +138,22 @@ final class WakeHelperSetupTests: XCTestCase {
         let plist = setup.renderPlist()
         XCTAssertFalse(plist.contains("A & B <C>")) // must be escaped in the XML…
         XCTAssertEqual(WakeHelperSetup.parseRootArgument(inPlist: plist), nasty.path) // …and parse back exactly
+    }
+
+    /// Plists installed before the env-var switch baked the root as a `--root`
+    /// program argument; status must keep reading those until they're re-installed.
+    func testParseRootArgumentReadsLegacyArgumentForm() {
+        let legacy = """
+        <key>ProgramArguments</key>
+        <array>
+          <string>/Library/PrivilegedHelperTools/am-wake-helper</string>
+          <string>--root</string>
+          <string>/Users/x/Library/Application Support/AgentManager</string>
+        </array>
+        """
+        XCTAssertEqual(
+            WakeHelperSetup.parseRootArgument(inPlist: legacy),
+            "/Users/x/Library/Application Support/AgentManager")
     }
 
     func testWakeConfigStoreRoundTripAndForgivingLoad() throws {

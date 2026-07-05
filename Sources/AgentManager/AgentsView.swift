@@ -53,7 +53,7 @@ struct AgentsView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Agents").font(Theme.Font.screenTitle)
-            Text("Ranked by priority — token windows fill #1 first, then #2, then #3. Reorder with the arrows. Each agent is an isolated, independently-anchored account with its own config home.")
+            Text("Each agent is an isolated, independently-anchored account with its own config home.")
                 .font(Theme.Font.body)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

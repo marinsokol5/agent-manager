@@ -72,8 +72,11 @@ public enum LaunchAgentPlanner {
     }
 
     /// Render the one `com.agent-manager.scheduler.plist` this app installs: a
-    /// `KeepAlive` agent running `am scheduler run --root <root>` — the resident
-    /// daemon that fires all scheduled pings itself.
+    /// `KeepAlive` agent running `am scheduler run` — the resident daemon that
+    /// fires all scheduled pings itself. The workspace root travels as
+    /// `AGENT_MANAGER_ROOT` in the baked environment, never as an argument —
+    /// `am` deliberately owns no flags (so `am run` passthrough stays verbatim),
+    /// and env vars are the one workspace-targeting channel everywhere.
     ///
     /// This plist must stay **byte-stable across applies**: `Scheduler.apply`
     /// rewrites/re-bootstraps it only when this rendering differs from what's on
@@ -93,19 +96,17 @@ public enum LaunchAgentPlanner {
         -> String
     {
         var programArgs = ""
-        for a in [program, "scheduler", "run", "--root", root] {
+        for a in [program, "scheduler", "run"] {
             programArgs += "    <string>\(xmlEscape(a))</string>\n"
         }
 
-        var envBlock = ""
-        let env = environment.filter { !$0.value.trimmingCharacters(in: .whitespaces).isEmpty }
-        if !env.isEmpty {
-            envBlock = "  <key>EnvironmentVariables</key>\n  <dict>\n"
-            for key in env.keys.sorted() {
-                envBlock += "    <key>\(xmlEscape(key))</key><string>\(xmlEscape(env[key]!))</string>\n"
-            }
-            envBlock += "  </dict>\n"
+        var env = environment.filter { !$0.value.trimmingCharacters(in: .whitespaces).isEmpty }
+        env["AGENT_MANAGER_ROOT"] = root
+        var envBlock = "  <key>EnvironmentVariables</key>\n  <dict>\n"
+        for key in env.keys.sorted() {
+            envBlock += "    <key>\(xmlEscape(key))</key><string>\(xmlEscape(env[key]!))</string>\n"
         }
+        envBlock += "  </dict>\n"
 
         return """
         <?xml version="1.0" encoding="UTF-8"?>

@@ -76,9 +76,12 @@ public struct WakeHelperSetup {
         return nil
     }
 
-    /// The LaunchDaemon plist. The workspace root is baked in as `--root` at
-    /// install time — that path is the admin-approved scope of what the helper
-    /// will ever read, and re-running install re-bakes it for a new workspace.
+    /// The LaunchDaemon plist. The workspace root is baked in as
+    /// `AGENT_MANAGER_ROOT` at install time — that path is the admin-approved
+    /// scope of what the helper will ever read, and re-running install re-bakes
+    /// it for a new workspace. Env, not an argument: same root-owned plist
+    /// either way, and it keeps the one workspace-targeting channel (the env
+    /// var) uniform across every binary in this repo.
     func renderPlist() -> String {
         """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -89,9 +92,11 @@ public struct WakeHelperSetup {
           <key>ProgramArguments</key>
           <array>
             <string>\(xmlEscape(installedBinary.path))</string>
-            <string>--root</string>
-            <string>\(xmlEscape(workspace.root.path))</string>
           </array>
+          <key>EnvironmentVariables</key>
+          <dict>
+            <key>AGENT_MANAGER_ROOT</key><string>\(xmlEscape(workspace.root.path))</string>
+          </dict>
           <key>RunAtLoad</key><true/>
           <key>KeepAlive</key><true/>
           <key>ProcessType</key><string>Background</string>
@@ -293,11 +298,19 @@ public struct WakeHelperSetup {
         return .starting
     }
 
-    /// Pull the `--root` value back out of an installed plist (the `<string>`
-    /// right after `<string>--root</string>`), so status can tell when the
-    /// helper is serving a different workspace than the one asking.
+    /// Pull the workspace root back out of an installed plist, so status can
+    /// tell when the helper is serving a different workspace than the one
+    /// asking. Reads the `AGENT_MANAGER_ROOT` env entry; pre-env-var installs
+    /// baked the root as a `--root` program argument instead, so that form is
+    /// still recognized until their next `sudo am wake install` rewrites them.
     static func parseRootArgument(inPlist text: String) -> String? {
-        guard let flag = text.range(of: "<string>--root</string>") else { return nil }
+        stringValue(after: "<key>AGENT_MANAGER_ROOT</key>", in: text)
+            ?? stringValue(after: "<string>--root</string>", in: text)
+    }
+
+    /// The unescaped content of the first `<string>…</string>` after `marker`.
+    private static func stringValue(after marker: String, in text: String) -> String? {
+        guard let flag = text.range(of: marker) else { return nil }
         guard let open = text.range(of: "<string>", range: flag.upperBound..<text.endIndex),
               let close = text.range(of: "</string>", range: open.upperBound..<text.endIndex) else { return nil }
         let value = String(text[open.upperBound..<close.lowerBound])

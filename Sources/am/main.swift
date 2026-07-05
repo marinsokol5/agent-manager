@@ -8,7 +8,7 @@ import Darwin
 // connect, edit, reconcile, remove) and the work-hour schedule live in the
 // Agent Manager app; the CLI keeps only the terminal-native verbs:
 //
-//   am run <id> [-- <args>]   launch a session as <id> (exec-replaces this process)
+//   am run <id> [<args>…]     launch a session as <id> (exec-replaces this process)
 //   am list                   inventory accounts + connection status
 //   am usage [<id>] [--week]  per-account capacity
 //   am ping <id>              fire one tui-ping (manual, and what the scheduler fires)
@@ -17,27 +17,30 @@ import Darwin
 //                             (the app's toggle + SMAppService is the supported path)
 
 let rawArguments = Array(CommandLine.arguments.dropFirst())
-// Honor a global `--root <path>` so a launchd-fired `am ping <id> --root <path>`
-// (and tests) target the same workspace the scheduler compiled against. Only read
-// it from the part *before* any `--` so it never shadows `am run`'s passthrough,
-// and strip it out so the remaining args dispatch normally. It's an internal
-// launchd/test knob, not an everyday flag, so it's intentionally left out of `--help`.
-let globalArgs = Array(rawArguments.prefix { $0 != "--" })
-let workspace: Workspace = value("--root", in: globalArgs)
+// The workspace comes from `AGENT_MANAGER_ROOT` (or the default app-support
+// path) — never from a flag. `am` owns no global flags, so `am run`'s
+// passthrough forwards verbatim with zero caveats.
+//
+// Compat shim: plists and daemons written before the env-var switch invoke the
+// internal verbs as `am scheduler run --root <path>` / `am ping <id> --root
+// <path> …`. Honor and strip that pair for those two verbs only, so a freshly
+// built binary keeps serving an old plist until `Scheduler.activate` rewrites
+// it (and an old daemon process's spawned pings keep landing in the right
+// workspace until it self-restarts). Delete once pre-switch installs are gone.
+let legacyRoot: String? = {
+    guard let verb = rawArguments.first, verb == "ping" || verb == "scheduler" else { return nil }
+    return value("--root", in: rawArguments)
+}()
+let workspace: Workspace = legacyRoot
     .map { Workspace(root: URL(fileURLWithPath: expandTilde($0), isDirectory: true)) }
     ?? Workspace.standard()
-let arguments = stripGlobalRoot(rawArguments)
-
-/// Remove the global `--root <value>` pair from the args, but only where it
-/// appears before any `--` separator (so `am run` passthrough is untouched).
-func stripGlobalRoot(_ args: [String]) -> [String] {
-    let dash = args.firstIndex(of: "--") ?? args.count
-    guard let i = args[..<dash].firstIndex(of: "--root") else { return args }
-    var copy = args
-    if i + 1 < dash { copy.remove(at: i + 1) }
+let arguments: [String] = {
+    guard legacyRoot != nil, let i = rawArguments.firstIndex(of: "--root") else { return rawArguments }
+    var copy = rawArguments
+    if i + 1 < copy.count { copy.remove(at: i + 1) }
     copy.remove(at: i)
     return copy
-}
+}()
 
 func fail(_ message: String, code: Int32 = 1) -> Never {
     FileHandle.standardError.write(Data("error: \(message)\n".utf8))
@@ -71,8 +74,9 @@ let usage = """
 am — Agent Manager CLI
 
 USAGE:
-  am run <id> [-- <args>]   launch a session under account <id>; everything after
-                            `--` is forwarded verbatim to the underlying claude/codex
+  am run <id> [<args>…]     launch a session under account <id>; every remaining
+                            arg is forwarded verbatim to the underlying claude/codex
+                            (a leading `--` separator is accepted and stripped)
   am list                   inventory: every account with connection status + provider
   am usage [<id>] [--provider claude|codex] [--sort tokens|time] [--week] [--no-color]
                             capacity for connected accounts (or just <id>); one-row
@@ -120,13 +124,13 @@ default:
 
 // MARK: - run (journey 2: launch an agent under an account)
 
-/// `am run <id> [-- <args>]` — resolve the account, then **replace this process**
+/// `am run <id> [<args>…]` — resolve the account, then **replace this process**
 /// with the underlying `claude`/`codex` binary under the account's isolated home.
 /// `exec` (not spawn) makes the launch terminal-native: the CLI inherits our tty,
 /// signals, and exit status, so the chosen account *is* the session.
 func runAgent(_ args: [String]) {
     guard let id = args.first, id != "--" else {
-        fail("usage: am run <id> [-- <args>]")
+        fail("usage: am run <id> [<args>…]")
     }
     // Passthrough = everything after the id, with an optional leading `--`
     // separator stripped (so both `am run x -- --model opus` and the bare
@@ -344,9 +348,9 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 /// `am ping <id>` — fire one minimal tui-ping for `id` now, anchoring its 5h
 /// window. This is the one ping operation: the manual "test ping" *and* exactly
 /// what the resident scheduler daemon spawns for each queue entry
-/// (`am ping <id> --root <root> --manage-sleep --scheduled-for <epoch>`), so a
-/// hand-run ping and a scheduled one take an identical path through
-/// `AccountPinger.ping`.
+/// (`am ping <id> --manage-sleep --scheduled-for <epoch>`, workspace via
+/// `AGENT_MANAGER_ROOT`), so a hand-run ping and a scheduled one take an
+/// identical path through `AccountPinger.ping`.
 func runPing(_ args: [String]) {
     // The positional <id>: first non-flag token that isn't a value-flag's value.
     let valueFlags: Set<String> = ["--scheduled-for"]
@@ -526,8 +530,8 @@ func runCloud(_ args: [String]) {
 /// write `wake.json`, which the helper re-reads every minute.
 func runWake(_ args: [String]) {
     // Under sudo, HOME points at /var/root — resolve the invoking user's
-    // workspace instead, unless an explicit --root already pinned it.
-    let ws = value("--root", in: globalArgs) != nil ? workspace : Workspace.sudoInvoker()
+    // workspace instead (an explicit AGENT_MANAGER_ROOT still pins it).
+    let ws = Workspace.sudoInvoker()
     let setup = WakeHelperSetup(workspace: ws)
 
     switch args.first {

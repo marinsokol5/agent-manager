@@ -3,8 +3,8 @@ import IOKit.pwr_mgt
 import WakeHelperCore
 import os
 
-/// `am-wake-helper [--root <workspace>]` — the tiny root daemon behind the
-/// "Wake Mac for pings" opt-in.
+/// `am-wake-helper` — the tiny root daemon behind the "Wake Mac for pings"
+/// opt-in.
 ///
 /// A lid-closed Mac never runs the resident scheduler, so scheduled pings are
 /// dropped as stale. Arming an RTC wake fixes that — but the wake-scheduling
@@ -12,12 +12,14 @@ import os
 /// this process exists. It is installed once, in one of two ways:
 /// - **SMAppService (preferred, no sudo):** shipped inside `AgentManager.app`
 ///   and registered by the app's toggle; the user approves once in System
-///   Settings → Login Items. No `--root` argument — the plist is sealed into
+///   Settings → Login Items. No pinned workspace — the plist is sealed into
 ///   the signed bundle — so the helper discovers every standard workspace
 ///   under `/Users/*`, each gated by its own `wake.json`.
 /// - **Classic (`sudo am wake install`):** root-owned copy in
-///   `/Library/PrivilegedHelperTools` with one explicit `--root` baked into its
-///   `/Library/LaunchDaemons` plist. Kept for bare-binary/dev setups.
+///   `/Library/PrivilegedHelperTools` with one explicit workspace baked into
+///   its `/Library/LaunchDaemons` plist as `AGENT_MANAGER_ROOT` (pre-env-var
+///   installs used a `--root` argument, still honored until their next
+///   install). Kept for bare-binary/dev setups.
 ///
 /// Design constraints, in order:
 /// - **Smallest possible root surface.** No XPC, no sockets, no subprocesses,
@@ -97,14 +99,19 @@ private func reconcile(wanted: [Date]) -> (added: Int, cancelled: Int, failed: I
 // MARK: - entry
 
 let arguments = Array(CommandLine.arguments.dropFirst())
+let environmentRoot = ProcessInfo.processInfo.environment["AGENT_MANAGER_ROOT"]?
+    .trimmingCharacters(in: .whitespacesAndNewlines)
 let explicitRoot: URL?
 switch arguments.count {
 case 0:
-    explicitRoot = nil // SMAppService mode: discover /Users/* workspaces each pass
+    // Classic installs pin one workspace via AGENT_MANAGER_ROOT in the daemon
+    // plist; the bundled SMAppService plist sets nothing, so discovery runs.
+    explicitRoot = environmentRoot.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
 case 2 where arguments[0] == "--root":
+    // Pre-env-var classic plists — honored until their next `sudo am wake install`.
     explicitRoot = URL(fileURLWithPath: arguments[1], isDirectory: true)
 default:
-    fail("usage: am-wake-helper [--root <workspace-root>]")
+    fail("usage: am-wake-helper (workspace root via AGENT_MANAGER_ROOT, or none to discover /Users/*)")
 }
 
 // IOPMSchedulePowerEvent is root-only; running unprivileged would just log a

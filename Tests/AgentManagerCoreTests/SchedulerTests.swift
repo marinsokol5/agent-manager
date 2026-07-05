@@ -100,8 +100,8 @@ final class SchedulerTests: XCTestCase {
         let contents = try String(contentsOf: agentPlist, encoding: .utf8)
         XCTAssertTrue(contents.contains("<string>scheduler</string>"))
         XCTAssertTrue(contents.contains("<string>run</string>"))
-        XCTAssertTrue(contents.contains("<string>--root</string>"))
-        XCTAssertTrue(contents.contains("<string>\(ws.root.path)</string>"))
+        XCTAssertFalse(contents.contains("--root")) // root travels as env, never a flag
+        XCTAssertTrue(contents.contains("<key>AGENT_MANAGER_ROOT</key><string>\(ws.root.path)</string>"))
         XCTAssertTrue(contents.contains("<key>KeepAlive</key>"))
         XCTAssertTrue(contents.contains("<key>PATH</key>"))
 

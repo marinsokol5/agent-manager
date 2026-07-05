@@ -1,31 +1,27 @@
 # Agent Manager
 
-A macOS menu-bar app and CLI for juggling more than one paid **Claude Code** or
-**Codex** account on the same machine.
+MacOS app for juggling multiple Claude Code and Codex accounts on the same machine. 
 
-If you have a couple of accounts, it lets you run them as separate logins, keep an
-eye on how much usage each one has left, and optionally warm up an account's usage
-window before you start work. Everything runs locally — no server, no telemetry.
+Allows you to run each account as separate agent session, keep an
+eye on how much usage each one has left, and warm up an account's usage
+window to increase the amount of tokens available.
 
 > Agent Manager only touches accounts **you own and pay for**. It drives the
 > official `claude` / `codex` CLIs and never proxies or stores your OAuth tokens —
 > it only reads the credentials those tools already wrote.
 
-![Agent Manager menu-bar dropdown listing each account with its remaining 5-hour usage](screenshots/menu-bar-accounts-list.png)
-
 ## What it does
 
-Three things:
+### 1. Run any account independently
 
-### 1. Run any account from the terminal
+![](screenshots/agents-view.png)
 
 ```bash
-am run <id> [-- <args forwarded to claude/codex>]
+am run <id> [<args forwarded to claude/codex>]
 ```
 
 This starts a `claude` or `codex` session under that account's own isolated config
-home and hands your terminal to the CLI. Your normal `~/.claude` / `~/.codex` login
-is never touched.
+home and hands your terminal to the CLI. Your normal `~/.claude` / `~/.codex` login is never touched.
 
 Each account's home symlinks back to your real `~/.claude` / `~/.codex` for
 everything except the per-account identity file, so accounts share the same
@@ -33,30 +29,42 @@ settings **and the same session history**. That means you can pick a session bac
 up under a different account — handy when one account's window runs out mid-task:
 
 ```bash
-am run other-account -- --resume <session-id>
+am run claude-ms55
+# runs out of tokens
+am run claude-ms18 --resume <session-id>
 ```
 
-### 2. Track usage
+The **Source home** effectively groups accounts: everything pointing at the
+same folder shares settings and history, so you can run a few work accounts
+off one source home and your personal ones off another, fully apart.
 
-The menu bar shows how much of each account's rolling 5-hour window is left;
-clicking an account expands the weekly window and reset times.
+### 2. Easily track usage
 
-![Expanded account view showing the 5-hour and weekly windows with reset times](screenshots/menu-bar-account-detail.png)
+Track each account usage from the menu bar (
+individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 
-The CLI shows the same:
+<table align="center">
+  <tr>
+    <th>Menu bar — individual</th>
+    <th>Menu bar — merged</th>
+  </tr>
+  <tr valign="top">
+    <td><img src="screenshots/menu-bar-individual-expanded.png" width="375"></td>
+    <td><img src="screenshots/menu-bar-collapsed.png" width="375"></td>
+  </tr>
+  <tr>
+    <th colspan="2">CLI — <code>am usage</code></th>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="screenshots/cli-usage-new.png" width="760"></td>
+  </tr>
+</table>
 
-```bash
-am list                  # accounts + connection status
-am usage                 # 5h + weekly capacity for connected accounts
-am usage <id> --week     # one account, weekly window
-```
+### 3. Warm up token windows
 
-![`am usage` terminal output with a capacity bar per account](screenshots/cli-usage.png)
+Don't start your subscription's 5-hour usage window on your first request, but at fixed moment before, to maximize amount of tokens available when working.
 
-### 3. Warm up a window before work
-
-A subscription's 5-hour usage window starts on your first request, not at a fixed
-time of day. Paint your working hours in the app, flip the **Scheduler active**
+Simply paint your working hours in the app, flip the **Scheduler active**
 switch, and Agent Manager fires a small ping to open each account's window just
 before you start — so you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
@@ -71,6 +79,11 @@ on, calendar repaints and account changes apply live; there's no re-apply step.
 am ping <id>             # open <id>'s 5h window now (also what the scheduler runs)
 ```
 
+Each ping is a real interactive turn in the official CLI over a terminal —
+never an SDK or programmatic call — to stay future-proof and not lose access
+through campaigns like
+[this one](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+
 Pings stay minimal — a couple around the edges of your day, not all night. A
 ping the Mac slept through is skipped, not fired late.
 
@@ -79,29 +92,24 @@ ping the Mac slept through is skipped, not fired late.
 seconds before each ping, the ping runs, and the Mac goes back to sleep if
 nobody's around. Firmware rule: a closed lid only wakes on AC power.
 
-**Lid closed *on battery*?** That's the one case no software can wake, so the
-experimental **Cloud fallback** (Preferences, Claude accounts only) covers it
-from the other side: it keeps a tiny one-shot routine — "AgentManager Routine",
+**Lid closed *on battery*?** That's the one case no software can wake on Mac, so for Claude Code accounts we use routine's compute to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences.  It keeps a tiny one-shot routine — "AgentManager Routine",
 visible at claude.ai/code/routines — armed 5 minutes after each scheduled ping.
-A ping that runs locally re-arms the routine forward, so it never fires; a ping
+A ping that runs locally disarms the pending routine, so it never fires; but a ping
 the sleeping Mac misses lets Anthropic's cloud run it instead (one minimal
 Haiku turn that opens the window), and the redundant local ping is skipped on
-wake. Off by default; when it's off (or anything errors), scheduling behaves
-exactly as before.
+wake.
 
 ## CLI reference
 
 ```
-am run <id> [-- <args>]   launch a session as <id>; args after `--` go to claude/codex
+am run <id> [<args>]     launch a session as <id>; remaining args go to claude/codex
 am list                   list accounts with status + provider
 am usage [<id>]           capacity for connected accounts (--week, --provider, --sort, --no-color)
 am ping <id>              fire one ping now — opens <id>'s 5h window
-am scheduler status       the background scheduler's heartbeat and next fires
 ```
 
 Adding and connecting accounts, and painting your work hours, happen in the app
-(the **Agents**, **Planner**, and **Monitoring** screens). The CLI handles the
-day-to-day.
+(the **Agents**, **Planner**, and **Monitoring** screens). The CLI handles only the running-related actions.
 
 ## How it works
 
@@ -114,7 +122,7 @@ day-to-day.
   never relays or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
   (`api.anthropic.com`, `chatgpt.com`): the usage reads the real CLI already
-  makes, plus — only if you turn the experimental cloud fallback on — managing
+  makes, plus — only if you turn the experimental Claude Routine fallback on — managing
   the anchor routine in your own claude.ai account. No backend, no analytics.
 - **One quiet background agent.** Scheduled pings come from a single resident
   launchd agent with an in-process queue — flipping the scheduler on and off
