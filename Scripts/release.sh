@@ -26,10 +26,14 @@ PLIST="Support/Info.plist.in"
 
 cd "$(git rev-parse --show-toplevel)"
 
-# 0. Optional version bump (only commits if the value actually changed).
+# 0. Optional version bump (only commits if the value actually changed). Keep the
+#    compiled fallback in AppVersion.swift in lockstep with the plist, so the bare
+#    `.build/debug/am --version` matches even before the next bundle is assembled.
 if [[ $# -ge 1 ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $1" "$PLIST"
-    git add "$PLIST"
+    /usr/bin/sed -i '' -E "s/(static let fallback = \")[^\"]*(\")/\1$1\2/" \
+        Sources/AgentManagerCore/AppVersion.swift
+    git add "$PLIST" Sources/AgentManagerCore/AppVersion.swift
     if ! git diff --cached --quiet; then
         git commit -m "Bump to $1" >/dev/null
         echo "==> bumped $PLIST to $1"

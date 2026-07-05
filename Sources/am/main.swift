@@ -118,6 +118,11 @@ case "cloud":
     runCloud(Array(arguments.dropFirst()))
 case "help", "-h", "--help":
     print(usage)
+case "--version", "-v", "version":
+    // Deliberately unlisted in `usage` — handy for support/scripts, not a verb
+    // to advertise. Reads the bundle's CFBundleShortVersionString when bundled,
+    // else the compiled fallback (see AppVersion).
+    print("am \(AppVersion.current)")
 default:
     fail("unknown command '\(command)'\n\n\(usage)")
 }
