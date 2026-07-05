@@ -192,11 +192,20 @@ public struct Scheduler {
     public func uninstall() throws -> UninstallReport {
         try configStore.save(SchedulerConfig(active: false))
         var removed: [String] = []
-        let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
-        if fileManager.fileExists(atPath: url.path) || launchd.loadedLabels().contains(LaunchAgentPlanner.schedulerLabel) {
-            launchd.bootout(label: LaunchAgentPlanner.schedulerLabel)
-            try? fileManager.removeItem(at: url)
-            removed.append(LaunchAgentPlanner.schedulerLabel)
+        if SchedulerAppService.isAvailable {
+            // Web/API DELETE isn't a thing here — unregister removes the launchd
+            // job and the app-row entry outright.
+            if SchedulerAppService.registration() != .notRegistered {
+                try? SchedulerAppService.unregister()
+                removed.append(LaunchAgentPlanner.schedulerLabel)
+            }
+        } else {
+            let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
+            if fileManager.fileExists(atPath: url.path) || launchd.loadedLabels().contains(LaunchAgentPlanner.schedulerLabel) {
+                launchd.bootout(label: LaunchAgentPlanner.schedulerLabel)
+                try? fileManager.removeItem(at: url)
+                removed.append(LaunchAgentPlanner.schedulerLabel)
+            }
         }
         AuditLog(workspace: workspace, fileManager: fileManager).append(
             accountID: nil, action: "scheduler.uninstall", ok: true, detail: "removed \(removed.count) job(s)")
@@ -237,9 +246,20 @@ public struct Scheduler {
     /// and the per-account plan.
     public func status() -> StatusReport {
         let active = configStore.load().active
-        let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
-        let installed = fileManager.fileExists(atPath: url.path)
-        let loaded = launchd.loadedLabels().contains(LaunchAgentPlanner.schedulerLabel)
+        let installed: Bool
+        let loaded: Bool
+        if SchedulerAppService.isAvailable {
+            // Registered in any form counts as "installed"; only an approved
+            // registration is "loaded" (launchd owns it). The daemon heartbeat
+            // below is still the real "is it running" signal.
+            let reg = SchedulerAppService.registration()
+            installed = reg == .enabled || reg == .requiresApproval || reg == .notFound
+            loaded = reg == .enabled
+        } else {
+            let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
+            installed = fileManager.fileExists(atPath: url.path)
+            loaded = launchd.loadedLabels().contains(LaunchAgentPlanner.schedulerLabel)
+        }
         let daemon = SchedulerStatusStore(workspace: workspace, fileManager: fileManager).load()
 
         let accounts = (try? schedulableAccounts()) ?? []
@@ -292,6 +312,11 @@ public struct Scheduler {
     /// the ground truth of what a relaunch would exec. `nil` when no agent is
     /// installed (nothing to restart) or the plist is unreadable.
     func installedAgentProgram() -> String? {
+        if SchedulerAppService.isAvailable {
+            // The sealed plist's BundleProgram resolves to the bundle's own `am`
+            // (== `program`); its on-disk mtime is the restart signal.
+            return fileManager.isExecutableFile(atPath: program) ? program : nil
+        }
         let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
         guard let data = try? Data(contentsOf: url),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
@@ -315,6 +340,9 @@ public struct Scheduler {
     /// - unchanged but not loaded (e.g. user ran `launchctl bootout` by hand) →
     ///   bootstrap the existing file.
     func ensureAgent(installIfMissing: Bool) throws -> EnsureResult {
+        if SchedulerAppService.isAvailable {
+            return ensureAgentViaAppService(installIfMissing: installIfMissing)
+        }
         let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
         let onDisk = try? String(contentsOf: url, encoding: .utf8)
         if onDisk == nil && !installIfMissing {
@@ -339,6 +367,50 @@ public struct Scheduler {
         }
         let result = launchd.bootstrap(plistPath: url.path, label: LaunchAgentPlanner.schedulerLabel)
         return EnsureResult(updated: false, loaded: result.ok, output: result.output)
+    }
+
+    /// The bundled-app counterpart to `ensureAgent`: register the sealed agent
+    /// plist via SMAppService instead of writing/bootstrapping one in
+    /// `~/Library/LaunchAgents`. Preserves the no-churn invariant — an already
+    /// `.enabled` registration is left untouched (no re-`register()`, so no
+    /// repeat background-items notification). `updated` marks the first
+    /// registration (the one time macOS notifies). A `register()` throw while the
+    /// approval is pending is expected, not fatal — we re-read the status after.
+    func ensureAgentViaAppService(installIfMissing: Bool) -> EnsureResult {
+        migrateAwayFromClassicAgent()
+        let before = SchedulerAppService.registration()
+        // Nothing to schedule and not yet registered → don't register just to idle.
+        if before == .notRegistered && !installIfMissing {
+            return EnsureResult(updated: false, loaded: false, output: "")
+        }
+        // Already approved and owned by launchd → zero mutation, zero notification.
+        if before == .enabled {
+            return EnsureResult(updated: false, loaded: true, output: "")
+        }
+        try? SchedulerAppService.register()
+        let after = SchedulerAppService.registration()
+        return EnsureResult(
+            updated: before == .notRegistered,
+            loaded: after == .enabled,
+            output: after == .requiresApproval ? "awaiting approval in System Settings → Login Items" : "")
+    }
+
+    /// Clean handoff for users upgrading from the classic-bootstrap scheduler to
+    /// the SMAppService one: an old `~/Library/LaunchAgents/…scheduler.plist`
+    /// (same launchd label) would otherwise keep running and fight the
+    /// SMAppService registration. Boot it out and delete it the first time we go
+    /// through the app-service path; after that the file is gone and this is a
+    /// cheap no-op. Only touches the classic *file* — never the SMAppService
+    /// registration (which has no such file), so it can't disturb an already
+    /// enabled agent.
+    func migrateAwayFromClassicAgent() {
+        let url = launchAgentsDir.appendingPathComponent(LaunchAgentPlanner.schedulerFilename)
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        launchd.bootout(label: LaunchAgentPlanner.schedulerLabel)
+        try? fileManager.removeItem(at: url)
+        AuditLog(workspace: workspace, fileManager: fileManager).append(
+            accountID: nil, action: "scheduler.migrate", ok: true,
+            detail: "removed classic LaunchAgent; scheduler now managed via SMAppService")
     }
 
     /// The env baked into the scheduler agent's plist: a usable `PATH` (launchd's

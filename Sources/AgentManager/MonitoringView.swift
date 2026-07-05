@@ -260,7 +260,7 @@ struct MonitoringView: View {
             Image(systemName: state.glyph)
                 .font(.system(size: 12))
                 .foregroundStyle(state.tint)
-            Text("com.agent-manager.scheduler")
+            Text(LaunchAgentPlanner.schedulerLabel)
                 .font(.system(size: 13, weight: .medium))
             Text(state.title)
                 .font(Theme.Font.caption)
@@ -313,7 +313,7 @@ struct MonitoringView: View {
             Image(systemName: state.glyph)
                 .font(.system(size: 12))
                 .foregroundStyle(state.tint)
-            Text("com.agent-manager.wake-helper")
+            Text(ScheduledWakes.helperID)
                 .font(.system(size: 13, weight: .medium))
             Text(state.title)
                 .font(Theme.Font.caption)
@@ -346,14 +346,23 @@ struct MonitoringView: View {
             }
             return wakeHealth(s)
         }
-        // Bundled SMAppService daemon — the normal path.
+        // Bundled SMAppService daemon — the normal path. Note that toggling
+        // wake off keeps the registration (so re-enabling never re-asks for
+        // approval), so `wakeRegistration` can sit in `.requiresApproval` /
+        // `.notFound` while the user has deliberately turned wakes off. In that
+        // state the registration is irrelevant noise — there's nothing armed to
+        // lose — so defer to `wakeHealth`, which shows the calm "installed · off"
+        // rather than warning about a helper that isn't meant to be doing
+        // anything. The warnings below fire only when wake is actually on.
         switch model.wakeRegistration {
         case .enabled:
             return wakeHealth(s)
         case .requiresApproval:
+            guard s.enabled else { return wakeHealth(s) }
             return ("exclamationmark.triangle.fill", Theme.warning, "waiting for approval",
                     "System Settings → Login Items → allow \u{201C}Agent Manager\u{201D}.")
         case .notFound:
+            guard s.enabled else { return wakeHealth(s) }
             return ("exclamationmark.triangle.fill", Theme.warning, "not found",
                     "launchd lost the registration (app moved?) — flip the Wake toggle off and on.")
         case .notRegistered, .unavailable, nil:

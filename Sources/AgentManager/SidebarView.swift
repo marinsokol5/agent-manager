@@ -90,6 +90,9 @@ struct SidebarView: View {
     private var schedulerCaption: (text: String, tint: Color) {
         if model.scheduleBusy { return ("working…", Color.secondary) }
         if model.schedulerActive {
+            if model.schedulerRegistration == .requiresApproval {
+                return ("allow in System Settings → Login Items", Theme.warning)
+            }
             if let s = model.schedulerStatus, s.agentInstalled, !s.agentLoaded {
                 return ("agent not loaded — see Monitoring", Theme.warning)
             }

@@ -1,21 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Template — the Makefile substitutes __BUNDLE_ID__, __APP_NAME__, and
+     __EXEC_NAME__ per build variant (prod for `make release`, the `.dev`
+     variant for `make build`/`make run`). See AppVariant.swift. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Agent Manager</string>
+	<string>__EXEC_NAME__</string>
 	<key>CFBundleIconFile</key>
 	<string>AgentManager</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.agent-manager.app</string>
+	<string>__BUNDLE_ID__</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Agent Manager</string>
+	<string>__APP_NAME__</string>
 	<key>CFBundleDisplayName</key>
-	<string>Agent Manager</string>
+	<string>__APP_NAME__</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

@@ -23,9 +23,19 @@ import Foundation
 /// Everything is injectable (dirs, launchd runner, source path, ownership
 /// application) so install/uninstall/render are unit-testable without root.
 public struct WakeHelperSetup {
-    public static let label = ScheduledWakes.helperID           // com.agent-manager.wake-helper
+    public static let label = ScheduledWakes.helperID           // com.agent-manager[.dev].wake-helper
     public static let plistFilename = label + ".plist"
+    /// The bundled helper binary's name — what `swift build` produces and what
+    /// ships in `Contents/MacOS`. Always unsuffixed: the SMAppService plist's
+    /// `BundleProgram` points at `Contents/MacOS/am-wake-helper` in every variant,
+    /// and each variant's copy lives in its own bundle, so there is no collision.
     public static let helperFilename = "am-wake-helper"
+    /// The **installed** name for the classic `sudo am wake install` copy in
+    /// `/Library/PrivilegedHelperTools` — variant-suffixed so a dev classic
+    /// install can never overwrite the prod helper at that one *shared* path
+    /// (the only place two variants would otherwise collide; their daemon plists,
+    /// labels, and logs are already label-scoped and distinct).
+    public static let installedHelperFilename = AppVariant.isDev ? "am-wake-helper-dev" : "am-wake-helper"
 
     let workspace: Workspace
     let launchd: LaunchdController
@@ -59,7 +69,7 @@ public struct WakeHelperSetup {
         self.applyRootOwnership = applyRootOwnership
     }
 
-    public var installedBinary: URL { helperInstallDir.appendingPathComponent(WakeHelperSetup.helperFilename) }
+    public var installedBinary: URL { helperInstallDir.appendingPathComponent(WakeHelperSetup.installedHelperFilename) }
     public var installedPlist: URL { daemonsDir.appendingPathComponent(WakeHelperSetup.plistFilename) }
 
     /// The freshly built helper to install: env override (tests/dev) → a

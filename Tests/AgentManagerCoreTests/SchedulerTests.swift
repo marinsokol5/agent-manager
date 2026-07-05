@@ -69,6 +69,36 @@ final class SchedulerTests: XCTestCase {
         return (scheduler, program)
     }
 
+    /// Upgrading from the classic bootstrap to the SMAppService scheduler: any
+    /// stale `~/Library/LaunchAgents` plist (same launchd label) is booted out
+    /// and deleted, so the two same-label agents never fight after the switch.
+    func testMigrateAwayFromClassicAgentRemovesStalePlist() throws {
+        let ws = workspace()
+        let fake = FakeLaunchctl()
+        let scheduler = makeScheduler(ws, fake)
+        try fm.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+        try "stale-classic-plist".write(to: agentPlist, atomically: true, encoding: .utf8)
+
+        scheduler.migrateAwayFromClassicAgent()
+
+        XCTAssertTrue(
+            fake.calls.contains { $0 == ["bootout", "gui/501/\(LaunchAgentPlanner.schedulerLabel)"] },
+            "the stale classic agent must be booted out")
+        XCTAssertFalse(fm.fileExists(atPath: agentPlist.path), "the stale classic plist must be deleted")
+    }
+
+    /// No classic plist on disk (fresh SMAppService install) → migration is a
+    /// cheap no-op that never touches launchd.
+    func testMigrateAwayFromClassicAgentIsNoOpWithoutClassicPlist() throws {
+        let ws = workspace()
+        let fake = FakeLaunchctl()
+        let scheduler = makeScheduler(ws, fake)
+
+        scheduler.migrateAwayFromClassicAgent()
+
+        XCTAssertTrue(fake.calls.isEmpty, "no classic plist → no launchd calls")
+    }
+
     func daemonStatus(startedAt: Date, updatedAt: Date, pinging: String? = nil) -> SchedulerDaemonStatus {
         SchedulerDaemonStatus(
             pid: 42, startedAt: startedAt, updatedAt: updatedAt, active: true,

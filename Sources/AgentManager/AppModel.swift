@@ -190,6 +190,15 @@ final class AppModel {
     /// call is in flight), then reconciled with ground truth — the flag in
     /// `scheduler.json` — every `refreshMonitoring()`.
     var schedulerActive = false
+    /// SMAppService state of the bundled scheduler agent (the no-sudo path that
+    /// groups it under the app's own Login Items row); from the last
+    /// `refreshMonitoring()`. `.unavailable` when running as a bare executable
+    /// (the classic `~/Library/LaunchAgents` bootstrap is used instead).
+    var schedulerRegistration: SchedulerAppService.Registration?
+    /// Alive only while the scheduler agent sits in `requiresApproval`: the same
+    /// short re-poll loop the wake helper uses, so the UI notices the System
+    /// Settings approval by itself (SMAppService posts no notification on Allow).
+    var schedulerApprovalPoll: Task<Void, Never>?
     /// The "Wake Mac for pings" opt-in switch (mirrors `wake.json`), flipped
     /// optimistically by `setWakeEnabled` and reconciled on refresh.
     var wakeEnabled = false

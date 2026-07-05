@@ -45,7 +45,10 @@ public enum WakeInputs {
     {
         let homes = (try? fileManager.contentsOfDirectory(at: usersDir, includingPropertiesForKeys: nil)) ?? []
         return homes
-            .map { $0.appendingPathComponent("Library/Application Support/AgentManager", isDirectory: true) }
+            .map {
+                $0.appendingPathComponent("Library/Application Support", isDirectory: true)
+                    .appendingPathComponent(WakeVariant.workspaceDirName, isDirectory: true)
+            }
             .filter { fileManager.fileExists(atPath: $0.path) }
             .sorted { $0.path < $1.path }
     }

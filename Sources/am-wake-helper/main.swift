@@ -38,7 +38,7 @@ import os
 /// wakes on a *closed* portable running on battery. Lid open, or lid closed on
 /// AC, they fire.
 
-private let helperID = "com.agent-manager.wake-helper"
+private let helperID = WakeVariant.helperID
 private let logger = Logger(subsystem: "com.agent-manager", category: "wake-helper")
 
 // Mirrors of IOPMLib.h's scheduled-event constants, pinned here as literals so
@@ -118,7 +118,7 @@ default:
 // failure per pass forever. Exit loudly instead — launchd (system domain) is
 // the intended parent.
 guard geteuid() == 0 else {
-    fail("am-wake-helper must run as root (as the com.agent-manager.wake-helper LaunchDaemon)")
+    fail("am-wake-helper must run as root (as the \(helperID) LaunchDaemon)")
 }
 
 logger.notice("wake helper started (pid \(ProcessInfo.processInfo.processIdentifier, privacy: .public)), watching \(explicitRoot?.path ?? "all standard workspaces under /Users", privacy: .public)")

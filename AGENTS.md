@@ -45,23 +45,44 @@ Core (so it's testable and reusable); keep `AgentManager/` to presentation and
 ```bash
 swift build                 # build everything
 swift test                  # run the Core test suite (150+ tests, fast)
-make build                  # assemble + codesign .build/AgentManager.app
+make build                  # assemble + codesign the DEV app at .build/AgentManager-dev.app
 make run                    # build, kill any running instance, open the app bundle
 .build/debug/am help        # CLI usage
 ```
 
 The library and CLI build/run/test with no special signing. `make build`
-assembles a real `.app` bundle at `.build/AgentManager.app` (the app binary,
-`am`, and `am-wake-helper` in `Contents/MacOS`, the wake-helper daemon plist in
-`Contents/Library/LaunchDaemons` — that placement is what makes `SMAppService`
-registration possible) and codesigns it with a local dev identity so Keychain
-grants survive rebuilds (`CODESIGN_ID` overrides the identity). Keep the
-bundle path stable: launchd's Background-items approval binds to it.
+assembles a real `.app` bundle (the app binary, `am`, and `am-wake-helper` in
+`Contents/MacOS`, the wake-helper daemon plist in `Contents/Library/LaunchDaemons`
+— that placement is what makes `SMAppService` registration possible) and
+codesigns it with a local dev identity so Keychain grants survive rebuilds
+(`CODESIGN_ID` overrides the identity).
+
+**Build variants (dev vs prod).** So a locally built app can run *alongside* the
+released one without colliding on bundle ID, launchd labels, workspace, or the
+macOS background-item (BTM) records they feed, the build is variant-scoped:
+
+- `make build` / `make run` produce the **dev** variant — bundle ID
+  `com.agent-manager.app.dev`, name "Agent Manager (Dev)", launchd prefix
+  `com.agent-manager.dev.`, workspace `~/Library/Application Support/AgentManager-dev`,
+  bundle at `.build/AgentManager-dev.app`. This is the *only* variant to develop
+  against.
+- `make release` produces the **prod** variant — today's exact identifiers,
+  bundle at `.build/AgentManager.app`. This is what brew ships; never release the
+  dev variant.
+
+The switch is the `AGENT_MANAGER_DEV` compile define (passed by `make build`,
+absent for `make release`). Runtime code reads *all* identity from
+`AppVariant` (Core) / `WakeVariant` (WakeHelperCore, the root binary that never
+links Core); the Makefile keeps the assembled `Info.plist` + wake-helper plist in
+sync via `Support/Info.plist.in` / `Support/wake-helper.plist.in`. To touch any
+identifier, change `AppVariant`/`WakeVariant` and the two `.in` templates
+together. Keep the *prod* bundle path (`.build/AgentManager.app`) stable:
+launchd's Background-items approval binds to it.
 
 Useful env overrides (also how the tests stay hermetic — nothing in Core
 hard-codes a real path):
 
-- `AGENT_MANAGER_ROOT` — workspace root (defaults to `~/Library/Application Support/AgentManager`).
+- `AGENT_MANAGER_ROOT` — workspace root (defaults to `~/Library/Application Support/AgentManager`, or `…/AgentManager-dev` for a dev build — see Build variants above).
 - `AGENT_MANAGER_LAUNCH_AGENTS_DIR` — where plists are written (defaults to `~/Library/LaunchAgents`).
 - `AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN` — override the resolved CLI binary (tests inject stubs here).
 
@@ -160,9 +181,20 @@ design follows from them.
 - `audit.log.jsonl`, `activity.jsonl`, `network.jsonl` — the three local logs
   shown in Monitoring.
 - `homes/<id>/` — the managed config home per account (created `0o700`).
-- `~/Library/LaunchAgents/com.agent-manager.scheduler.plist` — the **single**
-  launchd agent: a KeepAlive daemon (`am scheduler run`) that fires every
-  account's pings from an in-process queue (`SchedulerDaemon`).
+- The **single** scheduler LaunchAgent — a KeepAlive daemon (`am scheduler run`)
+  that fires every account's pings from an in-process queue (`SchedulerDaemon`) —
+  in one of two flavors (same launchd label, never both; `Scheduler` picks the
+  first that applies): the **bundled** agent inside `AgentManager.app`
+  (`Contents/Library/LaunchAgents/…scheduler.plist`) registered via
+  `SMAppService` (`SchedulerAppService`), so it groups under the app's own Login
+  Items row with a one-time approval; or the **classic** `~/Library/LaunchAgents/
+  com.agent-manager.scheduler.plist` bootstrapped into `gui/<uid>` (the
+  bare-binary/CLI fallback, and what the whole test suite exercises). The bundled
+  plist is sealed and static — no per-user `AGENT_MANAGER_ROOT`/`PATH`/log paths
+  (a variant-compiled `am` derives its own workspace; `am ping` children
+  self-enrich PATH). Upgrading from classic → SMAppService, `Scheduler.activate`
+  boots out + deletes the stale classic plist first (`migrateAwayFromClassicAgent`)
+  so the same-label agents never fight.
 - The optional root wake helper, in one of two flavors (same launchd label —
   never both): the **bundled** daemon inside `AgentManager.app` registered via
   `SMAppService` (the app's toggle; one-time System Settings approval, no
@@ -271,7 +303,10 @@ as failed.
   and re-bootstraps it **only** when the rendered content differs from disk;
   the Scheduler toggle otherwise only writes `scheduler.json`. Don't add
   anything schedule-shaped to the plist; the daemon reads all of that from the
-  workspace.
+  workspace. The bundled SMAppService flavor keeps the same invariant for free:
+  the plist is sealed and never changes, and `ensureAgentViaAppService` skips
+  `register()` entirely once the registration reads `.enabled` (re-registering an
+  approved agent is what would re-notify).
 - **Upgrades restart the daemons by themselves.** Both resident daemons are
   KeepAlive jobs, so "restart on upgrade" is just an exit: each stamps its own
   binary at launch and exits once the on-disk file has *changed and settled*
@@ -328,6 +363,19 @@ as failed.
   code (0 anchored / 2 failed / 3 stale-skip — a skip must never read as an
   anchor). Everything is fail-soft: any API error just logs, backs off, and
   leaves local scheduling untouched.
+- **Missing menu-bar item after running a dev *and* a packaged build.** If the
+  status item doesn't appear even though the app is running and `menuBarMode`
+  isn't `.hidden`, suspect a stale ControlCenter record, not the code. Running a
+  locally-built `.app` and the notarized/brew copy of the same
+  `com.agent-manager.app` bundle side by side registers two menu-bar entries in
+  macOS's *Allow in the Menu Bar* list (BTM-backed); the leftover one can
+  suppress the real item. Deleting the app files doesn't clear it — the fix is
+  to regenerate ControlCenter's state: `rm "$HOME/Library/Group
+  Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist"
+  && killall ControlCenter` (needs Full Disk Access on the terminal; a shutdown
+  instead of `killall` also works). This is a dev-machine artifact of the
+  self-signed→Developer-ID transition — a clean install (only the brew copy)
+  never registers the duplicate, so users don't hit it.
 
 ## Scope & responsible use
 

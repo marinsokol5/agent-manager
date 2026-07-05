@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — the Makefile substitutes __SCHEDULER_LABEL__ and __BUNDLE_ID__ per
+     build variant and writes it to Contents/Library/LaunchAgents/<label>.plist
+     (the filename must equal the Label; see LaunchAgentPlanner.schedulerFilename).
+
+     The SMAppService flavor of the resident scheduler: shipped inside the .app
+     and registered by the app (SchedulerAppService) with a one-time System
+     Settings approval — so it groups under the app's own row in Login Items &
+     Extensions rather than under the developer name. AssociatedBundleIdentifiers
+     is what ties it to the app.
+
+     This plist is SEALED into the signed bundle, so — unlike the classic
+     ~/Library/LaunchAgents plist (LaunchAgentPlanner.renderSchedulerAgentPlist) —
+     it carries NO per-user data: no AGENT_MANAGER_ROOT (a variant-compiled `am`
+     derives its own workspace under the invoking user's HOME), no baked PATH
+     (each `am ping` child self-enriches via ChildEnvironment.make), and no
+     StandardOut/ErrorPath (the daemon's ground truth is its workspace JSONL
+     logs). BundleProgram resolves relative to the bundle root by launchd. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__SCHEDULER_LABEL__</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/am</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>am</string>
+		<string>scheduler</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>__BUNDLE_ID__</string>
+	</array>
+</dict>
+</plist>

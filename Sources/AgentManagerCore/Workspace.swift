@@ -27,7 +27,7 @@ public struct Workspace: Sendable {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
-        return Workspace(root: base.appendingPathComponent("AgentManager", isDirectory: true))
+        return Workspace(root: base.appendingPathComponent(AppVariant.workspaceDirName, isDirectory: true))
     }
 
     /// The workspace of the human behind `sudo`. Under sudo, HOME (and so
@@ -50,7 +50,8 @@ public struct Workspace: Sendable {
               let passwd = getpwnam(sudoUser)
         else { return standard(environment: environment, fileManager: fileManager) }
         let home = URL(fileURLWithPath: String(cString: passwd.pointee.pw_dir), isDirectory: true)
-        return Workspace(root: home.appendingPathComponent("Library/Application Support/AgentManager", isDirectory: true))
+        return Workspace(root: home.appendingPathComponent("Library/Application Support", isDirectory: true)
+            .appendingPathComponent(AppVariant.workspaceDirName, isDirectory: true))
     }
 
     /// `homes/` — one managed config-dir per account.

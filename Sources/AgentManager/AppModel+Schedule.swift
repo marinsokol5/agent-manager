@@ -114,25 +114,33 @@ extension AppModel {
         statusMessage = on ? "starting scheduler…" : "stopping scheduler…"
         let ws = workspace
         Task {
-            let message = await Task.detached(priority: .userInitiated) { () -> String in
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (message: String, openSettings: Bool) in
                 do {
                     if on {
                         let report = try Scheduler(workspace: ws).activate()
-                        if report.noAccounts { return "no connected accounts to schedule" }
+                        if report.noAccounts { return ("no connected accounts to schedule", false) }
                         var msg = "scheduler active — \(report.accounts.count) account(s) · \(report.totalPingsPerWeek) pings/week"
                         if report.agentUpdated { msg += " · background agent installed" }
+                        // Bundled app: the agent registers via SMAppService and
+                        // won't run until the one-time Login Items approval, which
+                        // we deep-link open (mirrors the wake helper). Named with
+                        // the variant's display name so it matches the Settings row.
+                        if SchedulerAppService.registration() == .requiresApproval {
+                            return ("scheduler set — allow \u{201C}\(AppVariant.displayName)\u{201D} in System Settings → Login Items (one time)", true)
+                        }
                         if !report.agentLoaded { msg += " · agent failed to load" }
-                        return msg
+                        return (msg, false)
                     } else {
                         let report = try Scheduler(workspace: ws).deactivate()
-                        return report.wasActive ? "scheduler off — calendar kept" : "scheduler already off"
+                        return (report.wasActive ? "scheduler off — calendar kept" : "scheduler already off", false)
                     }
                 } catch {
-                    return "scheduler \(on ? "activation" : "deactivation") failed: \(error)"
+                    return ("scheduler \(on ? "activation" : "deactivation") failed: \(error)", false)
                 }
             }.value
             scheduleBusy = false
-            statusMessage = message
+            statusMessage = outcome.message
+            if outcome.openSettings { SchedulerAppService.openSystemSettings() }
             refreshMonitoring()
         }
     }
@@ -228,6 +236,21 @@ extension AppModel {
         }
     }
 
+    /// The scheduler-agent twin of `scheduleWakeApprovalPollIfNeeded`: while the
+    /// SMAppService scheduler sits in `requiresApproval`, re-check every few
+    /// seconds so the sidebar flips to active on its own once the user clicks
+    /// Allow (SMAppService posts no notification). Exists only in that state.
+    private func scheduleSchedulerApprovalPollIfNeeded() {
+        schedulerApprovalPoll?.cancel()
+        schedulerApprovalPoll = nil
+        guard schedulerActive, schedulerRegistration == .requiresApproval else { return }
+        schedulerApprovalPoll = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.refreshMonitoring()
+        }
+    }
+
     /// Reload the scheduler status, recent ping log, and the unified Logs feed
     /// (all touch the filesystem / `launchctl`, so they run off-main).
     func refreshMonitoring() {
@@ -237,6 +260,7 @@ extension AppModel {
             let result = await Task.detached(priority: .utility) {
                 () -> (status: Scheduler.StatusReport, wake: WakeHelperSetup.Status,
                        registration: WakeHelperAppService.Registration,
+                       schedReg: SchedulerAppService.Registration,
                        wakeProcess: WakeHelperSetup.ProcessState,
                        cloudEnabled: Bool, cloudState: CloudFallbackState,
                        recent: [ActivityRecord], logs: [MonitoringLogEntry]) in
@@ -251,6 +275,7 @@ extension AppModel {
                 let wake = wakeSetup.status()
                 let wakeProcess = wakeSetup.processState()
                 let registration = WakeHelperAppService.registration()
+                let schedReg = SchedulerAppService.registration()
                 let cloudEnabled = CloudFallbackConfigStore(workspace: ws).load().enabled
                 let cloudState = CloudFallbackStateStore(workspace: ws).load()
                 // Monitoring shows everything from the last 48 hours (the UI says
@@ -260,11 +285,13 @@ extension AppModel {
                 let audit = AuditLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let network = NetworkLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let logs = MonitoringLogEntry.merge(activity: activity, audit: audit, network: network)
-                return (scheduler.status(), wake, registration, wakeProcess, cloudEnabled, cloudState, activity, logs)
+                return (scheduler.status(), wake, registration, schedReg, wakeProcess, cloudEnabled, cloudState, activity, logs)
             }.value
             let wasAwaitingWakeApproval = self.wakeRegistration == .requiresApproval
+            let wasAwaitingSchedApproval = self.schedulerRegistration == .requiresApproval
             self.schedulerStatus = result.status
             self.schedulerActive = result.status.active
+            self.schedulerRegistration = result.schedReg
             self.wakeStatus = result.wake
             self.wakeEnabled = result.wake.enabled
             self.wakeRegistration = result.registration
@@ -274,7 +301,11 @@ extension AppModel {
             if wasAwaitingWakeApproval && result.registration == .enabled {
                 self.statusMessage = "wake helper approved — active"
             }
+            if wasAwaitingSchedApproval && result.schedReg == .enabled {
+                self.statusMessage = "scheduler approved — active"
+            }
             self.scheduleWakeApprovalPollIfNeeded()
+            self.scheduleSchedulerApprovalPollIfNeeded()
             self.healWakeHelperIfSpawnFailed()
             self.recentActivity = result.recent
             self.monitoringLogs = result.logs

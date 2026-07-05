@@ -15,13 +15,31 @@ CODESIGN_FLAGS ?=
 CONFIG ?= debug
 BIN_DIR = .build/$(CONFIG)
 
+# Build variant — the whole reason a locally built app can coexist with the
+# released one. `dev` (the default, what `make build`/`make run` produce) stamps
+# a distinct bundle ID, launchd labels, workspace, and app name so it never
+# collides with the `prod` build that `make release` ships (and brew installs).
+# The single source of truth at runtime is AppVariant/WakeVariant, kept in sync
+# with the values below by the AGENT_MANAGER_DEV compile define. Never release
+# the dev variant. See AGENTS.md "Build, run, test".
+VARIANT ?= dev
+IS_PROD = $(filter prod,$(VARIANT))
+
+BUNDLE_ID    = $(if $(IS_PROD),com.agent-manager.app,com.agent-manager.app.dev)
+APP_NAME     = $(if $(IS_PROD),Agent Manager,Agent Manager (Dev))
+EXEC_NAME    = $(APP_NAME)
+HELPER_LABEL = $(if $(IS_PROD),com.agent-manager.wake-helper,com.agent-manager.dev.wake-helper)
+SCHEDULER_LABEL = $(if $(IS_PROD),com.agent-manager.scheduler,com.agent-manager.dev.scheduler)
+APP_BASENAME = $(if $(IS_PROD),AgentManager,AgentManager-dev)
+DEV_DEFINE   = $(if $(IS_PROD),,-Xswiftc -DAGENT_MANAGER_DEV)
+
 # Notarization credentials, stored once in the login keychain with:
 #   xcrun notarytool store-credentials agent-manager \
 #     --apple-id <apple-id-email> --team-id H33MHC4C79
 # (use an app-specific password from account.apple.com)
 NOTARY_PROFILE ?= agent-manager
 
-VERSION := $(shell /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Support/Info.plist)
+VERSION := $(shell /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Support/Info.plist.in)
 RELEASE_ZIP = .build/AgentManager-$(VERSION).zip
 
 # The assembled .app bundle. A real bundle (not the bare SwiftPM executable) is
@@ -29,29 +47,31 @@ RELEASE_ZIP = .build/AgentManager-$(VERSION).zip
 # Contents/Library/LaunchDaemons and the app registers it with a one-time
 # System Settings approval instead of sudo. `am` rides along in Contents/MacOS
 # so the scheduler agent's program path resolves next to the app.
-# Keep the path stable: launchd's Background-items approval is tied to it
-# (a `make clean` therefore costs a re-approval).
-APP_BUNDLE = .build/AgentManager.app
+# Keep the *prod* path (.build/AgentManager.app) stable: launchd's
+# Background-items approval is tied to it (a `make clean` therefore costs a
+# re-approval). The dev variant assembles alongside it at .build/AgentManager-dev.app.
+APP_BUNDLE = .build/$(APP_BASENAME).app
 CONTENTS = $(APP_BUNDLE)/Contents
 
 .PHONY: build run clean release icon
 
 build:
-	swift build -c $(CONFIG)
+	swift build -c $(CONFIG) $(DEV_DEFINE)
 	rm -rf $(APP_BUNDLE)
-	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources $(CONTENTS)/Library/LaunchDaemons
-	cp Support/Info.plist $(CONTENTS)/Info.plist
+	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources $(CONTENTS)/Library/LaunchDaemons $(CONTENTS)/Library/LaunchAgents
+	sed -e 's/__BUNDLE_ID__/$(BUNDLE_ID)/g' -e "s/__APP_NAME__/$(APP_NAME)/g" -e "s/__EXEC_NAME__/$(EXEC_NAME)/g" Support/Info.plist.in > $(CONTENTS)/Info.plist
 	cp Support/AgentManager.icns $(CONTENTS)/Resources/
-	cp Support/com.agent-manager.wake-helper.plist $(CONTENTS)/Library/LaunchDaemons/
+	sed -e 's/__HELPER_LABEL__/$(HELPER_LABEL)/g' -e 's/__BUNDLE_ID__/$(BUNDLE_ID)/g' Support/wake-helper.plist.in > $(CONTENTS)/Library/LaunchDaemons/$(HELPER_LABEL).plist
+	sed -e 's/__SCHEDULER_LABEL__/$(SCHEDULER_LABEL)/g' -e 's/__BUNDLE_ID__/$(BUNDLE_ID)/g' Support/scheduler.plist.in > $(CONTENTS)/Library/LaunchAgents/$(SCHEDULER_LABEL).plist
 	cp $(BIN_DIR)/am $(BIN_DIR)/am-wake-helper $(CONTENTS)/MacOS/
-	cp $(BIN_DIR)/AgentManager "$(CONTENTS)/MacOS/Agent Manager"
+	cp $(BIN_DIR)/AgentManager "$(CONTENTS)/MacOS/$(EXEC_NAME)"
 	cp -R $(BIN_DIR)/AgentManager_AgentManager.bundle $(CONTENTS)/Resources/
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(CONTENTS)/MacOS/am-wake-helper
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(CONTENTS)/MacOS/am
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(APP_BUNDLE)
 
 run: build
-	pkill -x "Agent Manager" 2>/dev/null || true
+	pkill -x "$(EXEC_NAME)" 2>/dev/null || true
 	sleep 0.2
 	open $(APP_BUNDLE)
 
@@ -68,12 +88,16 @@ elapsed = t=$$(( $$(date +%s) - $$(cat $(RELEASE_START)) )); printf '==> [%02d:%
 # (tickets attach to bundles, not zips), and the zip is rebuilt from the
 # stapled app so offline Gatekeeper checks pass for downloaders.
 # Publishing is then e.g.: gh release create v$(VERSION) $(RELEASE_ZIP)
+# Force the prod variant for the whole release recipe (so $(APP_BUNDLE) etc.
+# resolve to the released paths, not the default dev ones) and for the build
+# sub-make. Never ship the dev variant.
+release: VARIANT := prod
 release:
 	@mkdir -p .build && date +%s > $(RELEASE_START)
 	@$(call elapsed,running tests)
 	swift test
 	@$(call elapsed,building signed release bundle)
-	$(MAKE) build CONFIG=release CODESIGN_FLAGS="--options runtime --timestamp"
+	$(MAKE) build CONFIG=release VARIANT=prod CODESIGN_FLAGS="--options runtime --timestamp"
 	@$(call elapsed,zipping bundle for notary submission)
 	ditto -c -k --keepParent $(APP_BUNDLE) $(RELEASE_ZIP)
 	@$(call elapsed,submitting to Apple notary — the slow part (usually 1-15 min))

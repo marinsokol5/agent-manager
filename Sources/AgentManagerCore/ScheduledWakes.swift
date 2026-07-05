@@ -7,8 +7,9 @@ import IOKit.pwr_mgt
 /// helper itself is observable without talking to it.
 public enum ScheduledWakes {
     /// The identity the wake helper schedules under (`scheduledby` in the
-    /// event table). Must match the literal in `am-wake-helper`.
-    public static let helperID = "com.agent-manager.wake-helper"
+    /// event table). Variant-scoped; must match `WakeVariant.helperID` in
+    /// `am-wake-helper`.
+    public static let helperID = AppVariant.labelPrefix + "wake-helper"
 
     public struct Event: Equatable, Sendable {
         public var date: Date

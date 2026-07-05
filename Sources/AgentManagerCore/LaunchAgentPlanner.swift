@@ -31,8 +31,9 @@ public struct CalEntry: Equatable, Sendable {
 }
 
 public enum LaunchAgentPlanner {
-    /// Prefix for every launchd Label / plist filename this app owns.
-    public static let labelPrefix = "com.agent-manager."
+    /// Prefix for every launchd Label / plist filename this app owns
+    /// (variant-scoped so a dev build never collides with the released app).
+    public static let labelPrefix = AppVariant.labelPrefix
 
     /// The one LaunchAgent this app installs: the resident scheduler daemon.
     public static let schedulerLabel = labelPrefix + "scheduler"

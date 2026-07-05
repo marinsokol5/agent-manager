@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — the Makefile substitutes __HELPER_LABEL__ and __BUNDLE_ID__ per
+     build variant and writes it to Contents/Library/LaunchDaemons/<label>.plist
+     (the filename must equal the Label; see WakeHelperSetup.plistFilename).
+
+     The SMAppService flavor of the wake helper: shipped inside the .app and
+     registered by the app ("Wake Mac for pings" toggle) with a one-time System
+     Settings approval; no sudo. BundleProgram is resolved relative to the bundle
+     root by launchd. No workspace argument here: the plist is sealed into the
+     signed bundle, so it can't be personalized per user; the helper instead
+     discovers every standard workspace under /Users/* and obeys each one's
+     wake.json. -->
+<dict>
+	<key>Label</key>
+	<string>__HELPER_LABEL__</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/am-wake-helper</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>__BUNDLE_ID__</string>
+	</array>
+</dict>
+</plist>
