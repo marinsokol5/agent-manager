@@ -53,7 +53,7 @@ RELEASE_ZIP = .build/AgentManager-$(VERSION).zip
 APP_BUNDLE = .build/$(APP_BASENAME).app
 CONTENTS = $(APP_BUNDLE)/Contents
 
-.PHONY: build run clean release icon
+.PHONY: build run clean release publish icon
 
 build:
 	swift build -c $(CONFIG) $(DEV_DEFINE)
@@ -87,7 +87,8 @@ elapsed = t=$$(( $$(date +%s) - $$(cat $(RELEASE_START)) )); printf '==> [%02d:%
 # The zip is submitted for notarization, the *app* gets the ticket stapled
 # (tickets attach to bundles, not zips), and the zip is rebuilt from the
 # stapled app so offline Gatekeeper checks pass for downloaders.
-# Publishing is then e.g.: gh release create v$(VERSION) $(RELEASE_ZIP)
+# `make release` just builds the artifact; `make publish` (below) also cuts the
+# GitHub release and updates the Homebrew cask.
 # Force the prod variant for the whole release recipe (so $(APP_BUNDLE) etc.
 # resolve to the released paths, not the default dev ones) and for the build
 # sub-make. Never ship the dev variant.
@@ -108,6 +109,13 @@ release:
 	ditto -c -k --keepParent $(APP_BUNDLE) $(RELEASE_ZIP)
 	@$(call elapsed,done)
 	@echo "==> Notarized, stapled release ready: $(RELEASE_ZIP)"
+
+# Full release: build + notarize (via `make release`), publish the GitHub
+# release, and update + push the Homebrew cask. `make publish` ships the version
+# currently in Support/Info.plist.in; `make publish V=0.1.3` bumps it first.
+# See Scripts/release.sh for env overrides (REPO, TAP_DIR, NOTES, YES).
+publish:
+	@Scripts/release.sh $(V)
 
 # Regenerate Support/AgentManager.icns from the code-defined brand mark.
 # The .icns is committed, so normal builds don't run this; rerun (and commit
