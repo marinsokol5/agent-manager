@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Template — the Makefile substitutes __BUNDLE_ID__, __APP_NAME__, and
-     __EXEC_NAME__ per build variant (prod for `make release`, the `.dev`
-     variant for `make build`/`make run`). See AppVariant.swift. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>__APP_NAME__</string>
 	<key>CFBundleExecutable</key>
 	<string>__EXEC_NAME__</string>
 	<key>CFBundleIconFile</key>
@@ -17,12 +16,10 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>__APP_NAME__</string>
-	<key>CFBundleDisplayName</key>
-	<string>__APP_NAME__</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.2</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
