@@ -320,6 +320,13 @@ as failed.
   restart that never (re)registers, so it can't trigger the background-items
   notification. Restarts are double-fire safe (watermarks persist in the
   status file); don't add restart paths that bootout/bootstrap instead.
+  One upgrade path *does* need a re-register: a cask/brew upgrade deletes the
+  bundle before replacing it, and macOS tears down the SMAppService/BTM
+  registration with it (the daemon may keep running as a leftover job, but
+  nothing would relaunch it after logout/reboot). The app self-heals on
+  monitoring refresh: active + registration reading `.notRegistered`/
+  `.notFound` → one `register()` per app run (`scheduler.reregister` in the
+  audit log) — a real state change, so it can't re-notify an approved agent.
 - **Anchoring needs a real TUI turn.** Only a `tui`-style ping over a PTY anchors
   a window; headless `claude -p` / `codex exec` burn tokens without opening the
   window. Don't "optimize" pings into headless calls.

@@ -325,10 +325,56 @@ extension AppModel {
             self.scheduleWakeApprovalPollIfNeeded()
             self.scheduleSchedulerApprovalPollIfNeeded()
             self.healWakeHelperIfSpawnFailed()
+            self.healSchedulerRegistrationIfTornDown()
             self.recentActivity = result.recent
             self.monitoringLogs = result.logs
             self.monitoringRefreshedAt = Date()
             self.monitoringRefreshing = false
+        }
+    }
+
+    /// Self-heal a torn-down scheduler-agent registration. The failure mode: a
+    /// cask/brew upgrade *deletes* the app bundle before laying down the new
+    /// one, and macOS tears the SMAppService/BTM registration down with it —
+    /// afterwards `scheduler.json` still says active (and a leftover KeepAlive
+    /// job may even keep the daemon running for now), but the registration
+    /// reads `.notRegistered`, so nothing relaunches the daemon after the next
+    /// logout/reboot. Nothing on the happy path ever re-registers (the toggle
+    /// only writes `scheduler.json`; `ensureAgentViaAppService` runs only from
+    /// `activate`), so heal it here on the monitoring refresh, next to
+    /// `restartDaemonIfOutdated`. `.notFound` gets the same repair — launchd
+    /// lost track of the service and Apple's fix is registering again from the
+    /// current bundle. Registering from a genuinely unregistered state is a
+    /// real state change, so it never re-notifies an already-approved agent;
+    /// if macOS wants a fresh approval, the `requiresApproval` flow (card +
+    /// poll) takes over. One attempt per app run.
+    private func healSchedulerRegistrationIfTornDown() {
+        guard schedulerActive,
+              let previous = schedulerRegistration,
+              previous == .notRegistered || previous == .notFound,
+              !schedulerHealAttempted
+        else { return }
+        schedulerHealAttempted = true
+        let ws = workspace
+        Task {
+            let message = await Task.detached(priority: .userInitiated) { () -> String in
+                try? SchedulerAppService.register()
+                let message: String
+                switch SchedulerAppService.registration() {
+                case .enabled:
+                    message = "scheduler agent registration was lost — re-registered"
+                case .requiresApproval:
+                    message = "scheduler re-registered — allow \u{201C}\(AppVariant.displayName)\u{201D} in System Settings → Login Items"
+                default:
+                    message = "scheduler re-registration didn't take — flip \u{201C}Scheduler active\u{201D} off and on"
+                }
+                AuditLog(workspace: ws).append(
+                    accountID: nil, action: "scheduler.reregister", ok: true,
+                    detail: "registration read \(String(describing: previous)) while active — \(message)")
+                return message
+            }.value
+            statusMessage = message
+            refreshMonitoring() // re-reads state; the once-per-run flag stops a loop
         }
     }
 

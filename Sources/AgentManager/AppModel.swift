@@ -199,6 +199,10 @@ final class AppModel {
     /// short re-poll loop the wake helper uses, so the UI notices the System
     /// Settings approval by itself (SMAppService posts no notification on Allow).
     var schedulerApprovalPoll: Task<Void, Never>?
+    /// The scheduler-registration self-heal is attempted at most once per app
+    /// run (same restraint as `wakeHealAttempted`): if re-registering doesn't
+    /// take, looping on it would just churn BTM.
+    var schedulerHealAttempted = false
     /// The "Wake Mac for pings" opt-in switch (mirrors `wake.json`), flipped
     /// optimistically by `setWakeEnabled` and reconciled on refresh.
     var wakeEnabled = false
