@@ -12,8 +12,9 @@ final class SymlinkFarmTests: XCTestCase {
         source = tmp.appendingPathComponent("source-claude", isDirectory: true)
         managed = tmp.appendingPathComponent("managed", isDirectory: true)
         try fm.createDirectory(at: source, withIntermediateDirectories: true)
-        // A representative source home: a linkable dir, a linkable file, the
-        // rewritten config file, and the identity file.
+        // A representative source home: a linkable dir, a linkable file,
+        // `settings.json` (shared by symlink so plugins/hooks propagate), and
+        // the identity file.
         try fm.createDirectory(at: source.appendingPathComponent("skills"), withIntermediateDirectories: true)
         try write("hello", to: source.appendingPathComponent("CLAUDE.md"))
         try write("{}", to: source.appendingPathComponent("settings.json"))
@@ -41,7 +42,9 @@ final class SymlinkFarmTests: XCTestCase {
         let f = farm()
         XCTAssertEqual(f.classify("skills"), .symlink)
         XCTAssertEqual(f.classify("CLAUDE.md"), .symlink)
-        XCTAssertEqual(f.classify("settings.json"), .copy)
+        // settings.json is shared by symlink (so plugins/hooks/permissions
+        // enabled in the source home reach every account in the group).
+        XCTAssertEqual(f.classify("settings.json"), .symlink)
         XCTAssertEqual(f.classify(".claude.json"), .skipIdentity)
         XCTAssertEqual(f.classify("backups"), .skipLocal)
     }
@@ -73,7 +76,7 @@ final class SymlinkFarmTests: XCTestCase {
         XCTAssertNil(try? fm.destinationOfSymbolicLink(atPath: managed.appendingPathComponent("backups").path))
     }
 
-    func testApplyLinksStaticCopiesRewrittenSkipsIdentity() throws {
+    func testApplyLinksStaticAndSettingsSkipsIdentity() throws {
         _ = try farm().apply()
 
         // Static dir + file are symlinks back to the source.
@@ -83,10 +86,13 @@ final class SymlinkFarmTests: XCTestCase {
             try fm.destinationOfSymbolicLink(atPath: managed.appendingPathComponent("skills").path),
             source.appendingPathComponent("skills").path)
 
-        // The rewritten config is a real copy, not a link (so edits don't bleed back).
+        // settings.json is symlinked too, so a plugin/hook/permission enabled in
+        // the source home later is live in the account (not frozen at creation).
         let settings = managed.appendingPathComponent("settings.json")
-        XCTAssertTrue(fm.fileExists(atPath: settings.path))
-        XCTAssertFalse(try isSymlink(settings))
+        XCTAssertTrue(try isSymlink(settings))
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: settings.path),
+            source.appendingPathComponent("settings.json").path)
 
         // The identity file is never created here (login writes it, per account).
         XCTAssertFalse(fm.fileExists(atPath: managed.appendingPathComponent(".claude.json").path))

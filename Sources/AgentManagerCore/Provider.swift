@@ -57,13 +57,25 @@ public enum Provider: String, Codable, Sendable, CaseIterable {
         }
     }
 
-    /// Depth-1 children of the source home that the CLI tends to **rewrite** in
-    /// place. Copied on create rather than symlinked, so an edit by one account
-    /// never bleeds back into the shared source and across the other accounts.
+    /// Depth-1 children of the source home to *copy* on create rather than
+    /// symlink — for a file the CLI **rewrites via atomic temp-and-rename**, a
+    /// symlink would be replaced by a divergent real file on the first write, so
+    /// the copy keeps such edits from bleeding into the shared source.
+    ///
+    /// Empty for both providers today: the shared config files each CLI
+    /// rewrites — Claude's `settings.json`, Codex's `config.toml` — are edited
+    /// **in place** (verified: a symlink survives a session), so we symlink them.
+    /// That's deliberate: `settings.json` carries `enabledPlugins`, the `hooks`
+    /// wiring, `permissions`, and `model`; a frozen copy meant anything enabled
+    /// in the source home *after* account-creation (a new plugin, a new hook)
+    /// never reached the account. Symlinking shares one live config across the
+    /// whole source-home group — the accepted trade-off being that a setting one
+    /// account changes is seen by the others (the meaning of a shared group).
+    /// Identity stays separate regardless (`identityFileName` / `localOnlyEntries`).
     public var rewrittenConfigFiles: Set<String> {
         switch self {
-        case .claude: ["settings.json"]
-        case .codex: ["config.toml"]
+        case .claude: []
+        case .codex: []
         }
     }
 

@@ -15,7 +15,7 @@ final class CodexTests: XCTestCase {
         XCTAssertTrue(Provider.allCases.contains(.codex))
     }
 
-    // MARK: Symlink classification (auth.json = identity, config.toml = copy)
+    // MARK: Symlink classification (auth.json = identity; config.toml shared)
 
     func testCodexSymlinkClassification() {
         let farm = SymlinkFarm(
@@ -23,7 +23,9 @@ final class CodexTests: XCTestCase {
             sourceHome: URL(fileURLWithPath: "/src"),
             managedHome: URL(fileURLWithPath: "/dst"))
         XCTAssertEqual(farm.classify("auth.json"), .skipIdentity)
-        XCTAssertEqual(farm.classify("config.toml"), .copy)
+        // config.toml is rewritten in place, so it's symlinked (shared) — the
+        // model/approval/MCP config stays live across the source-home group.
+        XCTAssertEqual(farm.classify("config.toml"), .symlink)
         XCTAssertEqual(farm.classify("sessions"), .symlink)
     }
 

@@ -7,8 +7,12 @@ import Foundation
 /// Per the design's sharing caveats:
 /// - the **identity file** (`.claude.json`) is never linked — it stays real and
 ///   per-account (login writes it);
-/// - files the CLI **rewrites** (`settings.json`) are *copied* on create, not
-///   linked, so an edit doesn't bleed into the shared source and across accounts;
+/// - the shared config files each CLI rewrites (Claude's `settings.json`,
+///   Codex's `config.toml`) are **symlinked** — they're edited in place, so a
+///   plugin/hook/permission enabled in the source home stays live across the
+///   whole source-home group instead of freezing at account-creation. (A file
+///   rewritten via atomic temp-and-rename would instead need copying, so
+///   `rewrittenConfigFiles` stays the escape hatch — it's just empty today.)
 /// - everything else is symlinked. New files *inside* an already-linked dir
 ///   resolve through the dir symlink automatically; only new *top-level* entries
 ///   need reconciling, which `apply()` does (it's re-runnable).
