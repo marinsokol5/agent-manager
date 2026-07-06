@@ -9,11 +9,8 @@ It lets you run each account as a separate agent session, keep an
 eye on how much usage each one has left, and warm up an account's usage
 window to increase the number of tokens available.
 
-> Agent Manager only touches accounts **you own and pay for**. It drives the
-> official `claude` / `codex` CLIs and never proxies or stores your OAuth tokens —
-> it only reads the credentials those tools already wrote.
 
-## What it does
+## What
 
 ### 1. Run any account independently
 
@@ -27,7 +24,7 @@ This starts a `claude` or `codex` session under that account's own isolated conf
 home and hands your terminal to the CLI. Your normal `~/.claude` / `~/.codex` login is never touched.
 
 Each account's home symlinks back to your real `~/.claude` / `~/.codex` for
-everything except the per-account identity file, so accounts share the same
+everything except the per-account identity file (`.claude.json` and `auth.json`), so accounts share the same
 settings **and the same session history**. That means you can pick a session back
 up under a different account — handy when one account's window runs out mid-task:
 
@@ -67,52 +64,35 @@ individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 
 Instead of starting your subscription's 5-hour usage window on your first request, start it at a fixed time beforehand, to maximize the number of tokens available when working.
 
-Simply paint your working hours in the app, flip the **Scheduler active**
+Paint your working hours in the app, flip the **Scheduler active**
 switch, and Agent Manager fires a small ping to open each account's window just
-before you start — so you begin the day with a fresh window instead of starting
+before you start, so that you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
 
 ![Planner screen: working hours painted on a weekly grid, the ping schedule, and the daily token-window timeline](screenshots/planner.png)
 
-The pings come from one resident background agent (installed once — macOS shows
-its "background items" notification a single time, ever). While the switch is
-on, calendar repaints and account changes apply live; there's no re-apply step.
-
-```bash
-am ping <id>             # open <id>'s 5h window now (also what the scheduler runs)
-```
-
-Each ping is a real interactive turn in the official CLI over a terminal —
-never an SDK or programmatic call — to stay future-proof and not lose access
+Each ping is a real interactive turn in the CLI over a managed terminal, not an SDK or programmatic call, to stay future-proof and not lose access
 through policy changes like
 [this one](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 
-Pings stay minimal — a couple around the edges of your day, not all night. A
-ping the Mac slept through is skipped, not fired late.
-
-**Lid closed?** Optionally flip **Wake Mac for pings** in Preferences: a tiny root helper
-(approved once in System Settings → Login Items) arms a hardware wake ~45
+**Lid closed or Mac sleeping?** Flip **Wake Mac for pings** in Preferences: a tiny helper arms a hardware wake ~45
 seconds before each ping, the ping runs, and the Mac goes back to sleep if
-nobody's around. Firmware rule: a closed lid only wakes on AC power.
+nobody's around.
 
-**Lid closed *on battery*?** That's the one case no software can wake the Mac, so for Claude Code accounts we use a cloud routine's compute to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences. It keeps a tiny one-shot routine — "AgentManager Routine",
+**Lid closed *on battery*?** That's the one case no software can wake on Mac, so for Claude Code accounts we use Anthropic's cloud compute for routines to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences. It keeps a tiny one-shot routine — "AgentManager Routine",
 visible at claude.ai/code/routines — armed 5 minutes after each scheduled ping.
 A ping that runs locally disarms the pending routine, so it never fires; but a ping
-the sleeping Mac misses lets Anthropic's cloud run it instead (one minimal
-Haiku turn that opens the window), and the redundant local ping is skipped on
-wake.
+the sleeping Mac misses lets Anthropic's cloud run it instead.
 
 ## CLI reference
 
 ```
-am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
 am list                   list accounts with status + provider
-am usage [<id>]           capacity for connected accounts (--week, --provider, --sort, --no-color)
-am ping <id>              fire one ping now — opens <id>'s 5h window
+am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
+am usage [<id>]           capacity for connected accounts (--week, --provider, --sort)
 ```
 
-Adding and connecting accounts, and painting your work hours, happen in the app
-(the **Agents**, **Planner**, and **Monitoring** screens). The CLI handles only the running-related actions.
+Everything else is doable only in the app, the CLI handles only running-related actions.
 
 ## How it works
 
@@ -140,25 +120,6 @@ Adding and connecting accounts, and painting your work hours, happen in the app
 
 - macOS 14 (Sonoma) or later
 - The `claude` and/or `codex` CLI, installed and logged in at least once
-- Swift 6 toolchain (Xcode 16+) to build from source
-
-## Build & run
-
-```bash
-git clone https://github.com/marinsokol5/agent-manager.git agent-manager
-cd agent-manager
-
-swift build            # library, CLI, and app
-swift test             # test suite
-.build/debug/am help   # the CLI
-
-# `make build` assembles and codesigns .build/AgentManager.app (the bundle is
-# what makes the wake helper's System Settings approval flow possible), and
-# `make run` opens it. Signing uses a local dev identity so Keychain grants
-# survive rebuilds: create a self-signed "AgentManager Dev" certificate in
-# Keychain Access first (or pass CODESIGN_ID="Developer ID Application: …").
-make run
-```
 
 ## Where your data lives
 
@@ -189,16 +150,13 @@ a personal optimization, not a guarantee.
 ## Contributing
 
 Architecture, commands, conventions, and the security rules the code assumes are in
-**[AGENTS.md](AGENTS.md)**. The logic lives in `AgentManagerCore` (unit-tested);
+**[AGENTS.md](AGENTS.md)**. The logic lives in `AgentManagerCore`;
 the app and CLI are thin layers over it.
 
 ## License
 
 [MIT](LICENSE) © 2026 Marin Sokol
 
----
 
-_Agent Manager is an independent project — not affiliated with, endorsed by, or
-sponsored by Anthropic or OpenAI. "Claude", "Claude Code", and "Codex" are
-trademarks of their respective owners. It manages only accounts you own and pay
-for, and drives each provider's official CLI._
+_This is an independent project — not affiliated with by Anthropic or OpenAI. "Claude", "Claude Code", and "Codex" are
+trademarks of their respective owners._
