@@ -4,8 +4,9 @@
 homes/
 .DS_Store
 
-# Local Claude Code settings (personal paths / machine-specific permissions)
-.claude/settings.local.json
+# Local Claude Code state (personal settings, machine-specific permissions,
+# session worktrees) — carve out exceptions if shareable project config lands
+.claude/
 CLAUDE.local.md
 
 # Internal-only notes (strategy / product proposals) — not for the public repo
