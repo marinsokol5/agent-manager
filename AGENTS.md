@@ -178,6 +178,9 @@ design follows from them.
 - `scheduler-status.json` — the scheduler daemon's heartbeat + upcoming-queue
   snapshot, rewritten every tick (plus `scheduler.lock`, its flock file).
 - `usage.json`, `usage-ratelimit.json` — cached readings / 429 backoff.
+- `keychain-grants.json` — which Keychain services the `/usr/bin/security` read
+  path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
+  any of them stay silent (see `KeychainGrantStore`).
 - `preferences.json` — display preferences (e.g. clock style), shared by app + CLI.
 - `audit.log.jsonl`, `activity.jsonl`, `network.jsonl` — the three local logs
   shown in Monitoring.

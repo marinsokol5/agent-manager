@@ -171,17 +171,46 @@ final class ParsingTests: XCTestCase {
 
     // MARK: KeychainGrantStore (security-CLI grant memory)
 
+    private func makeGrantStoreFixture() throws -> (store: KeychainGrantStore, fileURL: URL, defaults: UserDefaults) {
+        let dir = fm.temporaryDirectory.appendingPathComponent("am-grants-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let suite = "am-grant-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+        let fileURL = dir.appendingPathComponent("keychain-grants.json")
+        return (KeychainGrantStore(fileURL: fileURL, legacyDefaults: defaults), fileURL, defaults)
+    }
+
     func testKeychainGrantStoreRoundTrip() throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "am-grant-\(UUID().uuidString)"))
+        let (store, _, _) = try makeGrantStoreFixture()
         let svc = "Claude Code-credentials-abc123"
-        XCTAssertFalse(KeychainGrantStore.isGranted(svc, defaults: defaults))
-        KeychainGrantStore.markGranted(svc, defaults: defaults)
-        XCTAssertTrue(KeychainGrantStore.isGranted(svc, defaults: defaults))
+        XCTAssertFalse(store.isGranted(svc))
+        store.markGranted(svc)
+        XCTAssertTrue(store.isGranted(svc))
         // Idempotent + isolated per service.
-        KeychainGrantStore.markGranted(svc, defaults: defaults)
-        XCTAssertFalse(KeychainGrantStore.isGranted("other-svc", defaults: defaults))
-        KeychainGrantStore.clearGranted(svc, defaults: defaults)
-        XCTAssertFalse(KeychainGrantStore.isGranted(svc, defaults: defaults))
+        store.markGranted(svc)
+        XCTAssertFalse(store.isGranted("other-svc"))
+        store.clearGranted(svc)
+        XCTAssertFalse(store.isGranted(svc))
+    }
+
+    func testKeychainGrantStoreMigratesLegacyDefaultsAndSharesViaFile() throws {
+        let (store, fileURL, defaults) = try makeGrantStoreFixture()
+        // Older builds kept the flags in (per-process) UserDefaults; the first
+        // load seeds the shared file from them and clears the legacy key.
+        defaults.set(["svc-a", "svc-b"], forKey: "keychainSecurityCLIGrantedServices")
+        XCTAssertTrue(store.isGranted("svc-a"))
+        XCTAssertTrue(fm.fileExists(atPath: fileURL.path))
+        XCTAssertNil(defaults.stringArray(forKey: "keychainSecurityCLIGrantedServices"))
+        // A second store on the same file (≈ another process: app vs am vs
+        // daemon) sees the same grants without any defaults of its own —
+        // the cross-process gap the file replaces UserDefaults to close.
+        let otherDefaults = try XCTUnwrap(UserDefaults(suiteName: "am-grant-\(UUID().uuidString)"))
+        let other = KeychainGrantStore(fileURL: fileURL, legacyDefaults: otherDefaults)
+        XCTAssertTrue(other.isGranted("svc-b"))
+        other.clearGranted("svc-b") // self-heal propagates back the same way
+        XCTAssertFalse(store.isGranted("svc-b"))
+        XCTAssertTrue(store.isGranted("svc-a"))
     }
 
     // MARK: UsageReportRenderer (am usage)

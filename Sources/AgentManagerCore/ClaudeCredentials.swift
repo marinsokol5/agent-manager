@@ -23,17 +23,19 @@ public enum ClaudeCredentials {
             return KeychainProbe.readGenericPasswordData(service: service, allowInteraction: allowInteraction)
 
         case .securityCLIWithFrameworkFallback:
+            let grants = KeychainGrantStore()
             if allowInteraction {
-                // User action. Go straight to the CLI so the grant binds to
-                // `/usr/bin/security` (stable identity) — its prompt says
-                // "security", and "Always Allow" then survives our rebuilds.
+                // User action. Go straight to the CLI — normally silent, since
+                // the claude CLI trusts `security` from item creation; if the
+                // ACL was altered, its one-time prompt says "security" and
+                // "Always Allow" binds to that stable identity.
                 // IMPORTANT: do NOT try an in-process framework read first — that
                 // prompts as "AgentManager" and binds a non-durable app grant.
                 if let data = KeychainProbe.readGenericPasswordDataViaSecurityCLI(service: service) {
-                    KeychainGrantStore.markGranted(service)
+                    grants.markGranted(service)
                     return data
                 }
-                KeychainGrantStore.clearGranted(service)
+                grants.clearGranted(service)
                 // Last resort only if `/usr/bin/security` is unavailable.
                 return KeychainProbe.readGenericPasswordData(service: service, allowInteraction: true)
             } else {
@@ -41,11 +43,11 @@ public enum ClaudeCredentials {
                 // otherwise DEFER. We never do a framework read here: the legacy ACL
                 // "allow access" dialog isn't reliably suppressed, so a background
                 // framework read can still prompt ("AgentManager wants to access…").
-                guard KeychainGrantStore.isGranted(service) else { return nil }
+                guard grants.isGranted(service) else { return nil }
                 if let data = KeychainProbe.readGenericPasswordDataViaSecurityCLI(service: service) {
                     return data
                 }
-                KeychainGrantStore.clearGranted(service) // ACL changed → self-heal
+                grants.clearGranted(service) // ACL changed → self-heal
                 return nil
             }
         }

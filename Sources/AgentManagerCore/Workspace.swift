@@ -80,6 +80,13 @@ public struct Workspace: Sendable {
     /// GUI app and the `am` CLI so both render times the same way.
     public var preferencesFile: URL { root.appendingPathComponent("preferences.json") }
 
+    /// `keychain-grants.json` — Keychain services for which a `/usr/bin/security`
+    /// read is verified to succeed silently. Shared by the app, `am`, and the
+    /// scheduler daemon so a background read in any of them can use the CLI path
+    /// without risking a prompt — see `KeychainGrantStore` for why this must not
+    /// live in per-process `UserDefaults`.
+    public var keychainGrantsFile: URL { root.appendingPathComponent("keychain-grants.json") }
+
     /// `scheduler.json` — the resident scheduler's active flag. The app's
     /// "Scheduler active" toggle writes this (never launchd) so switching the
     /// scheduler on/off can't re-fire macOS's "background items" notifications.
