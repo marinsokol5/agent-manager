@@ -62,7 +62,7 @@ public enum LaunchAgentPlanner {
         let parallelism = schedule.resolvedParallelism(accountCount: accountIDs.count)
         for wd in 0..<7 {
             let blocks = schedule.blocks(forWeekday: wd)
-            let dayPlan = ScheduleEngine.planDay(forAccountIDs: accountIDs, workBlocks: blocks, window: schedule.windowMinutes, parallelism: parallelism)
+            let dayPlan = ScheduleEngine.planDay(forAccountIDs: accountIDs, workBlocks: blocks, window: schedule.windowMinutes, parallelism: parallelism, minSlice: schedule.resolvedMinSliceMinutes)
             if let plan = dayPlan.accounts.first(where: { $0.accountID == accountID }) {
                 for p in plan.pings {
                     entries.append(toCalEntry(weekdayMon0: wd, atMin: p.atMin))

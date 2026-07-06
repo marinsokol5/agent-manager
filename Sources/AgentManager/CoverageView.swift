@@ -53,8 +53,39 @@ struct DayConsumptionTimeline: View {
 
             Spacer(minLength: 0)
 
+            minSliceStepper
             parallelismStepper
         }
+    }
+
+    /// The engine's budget-slice floor: the shortest usable stretch a fresh
+    /// token budget is worth a ping for. Raising it folds the sliver budgets at
+    /// a block's edges into fewer, longer ones (a 6h day: 30m+5h+30m on three
+    /// pings → 3h+3h on two), so it sits beside the parallelism stepper as the
+    /// other knob that shapes the ping schedule below.
+    private var minSliceStepper: some View {
+        Stepper(
+            value: Binding(get: { model.minSliceMinutes }, set: { model.setMinSlice(minutes: $0) }),
+            in: model.minSliceRange,
+            step: 15
+        ) {
+            Text("Min token block \(Self.durationLabel(model.minSliceMinutes))")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .controlSize(.small)
+        .fixedSize()
+        .help("The shortest usable block of a fresh token window worth scheduling a ping for. Raising it trades edge slivers for fewer, longer blocks — e.g. a 6-hour day becomes 3h + 3h on two pings instead of 30 min + 5h + 30 min on three.")
+    }
+
+    /// "30m", "1h", "1h 15m" — compact duration for the stepper label.
+    private static func durationLabel(_ minutes: Int) -> String {
+        let h = minutes / 60
+        let m = minutes % 60
+        if h == 0 { return "\(m)m" }
+        if m == 0 { return "\(h)h" }
+        return "\(h)h \(m)m"
     }
 
     /// How many accounts run concurrently (parallel lanes). It sits in this

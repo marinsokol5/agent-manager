@@ -23,10 +23,12 @@ public struct CloudFallbackSyncRequest: Sendable, Equatable {
 public typealias CloudFallbackSyncer = @Sendable (CloudFallbackSyncRequest) async -> Void
 
 /// Executes `CloudFallbackPlanner` decisions against the claude.ai routines
-/// API: creates the account's one-shot "AgentManager Routine", re-arms its
-/// `run_once_at` forward after anchored local pings, disables it when the
-/// feature (or the scheduler) turns off, and recreates it if the user deleted
-/// it on the web. Owns `cloud-fallback-state.json` — the daemon only reads it.
+/// API: keeps the account's one-shot "AgentManager Routine" as the *single*
+/// routine we ever put in the customer's list — re-arming its `run_once_at`
+/// forward after anchored local pings, disabling it when the feature (or the
+/// scheduler) turns off, and, when no routine is pinned locally, re-adopting
+/// an existing one by name before ever creating (see `adoptOrCreateRoutine`).
+/// Owns `cloud-fallback-state.json` — the daemon only reads it.
 ///
 /// Deliberate omissions, both load-bearing:
 /// - **No delegated token refresh.** `ClaudeTokenRefresher` runs `/status`,
@@ -45,17 +47,20 @@ public struct CloudFallbackEngine: Sendable {
     public struct API: Sendable {
         public var listEnvironments: @Sendable (TriggerClient.Auth, String) async throws -> [CloudEnvironment]
         public var createEnvironment: @Sendable (TriggerClient.Auth, String) async throws -> CloudEnvironment
+        public var listRoutines: @Sendable (TriggerClient.Auth, String) async throws -> [CloudTrigger]
         public var createRoutine: @Sendable (AnchorRoutineSpec, TriggerClient.Auth, String) async throws -> CloudTrigger
         public var updateRoutine: @Sendable (String, TriggerPatch, TriggerClient.Auth, String) async throws -> CloudTrigger
 
         public init(
             listEnvironments: @escaping @Sendable (TriggerClient.Auth, String) async throws -> [CloudEnvironment],
             createEnvironment: @escaping @Sendable (TriggerClient.Auth, String) async throws -> CloudEnvironment,
+            listRoutines: @escaping @Sendable (TriggerClient.Auth, String) async throws -> [CloudTrigger],
             createRoutine: @escaping @Sendable (AnchorRoutineSpec, TriggerClient.Auth, String) async throws -> CloudTrigger,
             updateRoutine: @escaping @Sendable (String, TriggerPatch, TriggerClient.Auth, String) async throws -> CloudTrigger)
         {
             self.listEnvironments = listEnvironments
             self.createEnvironment = createEnvironment
+            self.listRoutines = listRoutines
             self.createRoutine = createRoutine
             self.updateRoutine = updateRoutine
         }
@@ -70,6 +75,9 @@ public struct CloudFallbackEngine: Sendable {
                         name: "Agent Manager",
                         description: "Created by Agent Manager for its cloud anchor routine (no repo, no tools).",
                         auth: auth, accountID: id, log: log)
+                },
+                listRoutines: { auth, id in
+                    try await TriggerClient.listTriggers(auth: auth, accountID: id, log: log)
                 },
                 createRoutine: { spec, auth, id in
                     try await TriggerClient.createAnchorRoutine(spec, auth: auth, accountID: id, log: log)
@@ -201,7 +209,6 @@ public struct CloudFallbackEngine: Sendable {
                 }
 
             case let .arm(runAt):
-                let environmentID = try await resolveEnvironment(&state, auth: auth, accountID: accountID)
                 if let triggerID = state.triggerID {
                     do {
                         _ = try await api.updateRoutine(
@@ -211,23 +218,16 @@ public struct CloudFallbackEngine: Sendable {
                         audit.append(accountID: accountID, action: "routine.arm", ok: true,
                                      detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(triggerID)")
                     } catch TriggerAPIError.notFound {
-                        // The user deleted it on claude.ai; make a fresh one.
-                        let created = try await createRoutine(runAt: runAt, environmentID: environmentID,
-                                                              auth: auth, accountID: accountID)
-                        state.triggerID = created.id
-                        state.armedFor = runAt
-                        state.disabled = false
-                        audit.append(accountID: accountID, action: "routine.create", ok: true,
-                                     detail: "recreated (deleted on claude.ai) — armed for \(TriggerClient.rfc3339(runAt)) — \(created.id)")
+                        // The user deleted it on claude.ai. A sibling may
+                        // still exist (another install's routine) — adopt it
+                        // before resorting to a create.
+                        state.triggerID = nil
+                        try await adoptOrCreateRoutine(
+                            runAt: runAt, state: &state, auth: auth, accountID: accountID, audit: audit)
                     }
                 } else {
-                    let created = try await createRoutine(runAt: runAt, environmentID: environmentID,
-                                                          auth: auth, accountID: accountID)
-                    state.triggerID = created.id
-                    state.armedFor = runAt
-                    state.disabled = false
-                    audit.append(accountID: accountID, action: "routine.create", ok: true,
-                                 detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(created.id)")
+                    try await adoptOrCreateRoutine(
+                        runAt: runAt, state: &state, auth: auth, accountID: accountID, audit: audit)
                 }
             }
 
@@ -244,6 +244,52 @@ public struct CloudFallbackEngine: Sendable {
             audit.append(accountID: accountID, action: name, ok: false, detail: detail)
         }
         return state
+    }
+
+    /// The list-before-create step that keeps the customer's routine list at
+    /// one "AgentManager Routine" per account. The stored `triggerID` normally
+    /// pins the routine, but that ID lives only in `cloud-fallback-state.json`
+    /// — losable to an uninstall/reinstall, a dev-variant build with its own
+    /// workspace, or a re-added account slug — while the routines *list* is
+    /// permanent from our side (the API exposes DELETE only to web sessions).
+    /// So whenever no routine is pinned, re-adopt an existing one by name and
+    /// patch it into shape; create only when the account has zero of ours.
+    /// Duplicates left behind by older installs are paused (best-effort — the
+    /// strongest cleanup the API allows), so at most one copy can ever fire;
+    /// removing them from the list entirely is a one-time manual delete on
+    /// claude.ai.
+    private func adoptOrCreateRoutine(
+        runAt: Date,
+        state: inout AccountCloudFallbackState,
+        auth: TriggerClient.Auth,
+        accountID: String,
+        audit: AuditLog) async throws
+    {
+        let ours = try await api.listRoutines(auth, accountID).filter { $0.name == Self.routineName }
+        if let adopted = ours.first(where: \.enabled) ?? ours.first {
+            _ = try await api.updateRoutine(
+                adopted.id, TriggerPatch(runOnceAt: runAt, enabled: true), auth, accountID)
+            state.triggerID = adopted.id
+            state.armedFor = runAt
+            state.disabled = false
+            audit.append(accountID: accountID, action: "routine.adopt", ok: true,
+                         detail: "adopted existing — armed for \(TriggerClient.rfc3339(runAt)) — \(adopted.id)")
+            for extra in ours where extra.id != adopted.id && extra.enabled {
+                guard (try? await api.updateRoutine(
+                    extra.id, TriggerPatch(enabled: false), auth, accountID)) != nil else { continue }
+                audit.append(accountID: accountID, action: "routine.disable", ok: true,
+                             detail: "paused duplicate \(extra.id)")
+            }
+        } else {
+            let environmentID = try await resolveEnvironment(&state, auth: auth, accountID: accountID)
+            let created = try await createRoutine(runAt: runAt, environmentID: environmentID,
+                                                  auth: auth, accountID: accountID)
+            state.triggerID = created.id
+            state.armedFor = runAt
+            state.disabled = false
+            audit.append(accountID: accountID, action: "routine.create", ok: true,
+                         detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(created.id)")
+        }
     }
 
     private func createRoutine(

@@ -22,7 +22,8 @@ extension AppModel {
             forAccountIDs: ids,
             workBlocks: schedule.blocks(forWeekday: d),
             window: schedule.windowMinutes,
-            parallelism: schedule.resolvedParallelism(accountCount: ids.count))
+            parallelism: schedule.resolvedParallelism(accountCount: ids.count),
+            minSlice: schedule.resolvedMinSliceMinutes)
     }
 
     // MARK: - paint (edit `schedule`)
@@ -92,6 +93,23 @@ extension AppModel {
     func setParallelism(_ n: Int) {
         let cap = parallelAccountCap
         schedule.parallelism = (n >= cap) ? nil : max(n, 1)
+        saveSchedule()
+    }
+
+    /// The engine's budget-slice floor as shown in the coverage stepper, and
+    /// its bounds: 15 minutes up to one full window (beyond which nothing
+    /// could ever satisfy it).
+    var minSliceMinutes: Int { schedule.resolvedMinSliceMinutes }
+    var minSliceRange: ClosedRange<Int> {
+        minSliceFloorMinutes...max(schedule.windowMinutes, minSliceFloorMinutes)
+    }
+
+    /// Set the floor. The default stores `nil` — old `schedule.json` files stay
+    /// byte-identical until the user actually reaches for the knob (mirrors how
+    /// `setParallelism` stores the max as `nil`).
+    func setMinSlice(minutes: Int) {
+        let clamped = min(max(minutes, minSliceRange.lowerBound), minSliceRange.upperBound)
+        schedule.minSliceMinutes = (clamped == defaultMinSliceMinutes) ? nil : clamped
         saveSchedule()
     }
 

@@ -250,7 +250,8 @@ final class CloudFallbackTests: XCTestCase {
         private let lock = NSLock()
         private var callLog: [String] = []
         var environments: [CloudEnvironment] = []
-        var updateError: TriggerAPIError?
+        var triggers: [CloudTrigger] = []
+        var updateErrors: [String: TriggerAPIError] = [:]
         private(set) var createdSpecs: [AnchorRoutineSpec] = []
         private(set) var patches: [(id: String, patch: TriggerPatch)] = []
 
@@ -273,14 +274,18 @@ final class CloudFallbackTests: XCTestCase {
                     record("createEnv")
                     return CloudEnvironment(id: "env_new", kind: "anthropic_cloud", name: "Agent Manager", state: "active")
                 },
+                listRoutines: { [self] _, _ in
+                    record("list")
+                    return triggers
+                },
                 createRoutine: { [self] spec, _, _ in
                     recordCreate(spec)
                     return CloudTrigger(id: "trig_new", enabled: true, runOnceAt: spec.runOnceAt)
                 },
                 updateRoutine: { [self] id, patch, _, _ in
-                    if let updateError {
+                    if let error = updateErrors[id] {
                         record("updateFail")
-                        throw updateError
+                        throw error
                     }
                     recordPatch(id, patch)
                     return CloudTrigger(id: id, enabled: patch.enabled ?? true, runOnceAt: patch.runOnceAt)
@@ -307,7 +312,9 @@ final class CloudFallbackTests: XCTestCase {
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
 
-        XCTAssertEqual(api.calls, ["listEnv", "createEnv", "create"])
+        // Nothing pinned locally → list first (adopt-or-create), find nothing
+        // of ours, then discover/create the environment and create.
+        XCTAssertEqual(api.calls, ["list", "listEnv", "createEnv", "create"])
         XCTAssertEqual(api.createdSpecs.first?.name, "AgentManager Routine")
         XCTAssertEqual(api.createdSpecs.first?.model, CloudFallbackEngine.routineModel)
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
@@ -343,7 +350,7 @@ final class CloudFallbackTests: XCTestCase {
     func testEngineRecreatesWhenRoutineDeletedOnWeb() async throws {
         let ws = makeWorkspace()
         let api = FakeAPI()
-        api.updateError = .notFound
+        api.updateErrors["trig_gone"] = .notFound
         let engine = try makeEngine(ws, api: api)
 
         var seed = CloudFallbackState()
@@ -355,9 +362,89 @@ final class CloudFallbackTests: XCTestCase {
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
             lastAnchoredFireAt: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
 
-        XCTAssertEqual(api.calls, ["updateFail", "create"])
+        // 404 → look for an adoptable sibling first; none → create.
+        XCTAssertEqual(api.calls, ["updateFail", "list", "create"])
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_new")
+        XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 5))
+        XCTAssertNil(state?.lastError)
+    }
+
+    func testEngineAdoptsExistingRoutineInsteadOfCreating() async throws {
+        // A wiped state file (uninstall/reinstall, dev-variant workspace) must
+        // not grow the customer's routine list: the engine re-adopts the
+        // existing "AgentManager Routine" by name and re-arms it in place.
+        let ws = makeWorkspace()
+        let api = FakeAPI()
+        api.triggers = [
+            CloudTrigger(id: "trig_user", name: "My own routine", enabled: true),
+            CloudTrigger(id: "trig_old", name: "AgentManager Routine", enabled: false,
+                         runOnceAt: date(2026, 7, 5, 19, 35)),
+        ]
+        let engine = try makeEngine(ws, api: api)
+        let fire = date(2026, 7, 6, 5, 0)
+
+        await engine.sync(CloudFallbackSyncRequest(
+            accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+
+        XCTAssertEqual(api.calls, ["list", "update"]) // no create, no env discovery
+        XCTAssertEqual(api.patches.first?.id, "trig_old")
+        XCTAssertEqual(api.patches.first?.patch.runOnceAt, fire.addingTimeInterval(300))
+        XCTAssertEqual(api.patches.first?.patch.enabled, true)
+        let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
+        XCTAssertEqual(state?.triggerID, "trig_old")
+        XCTAssertEqual(state?.armedFor, fire.addingTimeInterval(300))
+        XCTAssertNil(state?.lastError)
+    }
+
+    func testEngineAdoptPrefersEnabledRoutineAndPausesDuplicates() async throws {
+        // Multiple leftovers from older installs: adopt the live one (it is
+        // the only copy that could fire) and pause the other enabled strays —
+        // the strongest cleanup the API allows (DELETE is web-only).
+        let ws = makeWorkspace()
+        let api = FakeAPI()
+        api.triggers = [
+            CloudTrigger(id: "trig_paused", name: "AgentManager Routine", enabled: false),
+            CloudTrigger(id: "trig_live", name: "AgentManager Routine", enabled: true),
+            CloudTrigger(id: "trig_stray", name: "AgentManager Routine", enabled: true),
+        ]
+        let engine = try makeEngine(ws, api: api)
+        let fire = date(2026, 7, 6, 5, 0)
+
+        await engine.sync(CloudFallbackSyncRequest(
+            accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+
+        XCTAssertEqual(api.calls, ["list", "update", "update"])
+        XCTAssertEqual(api.patches[0].id, "trig_live")
+        XCTAssertEqual(api.patches[0].patch.enabled, true)
+        XCTAssertEqual(api.patches[1].id, "trig_stray")
+        XCTAssertEqual(api.patches[1].patch.enabled, false)
+        XCTAssertNil(api.patches[1].patch.runOnceAt)
+        XCTAssertEqual(CloudFallbackStateStore(workspace: ws).load().accounts["a1"]?.triggerID, "trig_live")
+    }
+
+    func testEngineAdoptsSiblingAfterWebDelete() async throws {
+        // The pinned routine 404s (deleted on claude.ai) but another install's
+        // sibling exists — adopt it rather than creating a third.
+        let ws = makeWorkspace()
+        let api = FakeAPI()
+        api.updateErrors["trig_gone"] = .notFound
+        api.triggers = [CloudTrigger(id: "trig_sibling", name: "AgentManager Routine", enabled: false)]
+        let engine = try makeEngine(ws, api: api)
+
+        var seed = CloudFallbackState()
+        seed.accounts["a1"] = AccountCloudFallbackState(
+            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 5))
+        CloudFallbackStateStore(workspace: ws).save(seed)
+
+        await engine.sync(CloudFallbackSyncRequest(
+            accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
+            lastAnchoredFireAt: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
+
+        XCTAssertEqual(api.calls, ["updateFail", "list", "update"])
+        XCTAssertEqual(api.patches.first?.id, "trig_sibling")
+        let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
+        XCTAssertEqual(state?.triggerID, "trig_sibling")
         XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 5))
         XCTAssertNil(state?.lastError)
     }

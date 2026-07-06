@@ -22,16 +22,27 @@ public struct WorkSchedule: Codable, Sendable, Equatable {
     /// in parallel — so a smaller number rests spare accounts while keeping N hot.
     /// Optional so old `schedule.json` files (which lack the key) decode to `nil`.
     public var parallelism: Int?
+    /// The engine's budget-slice floor (minutes): the shortest usable in-block
+    /// stretch a scheduled token budget is worth anchoring a ping for. `nil` =
+    /// the default (`defaultMinSliceMinutes`, 1h). Raising it trades budget
+    /// *count* for usable budget *length* — the planner stops pre-pinging for
+    /// edge slivers shorter than this and rebalances each block into fewer,
+    /// longer slices (a 6h day at 60+ becomes 3h + 3h on two pings instead of
+    /// 30m + 5h + 30m on three). Optional so old `schedule.json` files (which
+    /// lack the key) decode to `nil`.
+    public var minSliceMinutes: Int?
 
     public init(
         version: Int = WorkSchedule.currentVersion,
         windowMinutes: Int = defaultWindowMinutes,
         hoursByWeekday: [[Int]] = Array(repeating: [], count: 7),
-        parallelism: Int? = nil)
+        parallelism: Int? = nil,
+        minSliceMinutes: Int? = nil)
     {
         self.version = version
         self.windowMinutes = windowMinutes
         self.parallelism = parallelism
+        self.minSliceMinutes = minSliceMinutes
         // Defend against a short/long array sneaking in from hand-edited JSON.
         var days = hoursByWeekday
         while days.count < 7 { days.append([]) }
@@ -45,6 +56,15 @@ public struct WorkSchedule: Codable, Sendable, Equatable {
     public func resolvedParallelism(accountCount: Int) -> Int {
         let cap = max(accountCount, 1)
         return min(max(parallelism ?? cap, 1), cap)
+    }
+
+    /// Resolve the configured budget-slice floor for the engine: the stored
+    /// preference clamped into `minSliceFloorMinutes...windowMinutes` (below
+    /// 15 min a "budget" stops being one; above one window nothing could ever
+    /// satisfy it). `nil` — the default — resolves to `defaultMinSliceMinutes`.
+    public var resolvedMinSliceMinutes: Int {
+        let cap = max(windowMinutes, minSliceFloorMinutes)
+        return min(max(minSliceMinutes ?? defaultMinSliceMinutes, minSliceFloorMinutes), cap)
     }
 
     /// Weekday labels, index 0 = Monday.

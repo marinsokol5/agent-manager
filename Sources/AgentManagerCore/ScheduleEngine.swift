@@ -16,17 +16,37 @@ import Foundation
 // pings so the maximum number of fresh window budgets overlap the hours you
 // actually work — including a **pre-ping before work starts** so a full, unused
 // budget is already live the moment you sit down.
+//
+// "Maximum" is tempered by one knob: the **budget-slice floor** (`minSlice`,
+// default `minSliceFloorMinutes`, user-configurable via
+// `WorkSchedule.minSliceMinutes`). One account's window starts can never be
+// closer than `window` apart, so every interior slice of a work block is a
+// full window and only the two *edge* slices can shrink — and an edge sliver
+// too short to actually spend (30 minutes of a 5-hour budget) costs a ping
+// without buying usable time. Raising the floor folds those slivers away:
+// fewer, longer budgets, and strictly fewer pings. Coverage always beats the
+// floor — a work minute is never left uncovered to honor it.
 
 /// Default rolling-window length in minutes (5 hours).
 public let defaultWindowMinutes = 300
 
-/// Smallest stretch (minutes) the usage recommender will hand to one account
-/// before suggesting a switch. Switching accounts costs real time (re-auth,
-/// re-establishing context), so recommending a 5–15 min sliver isn't worth it —
-/// we'd rather under-touch a fresh budget than churn. A **heuristic that shapes
-/// the recommendation only**: it never moves ping times or the token-max engine,
-/// just the "use this account now" advice in `MultiDayPlan.usage`.
-public let minUsageSegmentMinutes = 30
+/// The lowest the budget-slice floor may go (minutes): the shortest stretch of
+/// one account's token budget the planner will ever anchor a ping for, or the
+/// recommender hand out before suggesting a switch — below ~15 min a budget
+/// stops being one (an account switch costs re-auth and context). Also the
+/// engine functions' *parameter* default, i.e. the un-floored token-max
+/// baseline; the product default a fresh `schedule.json` resolves to is
+/// `defaultMinSliceMinutes`. Hour-granular blocks always clear 15-minute
+/// edges, so this bound never constrains placement — only raising the knob
+/// moves pings (always fewer, never more).
+public let minSliceFloorMinutes = 15
+
+/// What `WorkSchedule.minSliceMinutes` resolves to until the user touches the
+/// "Min token block" stepper. An hour is long enough to actually get something
+/// done in a fresh budget: out of the box a 6h day folds its two 30-min edge
+/// slivers into 3h + 3h on two pings — the layout that motivated the knob —
+/// and anyone token-maxxing can still step down to `minSliceFloorMinutes`.
+public let defaultMinSliceMinutes = 60
 
 /// A half-open work interval `[start, end)` in local minutes-from-midnight.
 public struct Block: Equatable, Sendable {
@@ -112,29 +132,57 @@ public enum ScheduleEngine {
     }
 
     /// Pick the offset `a` (minutes from the block start `s` to the first window
-    /// boundary that lands *after* `s`) that maximises the number of distinct
-    /// window budgets overlapping a single work block of length `len`, choosing
-    /// the midpoint of the valid range for robustness (avoids fragile slivers).
+    /// boundary that lands *after* `s`) for a single work block of length `len`.
+    ///
+    /// The batch count comes first: the most window budgets whose two **edge**
+    /// slices both reach `minSlice`. Interior slices are always a full `window`
+    /// (window starts can't be closer than `window` apart), so only the edges
+    /// can sliver — with `n` batches they sum to `len - window*(n-2)`. Coverage
+    /// beats the floor: the count never drops below what spanning the block
+    /// requires, so an unsatisfiable floor bends (edges stay balanced, merely
+    /// shorter than asked) rather than leaving work minutes uncovered. The edge
+    /// budget is then split evenly — the midpoint is robust (no fragile
+    /// slivers) and, at the default floor, reproduces the pre-floor layout for
+    /// every hour-granular block.
+    ///
+    /// When the floor caps the count at one (`len <= window` and two
+    /// floor-length slices don't fit), the single window is centred on the
+    /// block — equal slack on both sides, boundary at or past the block end so
+    /// `planDay` adds no re-ping.
     ///
     /// Returns `a` in `1...window`. The pre-ping is then `s - window + a`.
-    static func firstBoundaryOffset(len: Int, window: Int) -> Int {
-        // Max batches over the block = 1 + ceil(len / window). The first interior
-        // boundary at offset `a` yields that maximum for any
-        //   a in ( len - window*m , len - window*(m-1) ]   where m = ceil(len/window).
-        let m = max((len + window - 1) / window, 1) // ceil(len/window), >= 1
-        let aLow = max(len - window * m, 1) // strictly after the block start
-        let aHigh = len - window * (m - 1)
-        let mid = (aLow + aHigh) / 2
-        return min(max(mid, 1), window)
+    static func firstBoundaryOffset(len: Int, window: Int, minSlice: Int = minSliceFloorMinutes) -> Int {
+        let floorPerEdge = max(minSlice, 1)
+        // Most batches whose two edge slices can both reach the floor…
+        let nFloor = len >= 2 * floorPerEdge ? 2 + (len - 2 * floorPerEdge) / window : 1
+        // …but never fewer than covering the whole block needs.
+        let nCover = max((len + window - 1) / window, 1)
+        let n = max(nFloor, nCover)
+
+        if n == 1 {
+            // One window covers the whole block: centre it, `a >= len` so the
+            // boundary lands at/past the block end and no re-ping fires.
+            return min(max((len + window) / 2, len), window)
+        }
+        // Split the edge budget evenly; clamp so the trailing edge fits inside
+        // one window and stays strictly positive (all `n` batches materialise).
+        let edgeSum = len - window * (n - 2)
+        return min(max(edgeSum / 2, max(edgeSum - window, 1)), min(edgeSum - 1, window))
     }
 
     /// Plan one day's pings for a **single account**.
     ///
     /// `workBlocks` are half-open intervals, assumed sorted and non-overlapping
     /// (as produced by `slotsToBlocks`). Returns the ping times (local minutes,
-    /// possibly negative) that anchor windows to maximise fresh-budget overlap,
+    /// possibly negative) that anchor windows to maximise fresh-budget overlap
+    /// under the `minSlice` budget-slice floor (see `firstBoundaryOffset`),
     /// pre-pinging before the first block.
-    public static func planDay(_ workBlocks: [Block], window: Int) -> [Ping] {
+    ///
+    /// The floor shapes each block's *own* layout; a window riding in from a
+    /// previous block still re-pings at its expiry wherever that falls —
+    /// coverage across the gap is worth more than the floor, so a sub-floor
+    /// tail can survive there.
+    public static func planDay(_ workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
         precondition(window > 0, "window must be positive")
         var pings: [Ping] = []
         // The instant the currently-active window expires. Nothing active to start.
@@ -147,7 +195,7 @@ public enum ScheduleEngine {
             // a pre-ping before `s`. If a prior block's window still covers `s`, we
             // ride it (re-pinging at its expiry below) — can't re-anchor mid-window.
             if activeUntil <= s {
-                let a = firstBoundaryOffset(len: e - s, window: window)
+                let a = firstBoundaryOffset(len: e - s, window: window, minSlice: minSlice)
                 let t0 = s - window + a
                 pings.append(Ping(atMin: t0))
                 activeUntil = t0 + window
@@ -166,12 +214,19 @@ public enum ScheduleEngine {
     ///
     /// The single-account case intentionally delegates to `planDay` so existing
     /// behavior stays stable. With multiple accounts, every account still
-    /// receives the maximum number of batches it can support for each work block,
-    /// but the first expiry for each account is staggered across the first equal
-    /// slices of the block. That makes short blocks like 08:00-12:00 with two
-    /// accounts land on 04:00/05:00 pings instead of duplicating the same 05:00
-    /// phase.
-    public static func planDay(forAccountIDs accountIDs: [String], workBlocks: [Block], window: Int) -> MultiDayPlan {
+    /// receives the maximum number of batches the `minSlice` floor allows for
+    /// each work block, but the first expiry for each account is staggered
+    /// across the first equal slices of the block. That makes short blocks like
+    /// 08:00-12:00 with two accounts land on 04:00/05:00 pings instead of
+    /// duplicating the same 05:00 phase.
+    ///
+    /// The floor and the stagger meet in two places: the floor sets each
+    /// account's batch count (fewer batches → fewer pings), while the stagger
+    /// geometry itself stays floor-agnostic — a staggered first expiry can
+    /// still cut one account's window into a sub-floor sliver, which the usage
+    /// allocator (also fed `minSlice`) then folds out of the recommendation.
+    /// Lanes of one account (full parallelism) get exact floor-aware placement.
+    public static func planDay(forAccountIDs accountIDs: [String], workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> MultiDayPlan {
         precondition(window > 0, "window must be positive")
 
         let ids = accountIDs
@@ -180,10 +235,10 @@ public enum ScheduleEngine {
         }
 
         if ids.count == 1 {
-            let pings = planDay(workBlocks, window: window)
+            let pings = planDay(workBlocks, window: window, minSlice: minSlice)
             let usage = computeUsage(
                 accountIDs: ids, workBlocks: workBlocks, window: window,
-                pingsByAccount: [pings], minSeg: minUsageSegmentMinutes)
+                pingsByAccount: [pings], minSeg: minSlice)
             return MultiDayPlan(
                 accounts: [AccountDayPlan(accountID: ids[0], pings: pings)],
                 usage: usage)
@@ -201,7 +256,19 @@ public enum ScheduleEngine {
             // actually fit (the closed-form `1 + ceil(len/window)` over-counts by
             // one when `len` sits just past a window multiple, e.g. 5h01m → claims
             // 3, only 2 fit).
-            let batchesPerAccount = planDay([Block(start: s, end: e)], window: window).count
+            let batchesPerAccount = planDay([Block(start: s, end: e)], window: window, minSlice: minSlice).count
+            // A raised floor can cap a block at a single budget per account.
+            // Staggering would only manufacture the sub-floor slivers the floor
+            // exists to remove, so every account anchors together on the
+            // single-account placement (the same shape parallel lanes produce
+            // over equal hours); the usage allocator splits the shared block.
+            if batchesPerAccount == 1 {
+                let a = firstBoundaryOffset(len: len, window: window, minSlice: minSlice)
+                for accountIdx in 0..<n {
+                    appendBlockPings(&pingsByAccount[accountIdx], firstPing: s - window + a, blockStart: s, blockEnd: e, window: window)
+                }
+                continue
+            }
             let maxOff = maxFirstExpiryOffset(len: len, window: window, batchesPerAccount: batchesPerAccount)
             // Cap the stagger unit so `n` accounts get *distinct* first-expiry
             // offsets (without the cap, a small slack + many accounts collapses
@@ -218,7 +285,7 @@ public enum ScheduleEngine {
 
         let usage = computeUsage(
             accountIDs: ids, workBlocks: workBlocks, window: window,
-            pingsByAccount: pingsByAccount, minSeg: minUsageSegmentMinutes)
+            pingsByAccount: pingsByAccount, minSeg: minSlice)
         let accounts = zip(ids, pingsByAccount).map { AccountDayPlan(accountID: $0, pings: $1) }
         return MultiDayPlan(accounts: accounts, usage: usage)
     }
@@ -239,7 +306,7 @@ public enum ScheduleEngine {
     /// the serial planner (one lane of every account); `parallelism >= count` puts
     /// each account in its own lane (full parallelism). Out-of-range values clamp
     /// into `1...count`.
-    public static func planDay(forAccountIDs accountIDs: [String], workBlocks: [Block], window: Int, parallelism: Int) -> MultiDayPlan {
+    public static func planDay(forAccountIDs accountIDs: [String], workBlocks: [Block], window: Int, parallelism: Int, minSlice: Int = minSliceFloorMinutes) -> MultiDayPlan {
         precondition(window > 0, "window must be positive")
         let total = accountIDs.count
         if total == 0 { return MultiDayPlan(accounts: [], usage: []) }
@@ -247,13 +314,13 @@ public enum ScheduleEngine {
         let lanes = min(max(parallelism, 1), total)
         // One lane = today's serial behaviour, byte-for-byte (back-compat).
         if lanes == 1 {
-            return planDay(forAccountIDs: accountIDs, workBlocks: workBlocks, window: window)
+            return planDay(forAccountIDs: accountIDs, workBlocks: workBlocks, window: window, minSlice: minSlice)
         }
 
         var accounts: [AccountDayPlan] = []
         var usage: [UsageSegment] = []
         for (laneIdx, laneIDs) in partitionLanes(accountIDs, into: lanes).enumerated() {
-            let lanePlan = planDay(forAccountIDs: laneIDs, workBlocks: workBlocks, window: window)
+            let lanePlan = planDay(forAccountIDs: laneIDs, workBlocks: workBlocks, window: window, minSlice: minSlice)
             accounts.append(contentsOf: lanePlan.accounts)
             usage.append(contentsOf: lanePlan.usage.map {
                 UsageSegment(accountID: $0.accountID, batchIndex: $0.batchIndex, startMin: $0.startMin, endMin: $0.endMin, lane: laneIdx)
@@ -280,8 +347,8 @@ public enum ScheduleEngine {
     }
 
     /// Convenience: plan a day directly from selected hour slots (single account).
-    public static func planDay(fromHours selectedHours: [Int], window: Int) -> [Ping] {
-        planDay(slotsToBlocks(selectedHours), window: window)
+    public static func planDay(fromHours selectedHours: [Int], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
+        planDay(slotsToBlocks(selectedHours), window: window, minSlice: minSlice)
     }
 
     // MARK: - stagger helpers

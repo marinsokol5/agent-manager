@@ -163,7 +163,8 @@ design follows from them.
 
 - `accounts.json` — account inventory (metadata + identity email + keychain
   service name; **no secrets**).
-- `schedule.json` — painted work hours + window length.
+- `schedule.json` — painted work hours + window length + planner knobs
+  (parallel lanes, minimum budget-slice length).
 - `scheduler.json` — the resident scheduler's active flag (what the app's
   "Scheduler active" toggle actually writes).
 - `wake.json` — the "Wake Mac for pings" opt-in (app toggle / `am wake
@@ -229,7 +230,7 @@ Work the chain in this order:
    deliberate drops are `ping.skip`, whose detail says why — `"stale ping
    (due 34m ago)"`, `"N stale pings (slept through…)"`, or `"cloud routine
    covered this fire"`. Cloud-fallback arming appears as `routine.create` /
-   `routine.arm` / `routine.disable` — and since `cloud-fallback-state.json`
+   `routine.adopt` / `routine.arm` / `routine.disable` — and since `cloud-fallback-state.json`
    only holds the *current* arming, the last `routine.arm` with `ok: true`
    before the night is what tells you what was armed going in. Caveat: a
    plain "stale ping" skip does *not* rule out cloud coverage — the daemon
@@ -354,7 +355,13 @@ as failed.
   Anthropic's cloud runs it only when the Mac provably couldn't. Its
   invariants: **always `run_once_at`, never cron** (an orphaned routine fires
   at most once, then auto-disables server-side); **the daemon is the only API
-  writer** (app/CLI only flip `cloud-fallback.json`); **delete is web-only** —
+  writer** (app/CLI only flip `cloud-fallback.json`); **create is adopt-first**
+  — the routine list is the customer's, and `triggerID` lives only in local
+  state (losable to an uninstall/reinstall, a dev-variant workspace, a
+  re-added account slug), so whenever no routine is pinned the engine
+  re-adopts an existing "AgentManager Routine" by name (list → patch), pauses
+  any enabled strays, and creates only when the account has zero of ours —
+  this instance never grows the list past one; **delete is web-only** —
   the API exposes DELETE solely to cookie-authenticated web sessions, which we
   never touch, so "off" means `enabled: false`; **never trigger the delegated
   token refresh from the engine** — a `/status` refresh anchors a window, the

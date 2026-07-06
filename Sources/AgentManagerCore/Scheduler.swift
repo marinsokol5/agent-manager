@@ -77,7 +77,7 @@ public struct Scheduler {
         let parallelism = schedule.resolvedParallelism(accountCount: ids.count)
         return (0..<7).map { wd in
             let blocks = schedule.blocks(forWeekday: wd)
-            let plan = ScheduleEngine.planDay(forAccountIDs: ids, workBlocks: blocks, window: schedule.windowMinutes, parallelism: parallelism)
+            let plan = ScheduleEngine.planDay(forAccountIDs: ids, workBlocks: blocks, window: schedule.windowMinutes, parallelism: parallelism, minSlice: schedule.resolvedMinSliceMinutes)
             return DayPlan(weekday: wd, blocks: blocks, plan: plan)
         }
     }
