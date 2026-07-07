@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+#
+# agent-config-reconcile — fold a drifted managed home back into its shared
+# source home, then re-link it, so an account that accumulated *real* runtime
+# dirs (projects/, history.jsonl, file-history/, …) rejoins the shared
+# source-home group instead of keeping a private, diverging copy.
+#
+# Why this exists: SymlinkFarm.apply() only ever *adds* missing entries — it
+# never converts an existing real dir into a symlink (deliberate: converting
+# would delete a dir that may hold real session data). So if the official CLI
+# ran against a managed home *before* the farm symlinked an entry, that entry
+# stays real forever and drifts. This script is the missing heal step — the
+# same merge-then-link claude-swap does for `--share-history`, but keyed off
+# accounts.json and provider-aware.
+#
+# Usage:
+#   scripts/agent-config-reconcile <account-id>          # dry-run (default): print the plan, touch nothing
+#   scripts/agent-config-reconcile <account-id> --apply  # execute the merge + relink
+#
+# Options:
+#   --apply        actually perform the merge and replace real entries with symlinks
+#   --root DIR     workspace root (default: $AGENT_MANAGER_ROOT or
+#                  ~/Library/Application Support/AgentManager)
+#   --force        skip the "is the CLI running against this home?" safety abort
+#   -v/--verbose   list every individual move (default: per-entry summary + all
+#                  collisions/conflicts)
+#
+# What it does, per top-level entry in the managed home that is *real* (not a
+# symlink) and that the farm would classify as shareable (i.e. not the identity
+# file .claude.json/auth.json and not a local-only entry like claude's backups/):
+#
+#   • absent in source        → move the whole entry into the source home
+#   • dir present in source    → union-merge recursively into it
+#   • file 'history.jsonl'     → append only the lines source doesn't already have
+#   • identical file           → drop the managed duplicate
+#   • other colliding file     → preserve the managed copy beside the source's
+#                                under a content-hashed name (never overwrite,
+#                                never corrupt a session transcript by mixing it)
+#   • type mismatch (dir⇔file) → leave it real, report it, don't symlink it
+#
+# …then replace the (now-merged-away) managed entry with a symlink into source.
+# No provider secrets are read or moved; the identity file stays real and
+# per-account. Idempotent: a second run is a no-op.
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Provider facts mirrored from Sources/AgentManagerCore/Provider.swift.
+IDENTITY_FILE = {"claude": ".claude.json", "codex": "auth.json"}
+LOCAL_ONLY = {"claude": {"backups"}, "codex": set()}
+
+
+def default_root() -> Path:
+    env = os.environ.get("AGENT_MANAGER_ROOT")
+    if env:
+        return Path(env)
+    return Path.home() / "Library" / "Application Support" / "AgentManager"
+
+
+def load_account(root: Path, account_id: str) -> dict:
+    accounts_path = root / "accounts.json"
+    if not accounts_path.is_file():
+        sys.exit(f"error: {accounts_path} not found (wrong --root / workspace?)")
+    data = json.loads(accounts_path.read_text())
+    for acct in data.get("accounts", []):
+        if acct.get("id") == account_id:
+            return acct
+    known = ", ".join(a.get("id", "?") for a in data.get("accounts", [])) or "(none)"
+    sys.exit(f"error: no account '{account_id}' in {accounts_path}\n       known: {known}")
+
+
+def sha1_of(path: Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cli_running_against(home: Path, account_id: str) -> list[str]:
+    """Best-effort: processes whose argv *or environment* mentions this home.
+
+    `ps -e` appends each process's environment to the command column for the
+    processes we own — which is how we catch a bare `claude`/`codex` child that
+    carries the home only in CLAUDE_CONFIG_DIR/CODEX_HOME, plus `am run/ping <id>`
+    in argv. Still best-effort (env is only visible for our own uid); --force
+    overrides.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-Axeww", "-o", "pid=,command="],
+            capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return []
+    self_pid = str(os.getpid())
+    hits = []
+    home_str = str(home)
+    script_name = os.path.basename(__file__)
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid, _, cmd = line.partition(" ")
+        if pid == self_pid or script_name in cmd:
+            continue
+        if home_str in cmd or f" {account_id}" in cmd or cmd.endswith(account_id):
+            hits.append(line)
+    return hits
+
+
+class Plan:
+    """Accumulates actions so dry-run and --apply share one traversal."""
+
+    def __init__(self):
+        self.entries: dict[str, dict[str, int]] = {}
+        self.details: list[tuple[str, str, str]] = []  # (entry, verb, note)
+        self.conflicts: list[tuple[str, str, str]] = []
+
+    def bump(self, entry: str, verb: str):
+        self.entries.setdefault(entry, {}).setdefault(verb, 0)
+        self.entries[entry][verb] += 1
+
+    def record(self, entry: str, verb: str, note: str):
+        self.bump(entry, verb)
+        self.details.append((entry, verb, note))
+        if verb == "CONFLICT":
+            self.conflicts.append((entry, verb, note))
+
+
+def reconcile_node(managed: Path, source: Path, entry: str, plan: Plan, apply: bool):
+    """Merge the real path `managed` into `source` (which may or may not exist)."""
+    rel = str(managed)
+
+    # Never chase a symlink; only real files/dirs are ours to move.
+    if managed.is_symlink():
+        return
+
+    if not source.exists() and not source.is_symlink():
+        # Whole subtree is new to source: relocate it wholesale.
+        plan.record(entry, "MOVE", f"{managed.name} → source (absent there)")
+        if apply:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(managed), str(source))
+        return
+
+    m_dir, s_dir = managed.is_dir(), source.is_dir()
+
+    if m_dir and s_dir:
+        for child in sorted(managed.iterdir()):
+            reconcile_node(child, source / child.name, entry, plan, apply)
+        # In apply mode the dir should now be empty (children moved/merged);
+        # in dry-run it still has them, so only rmdir when truly empty.
+        if apply and not any(managed.iterdir()):
+            managed.rmdir()
+        return
+
+    if not m_dir and not s_dir:
+        # Two files with the same name.
+        if managed.stat().st_size == source.stat().st_size and sha1_of(managed) == sha1_of(source):
+            plan.record(entry, "DROP", f"{managed.name} (identical to source)")
+            if apply:
+                managed.unlink()
+            return
+        if managed.name == "history.jsonl":
+            merge_history(managed, source, entry, plan, apply)
+            return
+        # Differing, non-mergeable file (e.g. a session <uuid>.jsonl): preserve
+        # both — park the managed copy next to source's under a hashed name.
+        m_hash = sha1_of(managed)
+        stem, suffix = managed.stem, managed.suffix
+        target = source.with_name(f"{stem}-{m_hash[:8]}{suffix}")
+        if target.exists() and sha1_of(target) == m_hash:
+            plan.record(entry, "DROP", f"{managed.name} (already preserved as {target.name})")
+            if apply:
+                managed.unlink()
+        else:
+            plan.record(entry, "KEEP+RENAME", f"{managed.name} → {target.name} (differs; both kept)")
+            if apply:
+                shutil.move(str(managed), str(target))
+        return
+
+    # dir vs file (or vice-versa): don't guess. Leave it real, skip symlinking.
+    plan.record(entry, "CONFLICT",
+                f"{managed.name}: managed is {'dir' if m_dir else 'file'}, "
+                f"source is {'dir' if s_dir else 'file'} — left as-is")
+
+
+def merge_history(managed: Path, source: Path, entry: str, plan: Plan, apply: bool):
+    """Append only the lines source doesn't already contain (order-preserving)."""
+    src_lines = set(source.read_text(errors="replace").splitlines())
+    managed_lines = managed.read_text(errors="replace").splitlines()
+    missing = [ln for ln in managed_lines if ln not in src_lines]
+    plan.record(entry, "APPEND", f"history.jsonl: +{len(missing)} new lines (of {len(managed_lines)} in managed)")
+    if apply:
+        if missing:
+            existing = source.read_text(errors="replace")
+            sep = "" if (existing == "" or existing.endswith("\n")) else "\n"
+            with source.open("a") as f:
+                f.write(sep + "\n".join(missing) + "\n")
+        managed.unlink()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agent-config-reconcile", add_help=True)
+    ap.add_argument("account_id")
+    ap.add_argument("--apply", action="store_true", help="perform the merge + relink (default: dry-run)")
+    ap.add_argument("--root", type=Path, default=None, help="workspace root override")
+    ap.add_argument("--force", action="store_true", help="skip the running-CLI safety abort")
+    ap.add_argument("-v", "--verbose", action="store_true", help="list every move")
+    args = ap.parse_args()
+
+    root = args.root or default_root()
+    acct = load_account(root, args.account_id)
+    provider = acct["provider"]
+    home = Path(acct["home"])
+    source = Path(acct["sourceHome"])
+
+    if provider not in IDENTITY_FILE:
+        sys.exit(f"error: unknown provider '{provider}'")
+    if not home.is_dir():
+        sys.exit(f"error: managed home {home} does not exist")
+    if not source.is_dir():
+        sys.exit(f"error: source home {source} does not exist")
+
+    identity = IDENTITY_FILE[provider]
+    local_only = LOCAL_ONLY[provider]
+
+    # Drifted = top-level entry that is REAL (not a symlink) and shareable.
+    drifted = []
+    for child in sorted(home.iterdir()):
+        name = child.name
+        if child.is_symlink():
+            continue
+        if name == identity or name in local_only:
+            continue
+        drifted.append(child)
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(f"agent-config-reconcile [{mode}]")
+    print(f"  account : {args.account_id}  ({provider})")
+    print(f"  home    : {home}")
+    print(f"  source  : {source}")
+
+    if not drifted:
+        print("\nnothing drifted — every shareable entry is already a symlink. ✓")
+        return
+
+    print(f"\ndrifted (real, should be symlinks): {', '.join(c.name for c in drifted)}")
+
+    # Safety: refuse while the CLI is live on this home (unless --force).
+    live = cli_running_against(home, args.account_id)
+    if live and not args.force:
+        print("\nABORT: a CLI process looks live on this home (merge would move files "
+              "out from under it):")
+        for l in live[:8]:
+            print(f"  {l[:120]}")
+        print("Quit that account's claude/codex sessions, or pass --force. (Dry-run "
+              "is always safe.)" if args.apply else
+              "This is only a dry-run so nothing was moved; the same check will block --apply.")
+        if args.apply:
+            sys.exit(3)
+
+    plan = Plan()
+    for child in drifted:
+        reconcile_node(child, source / child.name, child.name, plan, apply=args.apply)
+        # Relink the top-level entry if it merged away cleanly.
+        if args.apply and not child.exists():
+            os.symlink(str(source / child.name), str(child))
+            plan.record(child.name, "SYMLINK", f"{child.name} → {source / child.name}")
+        elif not args.apply and not any(e == child.name and v == "CONFLICT" for e, v, _ in plan.details):
+            plan.record(child.name, "SYMLINK", f"{child.name} → {source / child.name} (after merge)")
+
+    # Report.
+    print()
+    for child in drifted:
+        e = child.name
+        counts = plan.entries.get(e, {})
+        summary = "  ".join(f"{v.lower()}={n}" for v, n in sorted(counts.items()))
+        print(f"  {e:<16} {summary or '(no changes)'}")
+
+    if args.verbose:
+        print("\ndetail:")
+        for e, verb, note in plan.details:
+            print(f"  {verb:<12} {e}: {note}")
+    else:
+        # Always surface the non-routine stuff.
+        for e, verb, note in plan.details:
+            if verb in ("KEEP+RENAME", "CONFLICT"):
+                print(f"  {verb:<12} {e}: {note}")
+
+    if plan.conflicts:
+        print(f"\n{len(plan.conflicts)} conflict(s) left real (not symlinked) — resolve by hand.")
+
+    if not args.apply:
+        print("\ndry-run only — nothing changed. Re-run with --apply to execute.")
+
+
+if __name__ == "__main__":
+    main()
