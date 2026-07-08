@@ -47,7 +47,11 @@ public enum ClaudeTokenRefresher {
     {
         let session: PTYSession
         do {
-            session = try PTYSession(binary: binary, arguments: [], environment: environment)
+            // Sandbox opt-out: keeps Seatbelt init from sweeping TCC-protected
+            // folders under our name — see `Provider.sandboxOptOutArguments`.
+            session = try PTYSession(
+                binary: binary, arguments: Provider.claude.sandboxOptOutArguments,
+                environment: environment)
         } catch PTYSession.SpawnError.binaryNotFound {
             return Result(ok: false, detail: "claude binary not found on PATH")
         } catch let PTYSession.SpawnError.launchFailed(message) {

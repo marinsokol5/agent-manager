@@ -45,6 +45,34 @@ public enum Provider: String, Codable, Sendable, CaseIterable {
         }
     }
 
+    /// Extra arguments appended to every *automated* session we spawn — scheduled
+    /// pings, the delegated `/status` token refresh, guided login — that turn the
+    /// CLI's sandboxed-Bash feature off for that one session.
+    ///
+    /// Why: these sessions never execute a shell command (we drive a single TUI
+    /// turn or slash command over the PTY), so the sandbox protects nothing —
+    /// but its macOS Seatbelt initialization stats TCC-protected locations
+    /// (file-provider drives like Google Drive/iCloud, Downloads, network
+    /// volumes, macOS 26's "data from other apps"), and TCC bills that access
+    /// to the *responsible process*: this app. Because the shared
+    /// `settings.json` is symlinked into every managed home, a user with
+    /// `"sandbox": {"enabled": true}` there had every scheduled ping popping
+    /// "AgentManager wants to access…" dialogs (observed with claude-code
+    /// 2.1.202 — tccd log: accessing=claude, requesting=com.apple.sandboxd,
+    /// storm at TUI startup before the prompt was ready). The session-scoped
+    /// `--settings` override disables the sandbox for our automated sessions
+    /// only; the user's own interactive sessions (`am run`) keep whatever
+    /// they configured.
+    ///
+    /// Codex is empty: its sandbox is integral to its exec model, and no TCC
+    /// sweep has been observed from Codex pings.
+    public var sandboxOptOutArguments: [String] {
+        switch self {
+        case .claude: ["--settings", #"{"sandbox":{"enabled":false}}"#]
+        case .codex: []
+        }
+    }
+
     /// The single identity file kept **real and per-account** inside each managed
     /// home — never symlinked. Claude's `.claude.json` carries the `oauthAccount`
     /// record (the OAuth secret is in Keychain, keyed by the config-dir path);

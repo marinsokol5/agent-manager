@@ -29,8 +29,11 @@ public enum ClaudePingRunner {
             // Interactive defaults to the main model, so pin haiku to stay cheap.
             // `workingDirectory` keeps Claude out of launchd's `/` (which otherwise
             // raises the trust dialog the loop below has to dismiss by hand).
+            // The sandbox opt-out keeps Seatbelt init from sweeping TCC-protected
+            // folders under our name — see `Provider.sandboxOptOutArguments`.
             session = try PTYSession(
-                binary: binary, arguments: ["--model", "haiku"],
+                binary: binary,
+                arguments: ["--model", "haiku"] + Provider.claude.sandboxOptOutArguments,
                 environment: environment, workingDirectory: workingDirectory)
         } catch PTYSession.SpawnError.binaryNotFound {
             return Result(ok: false, detail: "claude binary not found on PATH", transcript: "")

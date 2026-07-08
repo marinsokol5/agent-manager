@@ -38,7 +38,9 @@ public struct GuidedLogin {
         var options = PTYLoginRunner.Options()
         options.timeout = timeout
         options.environment = environment
-        options.extraArgs = provider.loginArguments
+        // Sandbox opt-out: keeps Seatbelt init from sweeping TCC-protected
+        // folders under our name — see `Provider.sandboxOptOutArguments`.
+        options.extraArgs = provider.loginArguments + provider.sandboxOptOutArguments
 
         let result = PTYLoginRunner.run(
             binary: ChildEnvironment.binary(for: provider, environment: environment),
