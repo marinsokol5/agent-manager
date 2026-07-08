@@ -18,7 +18,7 @@ public enum AppVersion {
     /// Compiled-in version for the bare (unbundled) binary. Kept in lockstep with
     /// `Support/Info.plist.in` by `Scripts/release.sh` — edit both together, or
     /// just let a version bump via that script do it.
-    public static let fallback = "0.2.2"
+    public static let fallback = "0.2.3"
 
     /// Pull the version out of a bundle info dictionary, falling back to the
     /// compiled constant. Pure + injectable so it's testable without `Bundle.main`.
