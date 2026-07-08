@@ -6,11 +6,20 @@ import Foundation
 /// user-initiated (it may prompt once for Keychain / refresh the token). Pass a
 /// `log` to record each HTTP exchange to the shared `NetworkLog` (token masked),
 /// so CLI usage calls are auditable alongside the app's.
+///
+/// The delegated refresh is **window-gated** for background callers
+/// (`ClaudeTokenRefresher.mayRefresh`): `/status` anchors a fresh 5h window when
+/// none is live, so with `allowInteraction: false` it only runs while
+/// `cachedReading` shows a live window — otherwise the fetch fails soft with
+/// `.refreshDeferred` and the caller keeps its cached usage. Any future
+/// background caller must pass the account's last cached reading to get
+/// refreshes at all; omitting it means "never anchor".
 public enum UsageService {
     public static func fetch(
         account: Account,
         gate: UsageRateLimitGate,
         allowInteraction: Bool = true,
+        cachedReading: UsageReading? = nil,
         log: NetworkLog? = nil) async throws -> UsageReading
     {
         switch account.provider {
@@ -22,13 +31,19 @@ public enum UsageService {
             guard var creds = ClaudeCredentials.read(keychainService: service, allowInteraction: allowInteraction) else {
                 throw UsageFetchError.tokenDecodeFailed
             }
-            if ClaudeCredentials.needsRefresh(creds), let refreshed = refreshToken(account, allowInteraction) {
-                creds = refreshed
+            let mayRefresh = ClaudeTokenRefresher.mayRefresh(
+                userInitiated: allowInteraction, lastReading: cachedReading)
+            if ClaudeCredentials.needsRefresh(creds) {
+                // Expired token and no refresh allowed → don't fire the doomed
+                // 401 poll either; fail soft and keep whatever the caller has.
+                guard mayRefresh else { throw UsageFetchError.refreshDeferred }
+                if let refreshed = refreshToken(account, allowInteraction) { creds = refreshed }
             }
             do {
                 return try await ClaudeUsageFetcher.fetch(
                     account: account, accessToken: creds.accessToken, gate: gate, userInitiated: allowInteraction, log: log)
             } catch UsageFetchError.unauthorized {
+                guard mayRefresh else { throw UsageFetchError.refreshDeferred }
                 guard let refreshed = refreshToken(account, allowInteraction),
                       !ClaudeCredentials.needsRefresh(refreshed) else { throw UsageFetchError.unauthorized }
                 return try await ClaudeUsageFetcher.fetch(

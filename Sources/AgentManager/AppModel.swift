@@ -656,16 +656,6 @@ final class AppModel {
         }
     }
 
-    /// Is a 5h (primary) window currently live for this account, per the last
-    /// reading? When it is, a `/status` refresh just rides it; when it isn't,
-    /// `/status` would anchor a brand-new window. Used to keep background refreshes
-    /// from silently starting (and desyncing) a window. A missing/past reset = not
-    /// live (so we err toward *not* anchoring).
-    private func primaryWindowIsLive(_ id: String, now: Date = Date()) -> Bool {
-        guard let resets = usageReadings[id]?.primaryResetsAt else { return false }
-        return resets > now
-    }
-
     /// Ask the Claude CLI to refresh this account's token (delegated refresh via
     /// `/status`, no usage turn), gated by a per-account cooldown so a broken
     /// token can't make us spawn `claude` repeatedly. Returns the re-read
@@ -674,13 +664,12 @@ final class AppModel {
     private func refreshClaudeToken(_ account: Account, userInitiated: Bool) async -> ClaudeCredentials.Blob? {
         let id = account.id, now = Date()
         if !userInitiated, let until = claudeRefreshCooldownUntil[id], now < until { return nil }
-        // Never let a *background* `/status` refresh anchor a fresh window. Despite
-        // the "no usage" framing, `/status` makes an authenticated call that counts
-        // as "first use", so when no 5h window is live it silently starts one —
-        // desyncing the schedule (the 05:40 ms18 incident). Only run it while a
-        // window is already live (it just rides that window); otherwise defer to the
-        // next scheduled ping. A user-initiated refresh is explicit, so we honor it.
-        if !userInitiated, !primaryWindowIsLive(id, now: now) { return nil }
+        // Never let a *background* `/status` refresh anchor a fresh window — only
+        // run it while one is already live, per the shared window-gate policy
+        // (see `ClaudeTokenRefresher.mayRefresh` for the full why + incident).
+        guard ClaudeTokenRefresher.mayRefresh(
+            userInitiated: userInitiated, lastReading: usageReadings[id], now: now)
+        else { return nil }
 
         statusMessage = "\(account.label): refreshing token via Claude Code…"
         let result = await offMain { () -> ClaudeTokenRefresher.Result in

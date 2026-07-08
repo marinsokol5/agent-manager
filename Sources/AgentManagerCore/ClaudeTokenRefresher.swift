@@ -16,6 +16,29 @@ public enum ClaudeTokenRefresher {
         public let detail: String
     }
 
+    /// Whether a delegated `/status` refresh may run right now.
+    ///
+    /// Despite the "no usage turn" framing, `/status` makes an authenticated call
+    /// that counts as *first use*: when no 5h window is live it silently anchors a
+    /// brand-new one, desyncing the schedule the pings so carefully maintain (the
+    /// 05:40 ms18 incident). So a background refresh is allowed only while a
+    /// window is provably already live — then `/status` just rides it and can't
+    /// start anything. A user-initiated refresh is explicit and always honored.
+    ///
+    /// `lastReading` is the account's last cached `UsageReading`; a missing
+    /// reading or a missing/past `primaryResetsAt` reads as *not* live, so on any
+    /// doubt we defer (never anchor) and let the next scheduled ping re-fresh the
+    /// token instead.
+    public static func mayRefresh(
+        userInitiated: Bool,
+        lastReading: UsageReading?,
+        now: Date = Date()) -> Bool
+    {
+        if userInitiated { return true }
+        guard let resets = lastReading?.primaryResetsAt else { return false }
+        return resets > now
+    }
+
     public static func run(
         binary: String,
         environment: [String: String],

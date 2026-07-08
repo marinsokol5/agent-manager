@@ -12,6 +12,11 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
     /// A background read needs the Keychain prompt we won't show; keep cached
     /// usage and wait for an explicit "Refresh usage". Swallowed by the caller.
     case keychainAccessDeferred
+    /// The token is expired but the delegated `/status` refresh was withheld:
+    /// no 5h window is live, so running it would anchor a brand-new window (see
+    /// `ClaudeTokenRefresher.mayRefresh`). Keep cached usage; an explicit
+    /// refresh or the next scheduled ping delivers a fresh token.
+    case refreshDeferred
 
     public var errorDescription: String? {
         switch self {
@@ -25,6 +30,8 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
             "Usage API rejected the token (401/403) — re-login this account."
         case .keychainAccessDeferred:
             "Click “Refresh usage” to allow Keychain access."
+        case .refreshDeferred:
+            "Token expired; refresh deferred so it can't start a 5h window — refresh manually to update."
         case let .rateLimited(retryAfter):
             if let retryAfter {
                 "Rate limited by the usage API — retrying after \(Self.shortTime(retryAfter))."
