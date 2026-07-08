@@ -89,3 +89,54 @@ final class MonitoringLogTests: XCTestCase {
         XCTAssertEqual(trigger?.providerHint, .claude)
     }
 }
+
+/// `TranscriptCleaner` turns a raw PTY dump into legible plain text. The
+/// regression these tests exist for: the original stripper wrote its
+/// patterns as raw strings, so `\u{001B}` reached ICU as literal text it
+/// can't parse and *nothing* was ever stripped — every assertion here uses a
+/// real ESC character precisely because that's the case that silently broke.
+final class TranscriptCleanerTests: XCTestCase {
+    private let esc = "\u{001B}"
+
+    func testStripsColorAndModeSequences() {
+        let raw = "\(esc)[38;5;174mhello\(esc)[0m \(esc)[?25h\(esc)[?2004hworld"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "hello world")
+    }
+
+    func testColumnJumpsBecomeSingleSpaces() {
+        // A TUI positions words with column jumps instead of spaces; deleting
+        // them would fuse the words together.
+        let raw = "Claude\(esc)[21GCode\(esc)[28Gv2.1.204"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "Claude Code v2.1.204")
+    }
+
+    func testStripsOrphanedBodiesWhoseEscapeWasLost() {
+        // Sequence bodies with the ESC byte already stripped upstream.
+        let raw = "[2G[38;5;174mdraws down usage[39m"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "draws down usage")
+    }
+
+    func testStripsOSCTitleAndTwoCharSequences() {
+        let raw = "\(esc)]0;✳ Claude Code\u{0007}\(esc)7ready\(esc)8\(esc)[c"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "ready")
+    }
+
+    func testStripsPrivateParameterSequences() {
+        // `ESC [ > 0 q` (terminal-version query) uses the `<=>` marker range
+        // the original [0-9;?] parameter class missed.
+        let raw = "\(esc)[>0qvisible\(esc)[>4;2m"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "visible")
+    }
+
+    func testCollapsesScreenWideRulesAndBlankLines() {
+        let raw = "a\n\n\n\n" + String(repeating: "\u{2500}", count: 120) + "\nb"
+        XCTAssertEqual(
+            TranscriptCleaner.plainText(raw),
+            "a\n\n" + String(repeating: "\u{2500}", count: 8) + "\nb")
+    }
+
+    func testKeepsNewlinesAndTabsDropsOtherControls() {
+        let raw = "one\r\r\ntwo\tthree\u{0007}"
+        XCTAssertEqual(TranscriptCleaner.plainText(raw), "one\ntwo\tthree")
+    }
+}

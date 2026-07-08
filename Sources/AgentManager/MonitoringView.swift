@@ -783,24 +783,7 @@ private struct LogRowView: View {
         transcriptLoaded = true
         guard let path = entry.transcriptPath,
               let raw = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else { return }
-        transcript = Self.stripTerminalCodes(raw)
-    }
-
-    /// Strip ANSI/VT escape sequences and stray control bytes from a raw PTY dump,
-    /// keeping newlines and tabs, so a captured TUI screen renders as plain text.
-    static func stripTerminalCodes(_ s: String) -> String {
-        var out = s
-        // CSI (ESC [ … final), OSC (ESC ] … BEL/ST), and lone two-char ESC sequences.
-        for pattern in [#"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#,
-                        #"\u{001B}\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\)"#,
-                        #"\u{001B}[@-Z\\-_]"#] {
-            out = out.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
-        }
-        // Drop remaining control chars except newline (\n) and tab (\t).
-        out = String(out.unicodeScalars.filter { $0 == "\n" || $0 == "\t" || $0.value >= 0x20 })
-        // Collapse the runs of blank lines a redrawn TUI screen leaves behind.
-        out = out.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
-        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+        transcript = TranscriptCleaner.plainText(raw)
     }
 
     private func exchangeBlock(_ label: String, summary: String, headers: [String: String], body: String?) -> some View {
