@@ -18,6 +18,14 @@ struct MonitoringView: View {
     }
     @State private var tab: Tab = .status
 
+    // Logs-tab filter. Deliberately session-only @State (never persisted):
+    // a filter is a browsing gesture, and one that survived a relaunch would
+    // make the feed silently incomplete on the next visit. Sets hold what's
+    // hidden, so the default (empty = everything shown) needs no setup.
+    @State private var filterExpanded = false
+    @State private var hiddenProviders: Set<Provider> = []
+    @State private var hiddenCategories: Set<MonitoringLogEntry.Category> = []
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
@@ -462,13 +470,15 @@ struct MonitoringView: View {
     }
 
     private var logsTab: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let logs = filteredLogs
+        return VStack(alignment: .leading, spacing: 8) {
             auditBanner
+            filterBar
             HStack(alignment: .firstTextBaseline) {
                 Text("Activity log").font(Theme.Font.sectionTitle)
                 Spacer()
                 LogFileCaption(
-                    text: "\(model.monitoringLogs.count) events · showing the last 48 hours — full history in the workspace's .jsonl files",
+                    text: "\(eventCount(shown: logs.count)) · showing the last 48 hours — full history in the workspace's .jsonl files",
                     files: [model.workspace.auditLogFile,
                             model.workspace.activityLogFile,
                             model.workspace.networkLogFile])
@@ -476,19 +486,195 @@ struct MonitoringView: View {
             if model.monitoringLogs.isEmpty {
                 Text("Nothing logged in the last 48 hours. Pings, scheduling, token refreshes, and every HTTP request (with its response) show up here as they happen.")
                     .font(Theme.Font.callout).foregroundStyle(.secondary)
+            } else if logs.isEmpty {
+                // Distinct from the empty-feed copy above: events exist, the
+                // filter hides them all — never let that read as "nothing
+                // happened".
+                HStack(spacing: 8) {
+                    Text("No events in the last 48 hours match the current filter.")
+                        .font(Theme.Font.callout).foregroundStyle(.secondary)
+                    Button("Reset filter") { resetFilter() }
+                        .buttonStyle(.link)
+                        .font(Theme.Font.callout)
+                }
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 5) {
-                        ForEach(model.monitoringLogs) { entry in
+                        ForEach(logs) { entry in
                             LogRowView(entry: entry, clockStyle: model.clockStyle)
                         }
                     }
                     .padding(.bottom, 6)
-                    .animation(.easeOut(duration: 0.25), value: model.monitoringLogs.count)
+                    .animation(.easeOut(duration: 0.25), value: logs.count)
                 }
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    // MARK: - Logs filter
+
+    private var filterActive: Bool { !hiddenProviders.isEmpty || !hiddenCategories.isEmpty }
+
+    /// The feed with the active filter applied. Chips subtract: a row shows if
+    /// its type chip is on AND its provider chip is on. Provider is resolved
+    /// through the account inventory first (the truth), then the entry's
+    /// host-derived hint; rows attributable to neither (scheduler.start,
+    /// wake.reregister, …) always pass the provider facet — a provider chip
+    /// filters provider-attributable rows only, it never hides the machinery.
+    private var filteredLogs: [MonitoringLogEntry] {
+        guard filterActive else { return model.monitoringLogs }
+        let providerByAccount = Dictionary(
+            model.accounts.map { ($0.id, $0.provider) },
+            uniquingKeysWith: { first, _ in first })
+        return model.monitoringLogs.filter { entry in
+            if hiddenCategories.contains(entry.category) { return false }
+            if let provider = entry.accountID.flatMap({ providerByAccount[$0] }) ?? entry.providerHint,
+               hiddenProviders.contains(provider) { return false }
+            return true
+        }
+    }
+
+    /// "34 of 87 events" while filtering, plain "87 events" otherwise.
+    private func eventCount(shown: Int) -> String {
+        filterActive ? "\(shown) of \(model.monitoringLogs.count) events"
+                     : "\(model.monitoringLogs.count) events"
+    }
+
+    /// Collapsed-by-default filter controls, sitting just above the feed.
+    /// The critical affordance: an active filter must stay visible while
+    /// collapsed — the funnel fills in, the row summarizes what's still shown,
+    /// and Reset is one click — so a filtered feed can never masquerade as a
+    /// quiet night.
+    private var filterBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.15)) { filterExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: filterActive
+                            ? "line.3.horizontal.decrease.circle.fill"
+                            : "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 12))
+                            .foregroundStyle(filterActive ? Theme.accent : Color.secondary)
+                            .frame(width: 14)
+                        Text("Filter")
+                            .font(.system(size: 12.5, weight: .medium))
+                        Image(systemName: filterExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                        if filterActive, !filterExpanded {
+                            Text(filterSummary)
+                                .font(Theme.Font.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show only some providers or event types (display only — everything is still logged)")
+
+                Spacer(minLength: 8)
+
+                if filterActive {
+                    Button("Reset") { resetFilter() }
+                        .buttonStyle(.plain)
+                        .font(Theme.Font.caption)
+                        .foregroundStyle(Theme.accent)
+                        .help("Show everything again")
+                }
+            }
+
+            if filterExpanded {
+                filterChipRow(label: "Provider") {
+                    ForEach(Provider.allCases, id: \.self) { provider in
+                        FilterChip(
+                            label: provider.rawValue.capitalized,
+                            isOn: !hiddenProviders.contains(provider)) {
+                                toggleMembership(of: provider, in: &hiddenProviders)
+                            }
+                    }
+                }
+                filterChipRow(label: "Type") {
+                    ForEach(MonitoringLogEntry.Category.allCases) { category in
+                        FilterChip(
+                            label: category.rawValue,
+                            isOn: !hiddenCategories.contains(category)) {
+                                toggleMembership(of: category, in: &hiddenCategories)
+                            }
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .amCard(radius: Theme.Radius.sm)
+    }
+
+    private func filterChipRow(label: String, @ViewBuilder chips: () -> some View) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(Theme.Font.micro)
+                .foregroundStyle(.tertiary)
+                .frame(width: 52, alignment: .leading)
+            chips()
+        }
+        .padding(.leading, 22)
+    }
+
+    /// Collapsed-state summary of an active filter, naming what's still
+    /// *shown* per facet (only facets that are actually narrowed appear).
+    private var filterSummary: String {
+        var parts: [String] = []
+        let providers = Provider.allCases.filter { !hiddenProviders.contains($0) }
+        if providers.count < Provider.allCases.count {
+            parts.append(providers.isEmpty
+                ? "no providers"
+                : providers.map { $0.rawValue.capitalized }.joined(separator: ", "))
+        }
+        let categories = MonitoringLogEntry.Category.allCases.filter { !hiddenCategories.contains($0) }
+        if categories.count < MonitoringLogEntry.Category.allCases.count {
+            parts.append(categories.isEmpty
+                ? "no types"
+                : categories.map { $0.rawValue }.joined(separator: ", "))
+        }
+        return "showing " + parts.joined(separator: " · ")
+    }
+
+    private func toggleMembership<T: Hashable>(of value: T, in set: inout Set<T>) {
+        if set.contains(value) { set.remove(value) } else { set.insert(value) }
+    }
+
+    private func resetFilter() {
+        hiddenProviders = []
+        hiddenCategories = []
+    }
+}
+
+/// One toggle chip in the Logs filter: filled while its provider/type is
+/// shown, dimmed once hidden. A Button (not a Toggle) so the capsule itself
+/// is the whole affordance.
+private struct FilterChip: View {
+    let label: String
+    let isOn: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(isOn ? Theme.accent : Color.secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3.5)
+                .background(Capsule().fill(isOn ? Theme.accent.opacity(0.14) : Color.primary.opacity(0.04)))
+                .overlay(Capsule().stroke(isOn ? Theme.accent.opacity(0.5) : Color.primary.opacity(0.12)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(isOn ? "Click to hide \(label) events" : "Click to show \(label) events")
     }
 }
 
