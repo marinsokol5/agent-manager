@@ -62,7 +62,14 @@ public enum ClaudeTokenRefresher {
 
         var ready = false
         var trustDismissed = false
+        var readySearchStart = 0
         var statusSent = false
+        // Only trust a ready marker on a settled frame (no growth this long) —
+        // a half-drawn trust dialog could otherwise expose its own ❯ caret
+        // before the "confirm" bar that identifies it (see `ClaudeTUI`).
+        let readyQuiet: TimeInterval = 0.5
+        var lastLen = 0
+        var lastGrowth = Date()
         let deadline = Date().addingTimeInterval(timeout)
 
         usleep(400_000)
@@ -71,16 +78,20 @@ public enum ClaudeTokenRefresher {
             session.drain()
             session.answerCursorQueryIfNeeded()
             let captured = session.text
+            if captured.count != lastLen { lastLen = captured.count; lastGrowth = Date() }
 
             if !ready {
                 // The trust-folder dialog's action bar is the only place `confirm`
-                // appears (Enter to confirm); dismiss it once.
+                // appears (Enter to confirm); dismiss it once, and from then on
+                // only search output that arrived after the dismissal — the
+                // buffer is append-only, so the dialog's own ❯ caret stays in it.
                 if !trustDismissed, captured.contains("confirm") {
                     session.send("\r")
                     trustDismissed = true
-                }
-                // `? for shortcuts` marks the input prompt as ready.
-                if captured.contains("shortcuts") {
+                    readySearchStart = captured.count
+                } else if Date().timeIntervalSince(lastGrowth) >= readyQuiet,
+                          ClaudeTUI.inputPromptVisible(in: captured, from: readySearchStart)
+                {
                     ready = true
                     session.send("/status")
                     session.send("\r")

@@ -45,6 +45,8 @@ public enum ClaudePingRunner {
 
         var ready = false
         var trustDismissed = false
+        var readySearchStart = 0
+        var turnSearchStart = 0
         var promptSentAt: Date?
         var turnStarted = false   // saw `esc to interrupt` → generation began
         var turnSettled = false   // reply streamed and output went quiet → turn done
@@ -58,6 +60,10 @@ public enum ClaudePingRunner {
         // when no new output has arrived for `quietWindow`.
         let quietWindow: TimeInterval = 2.0
         let maxTurn: TimeInterval = 45
+        // Only trust a ready marker on a settled frame (no growth this long) —
+        // a half-drawn trust dialog could otherwise expose its own ❯ caret
+        // before the "confirm" bar that identifies it (see `ClaudeTUI`).
+        let readyQuiet: TimeInterval = 0.5
         var lastLen = 0
         var lastGrowth = Date()
 
@@ -71,20 +77,24 @@ public enum ClaudePingRunner {
 
             if !ready {
                 // The trust-folder dialog's action bar is the only place `confirm`
-                // appears (Enter to confirm); dismiss it once.
+                // appears (Enter to confirm); dismiss it once, and from then on
+                // only search output that arrived after the dismissal — the
+                // buffer is append-only, so the dialog's own ❯ caret stays in it.
                 if !trustDismissed, captured.contains("confirm") {
                     session.send("\r")
                     trustDismissed = true
-                }
-                // `? for shortcuts` marks the input prompt as ready.
-                if captured.contains("shortcuts") {
+                    readySearchStart = captured.count
+                } else if Date().timeIntervalSince(lastGrowth) >= readyQuiet,
+                          ClaudeTUI.inputPromptVisible(in: captured, from: readySearchStart)
+                {
                     ready = true
                     session.send(pingPrompt)
                     session.send("\r")
                     promptSentAt = Date()
+                    turnSearchStart = captured.count
                 }
             } else {
-                if captured.contains("interrupt") { turnStarted = true }
+                if ClaudeTUI.turnStarted(in: captured, from: turnSearchStart) { turnStarted = true }
                 if turnStarted, Date().timeIntervalSince(lastGrowth) >= quietWindow {
                     turnSettled = true
                     break
