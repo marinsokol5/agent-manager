@@ -19,24 +19,12 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3.0</string>
+	<string>0.3.1</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
-	<!-- TCC purpose strings. Agent Manager's own code never touches these
-	     locations; macOS attributes the official claude/codex CLI's file access
-	     to us because we are the responsible process for the children we spawn
-	     (pings, token refresh, login). Automated sessions opt out of the CLI's
-	     sandbox (whose Seatbelt init sweeps these folders — see
-	     Provider.sandboxOptOutArguments), so these dialogs should be rare; when
-	     one does appear, this text renders inside it and tells the user the
-	     truth: denying is always safe. -->
 	<key>NSAppDataUsageDescription</key>
-	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
-	<key>NSFileProviderDomainUsageDescription</key>
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
 	<key>NSDesktopFolderUsageDescription</key>
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
@@ -44,8 +32,12 @@
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
+	<key>NSFileProviderDomainUsageDescription</key>
+	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 	<key>NSRemovableVolumesUsageDescription</key>
 	<string>Agent Manager itself never reads your files. This request comes from the official Claude/Codex CLI it launches on your behalf. Nothing Agent Manager does needs this access — choosing Don’t Allow is safe.</string>
 </dict>
