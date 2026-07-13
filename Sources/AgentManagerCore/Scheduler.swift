@@ -74,11 +74,15 @@ public struct Scheduler {
         let accounts = try schedulableAccounts()
         let schedule = try scheduleStore.load()
         let ids = accounts.map(\.id)
-        let parallelism = schedule.resolvedParallelism(accountCount: ids.count)
+        // Project the same continuous weekly geometry the daemon fires —
+        // planning each weekday in isolation here would print pings that never
+        // happen whenever painted work hugs midnight.
+        let weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ids, schedule: schedule)
         return (0..<7).map { wd in
-            let blocks = schedule.blocks(forWeekday: wd)
-            let plan = ScheduleEngine.planDay(forAccountIDs: ids, workBlocks: blocks, window: schedule.windowMinutes, parallelism: parallelism, minSlice: schedule.resolvedMinSliceMinutes)
-            return DayPlan(weekday: wd, blocks: blocks, plan: plan)
+            DayPlan(
+                weekday: wd,
+                blocks: schedule.blocks(forWeekday: wd),
+                plan: LaunchAgentPlanner.displayPlan(forWeekday: wd, weekly: weekly, schedule: schedule))
         }
     }
 
@@ -116,10 +120,12 @@ public struct Scheduler {
         let accounts = try schedulableAccounts()
         let schedule = try scheduleStore.load()
         let ids = accounts.map(\.id)
+        let weeklyEntries = LaunchAgentPlanner.entriesByAccount(
+            accountIDs: ids, schedule: schedule)
         let plans = ids.map { id in
             ActivationReport.AccountPlan(
                 accountID: id,
-                pingsPerWeek: LaunchAgentPlanner.entries(forAccountID: id, accountIDs: ids, schedule: schedule).count)
+                pingsPerWeek: weeklyEntries[id, default: []].count)
         }
         let total = plans.reduce(0) { $0 + $1.pingsPerWeek }
 
@@ -265,8 +271,10 @@ public struct Scheduler {
         let accounts = (try? schedulableAccounts()) ?? []
         let schedule = (try? scheduleStore.load()) ?? WorkSchedule()
         let ids = accounts.map(\.id)
+        let weeklyEntries = LaunchAgentPlanner.entriesByAccount(
+            accountIDs: ids, schedule: schedule)
         let perAccount = ids.map { id -> StatusReport.AccountJobStatus in
-            let entries = LaunchAgentPlanner.entries(forAccountID: id, accountIDs: ids, schedule: schedule)
+            let entries = weeklyEntries[id, default: []]
             return .init(accountID: id, pingsPerWeek: entries.count, entries: entries, scheduled: active && !entries.isEmpty)
         }
         return StatusReport(active: active, agentInstalled: installed, agentLoaded: loaded, daemon: daemon, accounts: perAccount)

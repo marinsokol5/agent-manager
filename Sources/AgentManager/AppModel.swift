@@ -182,6 +182,14 @@ final class AppModel {
     // MARK: - Journey 4 (schedule) state
     /// The painted weekly work-hour selection (mirrors `schedule.json`).
     var schedule = WorkSchedule()
+    /// Memo for `plan(forWeekday:)`: the compiled continuous weekly plan for
+    /// the given inputs. Compiling the week is the expensive step (it can run
+    /// the whole-day search); projecting a weekday out of it is cheap, and the
+    /// coverage view asks for one day per render. `@ObservationIgnored` because
+    /// it is written from `plan(forWeekday:)` during view-body evaluation — an
+    /// observed write there would invalidate the very body computing it.
+    @ObservationIgnored
+    var weeklyPlanMemo: (ids: [String], schedule: WorkSchedule, weekly: [AccountDayPlan])?
     /// The resident scheduler's full picture: active flag, launchd state, the
     /// daemon's heartbeat/queue, and the per-account plan (nil = not read yet).
     var schedulerStatus: Scheduler.StatusReport?

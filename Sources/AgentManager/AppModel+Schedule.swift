@@ -15,15 +15,22 @@ extension AppModel {
         accounts.filter { $0.status == .connected }
     }
 
-    /// The live multi-account plan for one weekday, computed from in-memory state.
+    /// The live multi-account plan for one weekday, computed from in-memory
+    /// state — a projection of the same continuous weekly geometry the daemon
+    /// fires, so the coverage screen can never show a ping that won't happen
+    /// (planning a weekday in isolation would, whenever painted work hugs
+    /// midnight). The compiled week is memoised; painting invalidates it by
+    /// changing `schedule`.
     func plan(forWeekday d: Int) -> MultiDayPlan {
         let ids = scheduledAccounts.map(\.id)
-        return ScheduleEngine.planDay(
-            forAccountIDs: ids,
-            workBlocks: schedule.blocks(forWeekday: d),
-            window: schedule.windowMinutes,
-            parallelism: schedule.resolvedParallelism(accountCount: ids.count),
-            minSlice: schedule.resolvedMinSliceMinutes)
+        let weekly: [AccountDayPlan]
+        if let memo = weeklyPlanMemo, memo.ids == ids, memo.schedule == schedule {
+            weekly = memo.weekly
+        } else {
+            weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ids, schedule: schedule)
+            weeklyPlanMemo = (ids, schedule, weekly)
+        }
+        return LaunchAgentPlanner.displayPlan(forWeekday: d, weekly: weekly, schedule: schedule)
     }
 
     // MARK: - paint (edit `schedule`)

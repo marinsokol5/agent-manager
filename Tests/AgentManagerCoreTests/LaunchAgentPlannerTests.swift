@@ -3,10 +3,52 @@ import XCTest
 
 /// Launchd plist planning tests, plus `WorkSchedule` store round-trips.
 final class LaunchAgentPlannerTests: XCTestCase {
+    let minutesPerWeek = 7 * 24 * 60
+
     func scheduleMon(_ hours: [Int]) -> WorkSchedule {
         var s = WorkSchedule()
         s.set(weekday: 0, hours: hours)
         return s
+    }
+
+    func weekMinute(_ entry: CalEntry) -> Int {
+        let weekdayMon0 = (entry.weekday + 6) % 7
+        return weekdayMon0 * 1440 + entry.hour * 60 + entry.minute
+    }
+
+    func assertPhysicalAndCovered(
+        _ entries: [CalEntry],
+        schedule: WorkSchedule,
+        file: StaticString = #filePath,
+        line: UInt = #line)
+    {
+        let anchors = entries.map(weekMinute).sorted()
+        XCTAssertFalse(anchors.isEmpty, file: file, line: line)
+        for pair in zip(anchors, anchors.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(
+                pair.1 - pair.0, schedule.windowMinutes,
+                "anchors \(anchors)", file: file, line: line)
+        }
+        if let first = anchors.first, let last = anchors.last {
+            XCTAssertGreaterThanOrEqual(
+                first + minutesPerWeek - last, schedule.windowMinutes,
+                "weekly seam: anchors \(anchors)", file: file, line: line)
+        }
+
+        for weekday in 0..<7 {
+            for hour in schedule.hours(forWeekday: weekday) {
+                for minute in (weekday * 1440 + hour * 60)..<(weekday * 1440 + (hour + 1) * 60) {
+                    XCTAssertTrue(
+                        anchors.contains {
+                            (minute - $0 + minutesPerWeek) % minutesPerWeek
+                                < schedule.windowMinutes
+                        },
+                        "work minute \(minute) uncovered by \(anchors)",
+                        file: file,
+                        line: line)
+                }
+            }
+        }
     }
 
     // MARK: - weekday/time mapping
@@ -34,6 +76,152 @@ final class LaunchAgentPlannerTests: XCTestCase {
             CalEntry(weekday: 1, hour: 9, minute: 30),
             CalEntry(weekday: 1, hour: 14, minute: 30),
         ])
+    }
+
+    func testAdjacentWeekdaysRephaseOnOneContinuousTimeline() {
+        // The midnight field report: Monday's 21:00 anchor is live until Tuesday
+        // 02:00, so Tuesday's independently-derived Monday 23:30 pre-ping would
+        // be phantom. Planning the two columns together rephases the chain to
+        // three real windows: Monday 19:00, Tuesday 00:00, Tuesday 05:00.
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 0, hours: [23])
+        schedule.set(weekday: 1, hours: [3, 4, 5])
+        let ids = ["a1", "a2", "a3"] // default = three fully parallel lanes
+        let expected = [
+            CalEntry(weekday: 1, hour: 19, minute: 0),
+            CalEntry(weekday: 2, hour: 0, minute: 0),
+            CalEntry(weekday: 2, hour: 5, minute: 0),
+        ]
+
+        for id in ids {
+            let entries = LaunchAgentPlanner.entries(
+                forAccountID: id, accountIDs: ids, schedule: schedule)
+            XCTAssertEqual(entries, expected, id)
+            XCTAssertFalse(entries.contains(
+                CalEntry(weekday: 1, hour: 23, minute: 30)), id)
+            assertPhysicalAndCovered(entries, schedule: schedule)
+        }
+    }
+
+    func testSundayToMondayUsesTheSameContinuousWeekInvariant() {
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 6, hours: [23])
+        schedule.set(weekday: 0, hours: [3, 4, 5])
+        let entries = LaunchAgentPlanner.entries(
+            forAccountID: "a", accountIDs: ["a"], schedule: schedule)
+
+        // Returned in canonical trigger order (Monday → Sunday); cyclically this
+        // is Sunday 19:00 → Monday 00:00 → Monday 05:00.
+        XCTAssertEqual(entries, [
+            CalEntry(weekday: 1, hour: 0, minute: 0),
+            CalEntry(weekday: 1, hour: 5, minute: 0),
+            CalEntry(weekday: 0, hour: 19, minute: 0),
+        ])
+        assertPhysicalAndCovered(entries, schedule: schedule)
+    }
+
+    func testPhysicalCoverageHoldsAcrossEveryWeekdayBoundary() {
+        for weekday in 0..<7 {
+            var schedule = WorkSchedule()
+            schedule.set(weekday: weekday, hours: [23])
+            schedule.set(weekday: (weekday + 1) % 7, hours: [3, 4, 5])
+            let entries = LaunchAgentPlanner.entries(
+                forAccountID: "a", accountIDs: ["a"], schedule: schedule)
+            XCTAssertEqual(entries.count, 3, "boundary after weekday \(weekday)")
+            assertPhysicalAndCovered(entries, schedule: schedule)
+        }
+    }
+
+    func testDenseWeekWithoutAnIndependentSeamStaysPhysicalAndCovered() {
+        // Fifteen painted hours followed by nine off-hours every day: the gap is
+        // shorter than the planner's proof-safe 9h58m seam, so weekly planning
+        // must use repeated context instead of silently resetting each column.
+        var schedule = WorkSchedule()
+        for weekday in 0..<7 {
+            schedule.set(weekday: weekday, hours: Array(0..<15))
+        }
+        let entries = LaunchAgentPlanner.entries(
+            forAccountID: "a", accountIDs: ["a"], schedule: schedule)
+        assertPhysicalAndCovered(entries, schedule: schedule)
+    }
+
+    // MARK: - display projection (coverage screen / am plan)
+
+    func testDisplayPlanMatchesPerDayEngineWhenDaysAreIndependent() {
+        // Ordinary schedules (overnight gaps beyond the seam threshold) must
+        // render exactly as the per-day engine always has — pings and usage.
+        var schedule = scheduleMon([8, 9, 10, 11])
+        schedule.parallelism = 1
+        let ids = ["a1", "a2"]
+        let weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ids, schedule: schedule)
+        let projected = LaunchAgentPlanner.displayPlan(forWeekday: 0, weekly: weekly, schedule: schedule)
+        let direct = ScheduleEngine.planDay(
+            forAccountIDs: ids, workBlocks: schedule.blocks(forWeekday: 0),
+            window: schedule.windowMinutes,
+            parallelism: schedule.resolvedParallelism(accountCount: ids.count),
+            minSlice: schedule.resolvedMinSliceMinutes)
+        XCTAssertEqual(projected.accounts, direct.accounts)
+        XCTAssertEqual(projected.usage, direct.usage)
+
+        for weekday in 1..<7 {
+            let empty = LaunchAgentPlanner.displayPlan(forWeekday: weekday, weekly: weekly, schedule: schedule)
+            XCTAssertTrue(empty.accounts.allSatisfy(\.pings.isEmpty), "weekday \(weekday)")
+            XCTAssertTrue(empty.usage.isEmpty, "weekday \(weekday)")
+        }
+    }
+
+    func testDisplayPlanShowsOnlyFirableAnchorsAcrossMidnight() {
+        // The daemon fires Mon 19:00 / Tue 00:00 / Tue 05:00 for this shape.
+        // The coverage screen must show exactly those, each on the day whose
+        // work its window covers — never the phantom per-day 23:30 pre-ping.
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 0, hours: [23])
+        schedule.set(weekday: 1, hours: [3, 4, 5])
+        let weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ["a"], schedule: schedule)
+
+        let monday = LaunchAgentPlanner.displayPlan(forWeekday: 0, weekly: weekly, schedule: schedule)
+        XCTAssertEqual(monday.accounts.first?.pings.map(\.atMin), [1140]) // 19:00
+        XCTAssertEqual(monday.usage, [
+            UsageSegment(accountID: "a", batchIndex: 1, startMin: 1380, endMin: 1440),
+        ])
+
+        let tuesday = LaunchAgentPlanner.displayPlan(forWeekday: 1, weekly: weekly, schedule: schedule)
+        XCTAssertEqual(tuesday.accounts.first?.pings.map(\.atMin), [0, 300]) // 00:00, 05:00
+        XCTAssertEqual(tuesday.usage, [
+            UsageSegment(accountID: "a", batchIndex: 1, startMin: 180, endMin: 300),
+            UsageSegment(accountID: "a", batchIndex: 2, startMin: 300, endMin: 360),
+        ])
+    }
+
+    func testDisplayPlanProjectsTheSundayWrapOntoMonday() {
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 6, hours: [23])
+        schedule.set(weekday: 0, hours: [3, 4, 5])
+        let weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ["a"], schedule: schedule)
+        XCTAssertEqual(
+            LaunchAgentPlanner.displayPlan(forWeekday: 6, weekly: weekly, schedule: schedule)
+                .accounts.first?.pings.map(\.atMin), [1140]) // Sun 19:00
+        XCTAssertEqual(
+            LaunchAgentPlanner.displayPlan(forWeekday: 0, weekly: weekly, schedule: schedule)
+                .accounts.first?.pings.map(\.atMin), [0, 300]) // Mon 00:00, 05:00
+    }
+
+    func testDisplayPlanShowsAWindowSpanningMidnightWorkOnBothDays() {
+        // Mon 23:00–24:00 + Tue 00:00–01:00 is one continuous block; at a
+        // 90-minute floor it earns a single centred window (21:30–02:30)
+        // covering work on both sides of midnight — so both days show the same
+        // anchor: Monday as 21:30, Tuesday as 21:30 (−1d).
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 0, hours: [23])
+        schedule.set(weekday: 1, hours: [0])
+        schedule.minSliceMinutes = 90
+        let weekly = LaunchAgentPlanner.weeklyPings(accountIDs: ["a"], schedule: schedule)
+        XCTAssertEqual(
+            LaunchAgentPlanner.displayPlan(forWeekday: 0, weekly: weekly, schedule: schedule)
+                .accounts.first?.pings.map(\.atMin), [1290])
+        XCTAssertEqual(
+            LaunchAgentPlanner.displayPlan(forWeekday: 1, weekly: weekly, schedule: schedule)
+                .accounts.first?.pings.map(\.atMin), [-150])
     }
 
     func testEntriesAreStaggeredPerAccount() {

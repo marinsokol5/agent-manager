@@ -52,6 +52,25 @@ final class PingQueueTests: XCTestCase {
         ])
     }
 
+    func testQueueUsesContinuousPlanAcrossMidnight() {
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 0, hours: [23])
+        schedule.set(weekday: 1, hours: [3, 4, 5])
+        let queue = PingQueuePlanner.queue(
+            accountIDs: ["a"],
+            schedule: schedule,
+            after: date(2026, 7, 6, 18, 0),
+            calendar: cal)
+
+        XCTAssertEqual(queue, [
+            QueueEntry(fireAt: date(2026, 7, 6, 19, 0), accountID: "a"),
+            QueueEntry(fireAt: date(2026, 7, 7, 0, 0), accountID: "a"),
+            QueueEntry(fireAt: date(2026, 7, 7, 5, 0), accountID: "a"),
+        ])
+        XCTAssertFalse(queue.contains(
+            QueueEntry(fireAt: date(2026, 7, 6, 23, 30), accountID: "a")))
+    }
+
     func testSimultaneousFiresKeepAccountPriorityOrder() {
         // Default parallelism (auto = each account its own lane): both accounts
         // plan the identical 05:00/10:00 — the queue must break the tie by the

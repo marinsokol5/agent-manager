@@ -85,6 +85,9 @@ public actor SchedulerDaemon {
     private var active = false
     private var schedule = WorkSchedule()
     private var accountIDs: [String] = []
+    /// Minute-geometry compilation is cached with the stamped config. Ticks
+    /// only resolve these weekly fields to concrete dates and watermarks.
+    private var weeklyEntries: [String: [CalEntry]] = [:]
     /// Every known account's provider (connected or not) — the cloud-fallback
     /// sync must also reach routines of accounts that just *disconnected*.
     private var providersByID: [String: Provider] = [:]
@@ -348,6 +351,10 @@ public actor SchedulerDaemon {
         schedule = (try? ScheduleStore(workspace: workspace, fileManager: fileManager).load()) ?? WorkSchedule()
         let accounts = (try? AccountStore(workspace: workspace, fileManager: fileManager).load()) ?? []
         accountIDs = accounts.filter { $0.status == .connected }.inPriorityOrder().map(\.id)
+        weeklyEntries = active
+            ? LaunchAgentPlanner.entriesByAccount(
+                accountIDs: accountIDs, schedule: schedule)
+            : [:]
         providersByID = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.provider) })
         cloudFallbackEnabled = CloudFallbackConfigStore(workspace: workspace, fileManager: fileManager).load().enabled
     }
@@ -358,7 +365,7 @@ public actor SchedulerDaemon {
         guard active, !accountIDs.isEmpty else { return [] }
         return PingQueuePlanner.queue(
             accountIDs: accountIDs,
-            schedule: schedule,
+            weeklyEntries: weeklyEntries,
             after: horizonFloor,
             notBefore: lastHandled,
             calendar: calendar)

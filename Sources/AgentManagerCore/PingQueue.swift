@@ -53,10 +53,32 @@ public enum PingQueuePlanner {
         calendar: Calendar = .current)
         -> [QueueEntry]
     {
+        let weekly = LaunchAgentPlanner.entriesByAccount(
+            accountIDs: accountIDs, schedule: schedule)
+        return queue(
+            accountIDs: accountIDs,
+            weeklyEntries: weekly,
+            after: after,
+            notBefore: notBefore,
+            calendar: calendar)
+    }
+
+    /// Queue from an already-compiled weekly plan. The resident daemon caches
+    /// this value until `schedule.json` or `accounts.json` changes; resolving
+    /// dates is cheap and happens every tick, while whole-week optimisation does
+    /// not need to be repeated against identical inputs.
+    static func queue(
+        accountIDs: [String],
+        weeklyEntries: [String: [CalEntry]],
+        after: Date,
+        notBefore: [String: Date] = [:],
+        calendar: Calendar = .current)
+        -> [QueueEntry]
+    {
         var entries: [QueueEntry] = []
         for id in accountIDs {
             let floor = max(after, notBefore[id] ?? .distantPast)
-            for cal in LaunchAgentPlanner.entries(forAccountID: id, accountIDs: accountIDs, schedule: schedule) {
+            for cal in weeklyEntries[id, default: []] {
                 if let fireAt = nextOccurrence(of: cal, after: floor, calendar: calendar) {
                     entries.append(QueueEntry(fireAt: fireAt, accountID: id))
                 }
