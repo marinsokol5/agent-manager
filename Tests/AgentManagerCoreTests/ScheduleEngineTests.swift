@@ -65,6 +65,59 @@ final class ScheduleEngineTests: XCTestCase {
         XCTAssertEqual(mins(pings), [300, 600, 900]) // 05:00, 10:00, 15:00
     }
 
+    // MARK: - regression: phantom mid-window pings
+
+    func testShortBlockThenGapNeverPingsInsideTheLiveWindow() {
+        // The field report: Mon 10:00–11:00 + 14:00–17:00 at the product-default
+        // 60-min floor. The 1h block centres its window (08:00–13:00 — expired
+        // before the afternoon block, but with hours of post-block slack), and
+        // the afternoon block's *ideal* pre-ping (10:30) lands inside it. A real
+        // ping there anchors nothing — usage within a window never moves its
+        // boundary — so the old plan [08:00, 10:30, 15:30] promised a phantom
+        // 10:30–15:30 batch and left 14:00–15:30 of painted work uncovered.
+        // The anchor must clamp forward to the expiry instead.
+        let day = [block(600, 660), block(840, 1020)]
+        let pings = ScheduleEngine.planDay(day, window: w, minSlice: 60)
+        XCTAssertEqual(mins(pings), [480, 780]) // 08:00, 13:00 — not [480, 630, 930]
+        assertCovers(pings, day, "10–11 + 14–17, floor 60")
+    }
+
+    func testParallelLanesInheritTheMidWindowClamp() {
+        // Full parallelism = lanes of one account, each on the single-account
+        // planner — the exact configuration the field report ran (3 of 3).
+        let plan = ScheduleEngine.planDay(
+            forAccountIDs: ids(3), workBlocks: [block(600, 660), block(840, 1020)],
+            window: w, parallelism: 3, minSlice: 60)
+        for a in plan.accounts {
+            XCTAssertEqual(mins(a.pings), [480, 780], a.accountID)
+        }
+    }
+
+    func testPingsNeverCloserThanAWindowAcrossBlockShapesAndFloors() {
+        // The moat invariant, swept: one account's anchors can never be closer
+        // than `window` (a ping inside a live window anchors nothing), and no
+        // work minute may lose coverage — across two-block day shapes × floors.
+        for s1 in stride(from: 360, through: 720, by: 60) {
+            for len1 in [60, 120, 180] {
+                for gap in stride(from: 60, through: 360, by: 60) {
+                    for len2 in [60, 180, 300, 360] {
+                        let blocks = [block(s1, s1 + len1),
+                                      block(s1 + len1 + gap, s1 + len1 + gap + len2)]
+                        for minSlice in [minSliceFloorMinutes, 30, 60, 90, 150] {
+                            let ctx = "s1 \(s1) len1 \(len1) gap \(gap) len2 \(len2) floor \(minSlice)"
+                            let pings = ScheduleEngine.planDay(blocks, window: w, minSlice: minSlice)
+                            for pair in zip(pings, pings.dropFirst()) {
+                                XCTAssertGreaterThanOrEqual(pair.1.atMin - pair.0.atMin, w,
+                                    "\(ctx): pings \(mins(pings))")
+                            }
+                            assertCovers(pings, blocks, ctx)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testCoverageHasNoGapsDuringWork() {
         let blocks = [block(480, 960), block(1020, 1140)]
         let pings = ScheduleEngine.planDay(blocks, window: w)
@@ -136,6 +189,8 @@ final class ScheduleEngineTests: XCTestCase {
         (4, [Block(start: 480, end: 781)]),                                // 5h01m block
         (2, [Block(start: 480, end: 1200)]),                               // 12h
         (3, [Block(start: 480, end: 960), Block(start: 1020, end: 1200)]),
+        (1, [Block(start: 600, end: 660), Block(start: 840, end: 1020)]),  // short block + gap (field report)
+        (3, [Block(start: 600, end: 660), Block(start: 840, end: 1020)]),
     ]
 
     func usageWithMin(_ n: Int, _ blocks: [Block], _ window: Int, _ minSeg: Int) -> [UsageSegment] {

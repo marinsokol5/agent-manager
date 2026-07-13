@@ -182,6 +182,12 @@ public enum ScheduleEngine {
     /// previous block still re-pings at its expiry wherever that falls —
     /// coverage across the gap is worth more than the floor, so a sub-floor
     /// tail can survive there.
+    ///
+    /// Anchors are physical: one account's pings are never closer than
+    /// `window` apart (a ping inside a still-open window anchors nothing), so
+    /// a fresh block's ideal pre-ping clamps forward to the previous window's
+    /// expiry when the two collide — mirroring `appendBlockPings` on the
+    /// multi-account path.
     public static func planDay(_ workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
         precondition(window > 0, "window must be positive")
         var pings: [Ping] = []
@@ -196,7 +202,18 @@ public enum ScheduleEngine {
             // ride it (re-pinging at its expiry below) — can't re-anchor mid-window.
             if activeUntil <= s {
                 let a = firstBoundaryOffset(len: e - s, window: window, minSlice: minSlice)
-                let t0 = s - window + a
+                // The ideal pre-ping can still land *inside* the previous block's
+                // window: a short early block centres its window with slack past
+                // the block end, so the window can expire before `s` yet after the
+                // ideal anchor (e.g. 10–11h centres 08:00–13:00; a 14–17h block's
+                // ideal pre-ping is 10:30). A ping there anchors nothing — usage
+                // inside a window never moves its boundary — burning a turn and
+                // promising a batch that never exists. Clamp to the expiry: the
+                // earliest legal anchor and the closest to the ideal. Coverage of
+                // `s` survives the clamp — whichever bound wins is ≤ `s` (this
+                // branch) and > `s - window` (a ≥ 1; a binding clamp means
+                // `activeUntil` exceeds the ideal, which already is).
+                let t0 = max(s - window + a, activeUntil)
                 pings.append(Ping(atMin: t0))
                 activeUntil = t0 + window
             }
