@@ -188,12 +188,52 @@ public enum ScheduleEngine {
     /// a fresh block's ideal pre-ping clamps forward to the previous window's
     /// expiry when the two collide — mirroring `appendBlockPings` on the
     /// multi-account path. That greedy clamp is only the safety baseline: if it
-    /// loses a floor-sized budget that a different phase could preserve, a
-    /// bounded whole-day search rephases the anchors. Keeping the greedy result
+    /// loses a floor-sized budget that a different phase could preserve — or
+    /// spends an extra ping a different phase makes unnecessary — a bounded
+    /// whole-day search rephases the anchors. Keeping the greedy result
     /// whenever it is already maximal preserves the established, block-local
     /// placement tie-breaks without sacrificing usable budgets.
     public static func planDay(_ workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
         precondition(window > 0, "window must be positive")
+        let pings = greedyDayPings(workBlocks, window: window, minSlice: minSlice)
+
+        // A collision can be made physically valid by clamping yet still lose a
+        // real budget. In the field-report shape, centring 10–11h at 08:00 makes
+        // the 14–17h ideal collide; clamping yields only 08:00/13:00, while
+        // rephasing the day to 06:00/11:00/16:00 gives three legal windows whose
+        // work slices are 60/120/60 minutes. Search the whole day for that class
+        // of improvement. Single blocks already have a closed-form optimum; for
+        // multi-block days, cheap geometric + total-work bounds keep the minute
+        // search off every plan that cannot possibly improve.
+        let actionableGreedy = actionablePingCount(
+            pings, workBlocks: workBlocks, window: window, minSlice: minSlice)
+        if workBlocks.filter({ $0.end > $0.start }).count > 1,
+           // Worth searching when a new budget may exist — or when greedy spent
+           // more pings than it has actionable budgets (a sub-floor coverage
+           // ping a rephase might shed).
+           pings.count > actionableGreedy
+               || maximumActionablePingUpperBound(
+                   workBlocks, window: window, minSlice: minSlice
+               ) > actionableGreedy,
+           let improved = maximalActionablePlan(
+               workBlocks, window: window, minSlice: minSlice),
+           // Every window in the searched plan clears the floor, so its count is
+           // also its actionable-budget count. Replace greedy only for a strict
+           // win: more budgets, or the same budgets on strictly fewer pings.
+           // Exact ties keep the established block-local tie-breaks.
+           improved.count > actionableGreedy
+               || (improved.count == actionableGreedy && improved.count < pings.count)
+        {
+            return improved
+        }
+        return pings
+    }
+
+    /// The greedy block-local pass planDay starts from: pre-ping each block
+    /// (clamped to the previous window's expiry) and re-ping at every expiry
+    /// inside it. Extracted so the multi-account planner can ask whether the
+    /// whole-day search overrode this geometry for the day.
+    private static func greedyDayPings(_ workBlocks: [Block], window: Int, minSlice: Int) -> [Ping] {
         var pings: [Ping] = []
         // The instant the currently-active window expires. Nothing active to start.
         var activeUntil = Int.min
@@ -227,31 +267,6 @@ public enum ScheduleEngine {
             while activeUntil < e {
                 pings.append(Ping(atMin: activeUntil))
                 activeUntil += window
-            }
-        }
-
-        // A collision can be made physically valid by clamping yet still lose a
-        // real budget. In the field-report shape, centring 10–11h at 08:00 makes
-        // the 14–17h ideal collide; clamping yields only 08:00/13:00, while
-        // rephasing the day to 06:00/11:00/16:00 gives three legal windows whose
-        // work slices are 60/120/60 minutes. Search the whole day for that class
-        // of improvement. Single blocks already have a closed-form optimum; for
-        // multi-block days, cheap geometric + total-work bounds keep the minute
-        // search off every plan that cannot possibly improve.
-        let actionableGreedy = actionablePingCount(
-            pings, workBlocks: workBlocks, window: window, minSlice: minSlice)
-        if workBlocks.lazy.filter({ $0.end > $0.start }).dropFirst().first != nil,
-           maximumActionablePingUpperBound(
-               workBlocks, window: window, minSlice: minSlice
-           ) > actionableGreedy,
-           let improved = maximalActionablePlan(
-               workBlocks, window: window, minSlice: minSlice)
-        {
-            // Every window in the searched plan clears the floor, so its count
-            // is also its actionable-budget count. The strict comparison keeps
-            // the block-local tie-breaks whenever rephasing buys no new budget.
-            if improved.count > actionableGreedy {
-                return improved
             }
         }
         return pings
@@ -468,6 +483,12 @@ public enum ScheduleEngine {
     /// still cut one account's window into a sub-floor sliver, which the usage
     /// allocator (also fed `minSlice`) then folds out of the recommendation.
     /// Lanes of one account (full parallelism) get exact floor-aware placement.
+    ///
+    /// Days where the whole-day search overrides the greedy block-local
+    /// geometry (see the single-account `planDay`) skip the stagger entirely:
+    /// every account anchors together on the rephased day plan, because the
+    /// stagger's block-local clamps would re-lose exactly the budgets the
+    /// rephase recovered.
     public static func planDay(forAccountIDs accountIDs: [String], workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> MultiDayPlan {
         precondition(window > 0, "window must be positive")
 
@@ -489,39 +510,54 @@ public enum ScheduleEngine {
         let n = ids.count
         var pingsByAccount = Array(repeating: [Ping](), count: n)
 
-        for block in workBlocks {
-            let (s, e) = (block.start, block.end)
-            if e <= s { continue }
-
-            let len = e - s
-            // Use planDay's own output as the authority on how many batches
-            // actually fit (the closed-form `1 + ceil(len/window)` over-counts by
-            // one when `len` sits just past a window multiple, e.g. 5h01m → claims
-            // 3, only 2 fit).
-            let batchesPerAccount = planDay([Block(start: s, end: e)], window: window, minSlice: minSlice).count
-            // A raised floor can cap a block at a single budget per account.
-            // Staggering would only manufacture the sub-floor slivers the floor
-            // exists to remove, so every account anchors together on the
-            // single-account placement (the same shape parallel lanes produce
-            // over equal hours); the usage allocator splits the shared block.
-            if batchesPerAccount == 1 {
-                let a = firstBoundaryOffset(len: len, window: window, minSlice: minSlice)
-                for accountIdx in 0..<n {
-                    appendBlockPings(&pingsByAccount[accountIdx], firstPing: s - window + a, blockStart: s, blockEnd: e, window: window)
-                }
-                continue
-            }
-            let maxOff = maxFirstExpiryOffset(len: len, window: window, batchesPerAccount: batchesPerAccount)
-            // Cap the stagger unit so `n` accounts get *distinct* first-expiry
-            // offsets (without the cap, a small slack + many accounts collapses
-            // every offset onto `maxOff`, scheduling all accounts identically).
-            let unit = min(
-                multiAccountOffsetUnit(len: len, window: window, batchesPerAccount: batchesPerAccount, accountCount: n),
-                max(maxOff / n, 1))
-
+        // The block-local stagger below inherits every loss the greedy geometry
+        // has: its forward clamps drop the same cross-block budgets a whole-day
+        // rephase preserves — and can even collapse every account onto one
+        // degraded phase (each clamp binding at the same expiry). When the
+        // day-level plan overrides the greedy geometry (see planDay), extend
+        // the single-budget precedent: every account anchors together on the
+        // rephased plan (the parallel-lane shape) and the usage allocator
+        // splits the shared blocks — budgets are worth more than stagger.
+        let dayPlan = planDay(workBlocks, window: window, minSlice: minSlice)
+        if dayPlan != greedyDayPings(workBlocks, window: window, minSlice: minSlice) {
             for accountIdx in 0..<n {
-                let offset = min(max((accountIdx + 1) * unit, 1), maxOff)
-                appendBlockPings(&pingsByAccount[accountIdx], firstPing: s - window + offset, blockStart: s, blockEnd: e, window: window)
+                pingsByAccount[accountIdx] = dayPlan
+            }
+        } else {
+            for block in workBlocks {
+                let (s, e) = (block.start, block.end)
+                if e <= s { continue }
+
+                let len = e - s
+                // Use planDay's own output as the authority on how many batches
+                // actually fit (the closed-form `1 + ceil(len/window)` over-counts by
+                // one when `len` sits just past a window multiple, e.g. 5h01m → claims
+                // 3, only 2 fit).
+                let batchesPerAccount = planDay([Block(start: s, end: e)], window: window, minSlice: minSlice).count
+                // A raised floor can cap a block at a single budget per account.
+                // Staggering would only manufacture the sub-floor slivers the floor
+                // exists to remove, so every account anchors together on the
+                // single-account placement (the same shape parallel lanes produce
+                // over equal hours); the usage allocator splits the shared block.
+                if batchesPerAccount == 1 {
+                    let a = firstBoundaryOffset(len: len, window: window, minSlice: minSlice)
+                    for accountIdx in 0..<n {
+                        appendBlockPings(&pingsByAccount[accountIdx], firstPing: s - window + a, blockStart: s, blockEnd: e, window: window)
+                    }
+                    continue
+                }
+                let maxOff = maxFirstExpiryOffset(len: len, window: window, batchesPerAccount: batchesPerAccount)
+                // Cap the stagger unit so `n` accounts get *distinct* first-expiry
+                // offsets (without the cap, a small slack + many accounts collapses
+                // every offset onto `maxOff`, scheduling all accounts identically).
+                let unit = min(
+                    multiAccountOffsetUnit(len: len, window: window, batchesPerAccount: batchesPerAccount, accountCount: n),
+                    max(maxOff / n, 1))
+
+                for accountIdx in 0..<n {
+                    let offset = min(max((accountIdx + 1) * unit, 1), maxOff)
+                    appendBlockPings(&pingsByAccount[accountIdx], firstPing: s - window + offset, blockStart: s, blockEnd: e, window: window)
+                }
             }
         }
 

@@ -100,6 +100,46 @@ final class ScheduleEngineTests: XCTestCase {
         }
     }
 
+    func testTieOnBudgetsDropsTheWastedPing() {
+        // 08:00–12:00 + 15:00–15:30, floor 60. Greedy rides the morning window
+        // to 15:00 and re-pings there for a 30-minute sub-floor tail —
+        // [05:00, 10:00, 15:00]: two usable budgets on three pings. No third
+        // floor-clearing budget exists (any window reaching the 15:00 sliver
+        // holds at most 30 sliver minutes + a sub-hour block-1 tail), so the
+        // whole-day search ties on budgets — and must then win on ping count:
+        // [05:30, 10:30] covers everything with the same two budgets.
+        let day = [block(480, 720), block(900, 930)]
+        let pings = ScheduleEngine.planDay(day, window: w, minSlice: 60)
+        XCTAssertEqual(mins(pings), [330, 630]) // 05:30, 10:30 — not [300, 600, 900]
+        assertCovers(pings, day, "8–12 + 15:00–15:30, floor 60")
+    }
+
+    func testSerialAccountsAnchorTogetherOnTheRephasedDay() {
+        // Serial rotation (one lane) on the field-report day: the block-local
+        // stagger collapses both accounts onto the same degraded [08:00, 13:00]
+        // phase (each clamp binds at the same expiry), losing the third budget
+        // the day admits. A rephased day therefore skips the stagger — every
+        // account anchors together on the day plan, the parallel-lane shape —
+        // and the allocator still tiles the painted blocks edge to edge.
+        let day = [block(600, 660), block(840, 1020)]
+        let plan = ScheduleEngine.planDay(forAccountIDs: ids(2), workBlocks: day, window: w, minSlice: 60)
+        for a in plan.accounts {
+            XCTAssertEqual(mins(a.pings), [360, 660, 960], a.accountID)
+        }
+        for b in day {
+            var segs = plan.usage.filter { $0.startMin < b.end && $0.endMin > b.start }
+                .map { ($0.startMin, $0.endMin) }
+            segs.sort { $0 < $1 }
+            var cur = b.start
+            for (s, e) in segs {
+                XCTAssertEqual(s, cur, "gap/overlap in block [\(b.start),\(b.end)] at \(cur)")
+                XCTAssertGreaterThanOrEqual(e - s, 60, "sub-floor segment \(s)–\(e)")
+                cur = e
+            }
+            XCTAssertEqual(cur, b.end, "block [\(b.start),\(b.end)] not covered to its end")
+        }
+    }
+
     func testSmallModelNeverLeavesAnActionableBudgetOnTheTable() {
         // Exhaustive, implementation-independent oracle over every non-empty
         // 7-minute work bitmap and every floor for a 4-minute window. Enumerate
