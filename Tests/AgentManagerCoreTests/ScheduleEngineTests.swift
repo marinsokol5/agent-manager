@@ -67,29 +67,108 @@ final class ScheduleEngineTests: XCTestCase {
 
     // MARK: - regression: phantom mid-window pings
 
-    func testShortBlockThenGapNeverPingsInsideTheLiveWindow() {
+    func testShortBlockThenGapRephasesToKeepEveryUsableBudget() {
         // The field report: Mon 10:00–11:00 + 14:00–17:00 at the product-default
         // 60-min floor. The 1h block centres its window (08:00–13:00 — expired
         // before the afternoon block, but with hours of post-block slack), and
         // the afternoon block's *ideal* pre-ping (10:30) lands inside it. A real
         // ping there anchors nothing — usage within a window never moves its
         // boundary — so the old plan [08:00, 10:30, 15:30] promised a phantom
-        // 10:30–15:30 batch and left 14:00–15:30 of painted work uncovered.
-        // The anchor must clamp forward to the expiry instead.
+        // 10:30–15:30 batch and left 14:00–15:30 of painted work uncovered. A
+        // forward-only clamp to [08:00, 13:00] is physical but still throws away
+        // a usable budget: rephase the whole day to three 5h-spaced anchors whose
+        // painted slices are exactly 60m, 120m, 60m.
         let day = [block(600, 660), block(840, 1020)]
         let pings = ScheduleEngine.planDay(day, window: w, minSlice: 60)
-        XCTAssertEqual(mins(pings), [480, 780]) // 08:00, 13:00 — not [480, 630, 930]
+        XCTAssertEqual(mins(pings), [360, 660, 960]) // 06:00, 11:00, 16:00
+        XCTAssertEqual(pings.map { ping in
+            day.reduce(0) { total, b in
+                total + max(0, min(ping.atMin + w, b.end) - max(ping.atMin, b.start))
+            }
+        }, [60, 120, 60])
         assertCovers(pings, day, "10–11 + 14–17, floor 60")
     }
 
-    func testParallelLanesInheritTheMidWindowClamp() {
+    func testParallelLanesInheritTheWholeDayRephase() {
         // Full parallelism = lanes of one account, each on the single-account
         // planner — the exact configuration the field report ran (3 of 3).
         let plan = ScheduleEngine.planDay(
             forAccountIDs: ids(3), workBlocks: [block(600, 660), block(840, 1020)],
             window: w, parallelism: 3, minSlice: 60)
         for a in plan.accounts {
-            XCTAssertEqual(mins(a.pings), [480, 780], a.accountID)
+            XCTAssertEqual(mins(a.pings), [360, 660, 960], a.accountID)
+        }
+    }
+
+    func testSmallModelNeverLeavesAnActionableBudgetOnTheTable() {
+        // Exhaustive, implementation-independent oracle over every non-empty
+        // 7-minute work bitmap and every floor for a 4-minute window. Enumerate
+        // every possible physical anchor subset, retain the plans that cover all
+        // work and give every window a contiguous floor-sized stretch, then
+        // require the real planner to expose at least that many actionable
+        // budgets. (Its coverage-first fallback may also contain load-bearing
+        // sub-floor windows when no all-actionable plan exists.)
+        // The compressed units exercise the same interval geometry as hours/5h
+        // while keeping the brute-force search tiny and deterministic.
+        let slots = 7
+        let window = 4
+
+        func blocksForMask(_ mask: Int) -> [Block] {
+            var result: [Block] = []
+            var start: Int?
+            for t in 0...slots {
+                let selected = t < slots && (mask & (1 << t)) != 0
+                if selected, start == nil {
+                    start = t
+                } else if !selected, let s = start {
+                    result.append(block(s, t))
+                    start = nil
+                }
+            }
+            return result
+        }
+
+        func longestBlockRun(anchor: Int, blocks: [Block]) -> Int {
+            blocks.map {
+                max(0, min(anchor + window, $0.end) - max(anchor, $0.start))
+            }.max() ?? 0
+        }
+
+        func oracleMaximum(mask: Int, blocks: [Block], floor: Int) -> Int {
+            let work = (0..<slots).filter { (mask & (1 << $0)) != 0 }
+            let candidates = Array((work.first! - window + 1)...work.last!)
+            var best = 0
+            for subset in 1..<(1 << candidates.count) {
+                let count = subset.nonzeroBitCount
+                if count <= best { continue }
+                let anchors = candidates.indices.compactMap {
+                    (subset & (1 << $0)) != 0 ? candidates[$0] : nil
+                }
+                guard zip(anchors, anchors.dropFirst()).allSatisfy({ $0.1 - $0.0 >= window }),
+                      work.allSatisfy({ t in
+                          anchors.contains { $0 <= t && t < $0 + window }
+                      }),
+                      anchors.allSatisfy({
+                          longestBlockRun(anchor: $0, blocks: blocks) >= floor
+                      })
+                else { continue }
+                best = max(best, anchors.count)
+            }
+            return best
+        }
+
+        for mask in 1..<(1 << slots) {
+            let blocks = blocksForMask(mask)
+            for floor in 1...window {
+                let oracle = oracleMaximum(mask: mask, blocks: blocks, floor: floor)
+                let pings = ScheduleEngine.planDay(blocks, window: window, minSlice: floor)
+                let actionable = pings.filter {
+                    longestBlockRun(anchor: $0.atMin, blocks: blocks) >= floor
+                }.count
+                XCTAssertGreaterThanOrEqual(
+                    actionable, oracle,
+                    "mask \(String(mask, radix: 2)), floor \(floor): pings \(mins(pings)), oracle \(oracle)")
+            }
         }
     }
 
@@ -97,21 +176,23 @@ final class ScheduleEngineTests: XCTestCase {
         // The moat invariant, swept: one account's anchors can never be closer
         // than `window` (a ping inside a live window anchors nothing), and no
         // work minute may lose coverage — across two-block day shapes × floors.
-        for s1 in stride(from: 360, through: 720, by: 60) {
-            for len1 in [60, 120, 180] {
-                for gap in stride(from: 60, through: 360, by: 60) {
-                    for len2 in [60, 180, 300, 360] {
-                        let blocks = [block(s1, s1 + len1),
-                                      block(s1 + len1 + gap, s1 + len1 + gap + len2)]
-                        for minSlice in [minSliceFloorMinutes, 30, 60, 90, 150] {
-                            let ctx = "s1 \(s1) len1 \(len1) gap \(gap) len2 \(len2) floor \(minSlice)"
-                            let pings = ScheduleEngine.planDay(blocks, window: w, minSlice: minSlice)
-                            for pair in zip(pings, pings.dropFirst()) {
-                                XCTAssertGreaterThanOrEqual(pair.1.atMin - pair.0.atMin, w,
-                                    "\(ctx): pings \(mins(pings))")
-                            }
-                            assertCovers(pings, blocks, ctx)
+        // One origin is sufficient: adding a constant to every block only adds
+        // that constant to every ping, so repeating the same geometry at seven
+        // clock offsets adds runtime, not coverage.
+        let s1 = 360
+        for len1 in [60, 120, 180] {
+            for gap in stride(from: 60, through: 360, by: 60) {
+                for len2 in [60, 180, 300, 360] {
+                    let blocks = [block(s1, s1 + len1),
+                                  block(s1 + len1 + gap, s1 + len1 + gap + len2)]
+                    for minSlice in [minSliceFloorMinutes, 30, 60, 90, 150] {
+                        let ctx = "len1 \(len1) gap \(gap) len2 \(len2) floor \(minSlice)"
+                        let pings = ScheduleEngine.planDay(blocks, window: w, minSlice: minSlice)
+                        for pair in zip(pings, pings.dropFirst()) {
+                            XCTAssertGreaterThanOrEqual(pair.1.atMin - pair.0.atMin, w,
+                                "\(ctx): pings \(mins(pings))")
                         }
+                        assertCovers(pings, blocks, ctx)
                     }
                 }
             }

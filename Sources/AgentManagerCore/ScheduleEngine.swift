@@ -187,7 +187,11 @@ public enum ScheduleEngine {
     /// `window` apart (a ping inside a still-open window anchors nothing), so
     /// a fresh block's ideal pre-ping clamps forward to the previous window's
     /// expiry when the two collide — mirroring `appendBlockPings` on the
-    /// multi-account path.
+    /// multi-account path. That greedy clamp is only the safety baseline: if it
+    /// loses a floor-sized budget that a different phase could preserve, a
+    /// bounded whole-day search rephases the anchors. Keeping the greedy result
+    /// whenever it is already maximal preserves the established, block-local
+    /// placement tie-breaks without sacrificing usable budgets.
     public static func planDay(_ workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
         precondition(window > 0, "window must be positive")
         var pings: [Ping] = []
@@ -202,6 +206,7 @@ public enum ScheduleEngine {
             // ride it (re-pinging at its expiry below) — can't re-anchor mid-window.
             if activeUntil <= s {
                 let a = firstBoundaryOffset(len: e - s, window: window, minSlice: minSlice)
+                let ideal = s - window + a
                 // The ideal pre-ping can still land *inside* the previous block's
                 // window: a short early block centres its window with slack past
                 // the block end, so the window can expire before `s` yet after the
@@ -213,7 +218,7 @@ public enum ScheduleEngine {
                 // `s` survives the clamp — whichever bound wins is ≤ `s` (this
                 // branch) and > `s - window` (a ≥ 1; a binding clamp means
                 // `activeUntil` exceeds the ideal, which already is).
-                let t0 = max(s - window + a, activeUntil)
+                let t0 = max(ideal, activeUntil)
                 pings.append(Ping(atMin: t0))
                 activeUntil = t0 + window
             }
@@ -224,7 +229,227 @@ public enum ScheduleEngine {
                 activeUntil += window
             }
         }
+
+        // A collision can be made physically valid by clamping yet still lose a
+        // real budget. In the field-report shape, centring 10–11h at 08:00 makes
+        // the 14–17h ideal collide; clamping yields only 08:00/13:00, while
+        // rephasing the day to 06:00/11:00/16:00 gives three legal windows whose
+        // work slices are 60/120/60 minutes. Search the whole day for that class
+        // of improvement. Single blocks already have a closed-form optimum; for
+        // multi-block days, cheap geometric + total-work bounds keep the minute
+        // search off every plan that cannot possibly improve.
+        let actionableGreedy = actionablePingCount(
+            pings, workBlocks: workBlocks, window: window, minSlice: minSlice)
+        if workBlocks.lazy.filter({ $0.end > $0.start }).dropFirst().first != nil,
+           maximumActionablePingUpperBound(
+               workBlocks, window: window, minSlice: minSlice
+           ) > actionableGreedy,
+           let improved = maximalActionablePlan(
+               workBlocks, window: window, minSlice: minSlice)
+        {
+            // Every window in the searched plan clears the floor, so its count
+            // is also its actionable-budget count. The strict comparison keeps
+            // the block-local tie-breaks whenever rephasing buys no new budget.
+            if improved.count > actionableGreedy {
+                return improved
+            }
+        }
         return pings
+    }
+
+    // MARK: - whole-day single-account optimisation
+
+    /// Memo key for the first minute the next non-overlapping window may start.
+    /// Every earlier work minute is already covered by the prefix plan.
+    private struct ActionablePlanState: Hashable {
+        var cursor: Int
+    }
+
+    /// One complete suffix plan. Count is the primary objective; the additive
+    /// costs only choose a stable, robust phase among equally rich plans.
+    private struct ActionablePlanChoice {
+        var anchors: [Int]
+        var balanceCost: Int64
+        var centringCost: Int64
+
+        static let empty = ActionablePlanChoice(
+            anchors: [], balanceCost: 0, centringCost: 0)
+    }
+
+    private struct WindowWorkStats {
+        /// Total painted work minutes inside this window (possibly across blocks).
+        var total: Int
+        /// Longest contiguous painted stretch inside the window. The floor is a
+        /// usable *block*, so two tiny stretches separated by a gap do not fake
+        /// one actionable budget.
+        var longestBlockRun: Int
+        /// Doubled-centre distance between the window and the outer span of work
+        /// it contains; avoids floating point and centres one-window plans exactly.
+        var centringCost: Int64
+    }
+
+    /// Find the maximum-cardinality plan in which every window contains at
+    /// least one contiguous `minSlice` stretch and all painted work is covered.
+    /// Requiring every searched window to clear the floor is deliberate: when
+    /// coverage makes that impossible, the block-local baseline remains the
+    /// authority and preserves its documented balanced-edge fallback. Windows
+    /// are generated in chronological order and the recursion's cursor is the
+    /// previous expiry, so physical spacing is structural rather than checked
+    /// after the fact.
+    ///
+    /// The search is minute-granular but tightly bounded: for the next uncovered
+    /// minute only the `window` possible anchors that contain it are candidates,
+    /// and memoisation visits each cursor once. A 24-hour grid is therefore tiny
+    /// enough to recompute live while painting.
+    private static func maximalActionablePlan(
+        _ workBlocks: [Block],
+        window: Int,
+        minSlice: Int)
+        -> [Ping]?
+    {
+        let blocks = workBlocks.filter { $0.end > $0.start }
+        guard let first = blocks.first else { return [] }
+        let floor = max(minSlice, 1)
+        var memo: [ActionablePlanState: ActionablePlanChoice] = [:]
+        var deadEnds: Set<ActionablePlanState> = []
+
+        func solve(cursor: Int) -> ActionablePlanChoice? {
+            let state = ActionablePlanState(cursor: cursor)
+            if let cached = memo[state] { return cached }
+            if deadEnds.contains(state) { return nil }
+            guard let nextWork = nextWorkMinute(atOrAfter: cursor, in: blocks) else {
+                return .empty
+            }
+
+            // The next anchor must be late enough not to overlap the previous
+            // window, yet early enough that its window contains `nextWork`.
+            let lower = max(cursor, nextWork - window + 1)
+            var best: ActionablePlanChoice?
+            for anchor in lower...nextWork {
+                let stats = windowWorkStats(
+                    anchor: anchor, window: window, workBlocks: blocks)
+                guard stats.longestBlockRun >= floor,
+                      let suffix = solve(cursor: anchor + window)
+                else { continue }
+
+                let total = Int64(stats.total)
+                let candidate = ActionablePlanChoice(
+                    anchors: [anchor] + suffix.anchors,
+                    // Total covered work is fixed, so minimising the sum of
+                    // squares is max-min fairness: it balances edge budgets.
+                    balanceCost: total * total + suffix.balanceCost,
+                    centringCost: stats.centringCost + suffix.centringCost)
+                if best == nil || isBetterActionablePlan(candidate, than: best!) {
+                    best = candidate
+                }
+            }
+
+            if let best {
+                memo[state] = best
+                return best
+            }
+            deadEnds.insert(state)
+            return nil
+        }
+
+        // `+ 1` is the earliest integer-minute anchor whose half-open window
+        // still contains the first painted minute.
+        return solve(cursor: first.start - window + 1)?.anchors.map(Ping.init(atMin:))
+    }
+
+    private static func nextWorkMinute(atOrAfter minute: Int, in workBlocks: [Block]) -> Int? {
+        for block in workBlocks {
+            if block.end <= minute { continue }
+            return max(block.start, minute)
+        }
+        return nil
+    }
+
+    private static func windowWorkStats(
+        anchor: Int,
+        window: Int,
+        workBlocks: [Block])
+        -> WindowWorkStats
+    {
+        let expiry = anchor + window
+        var total = 0
+        var longest = 0
+        var firstCovered: Int?
+        var lastCovered: Int?
+        for block in workBlocks {
+            let a = max(anchor, block.start)
+            let b = min(expiry, block.end)
+            guard b > a else { continue }
+            total += b - a
+            longest = max(longest, b - a)
+            firstCovered = firstCovered.map { min($0, a) } ?? a
+            lastCovered = lastCovered.map { max($0, b) } ?? b
+        }
+
+        let centreCost: Int64
+        if let firstCovered, let lastCovered {
+            let windowCentre2 = Int64(anchor) * 2 + Int64(window)
+            let workCentre2 = Int64(firstCovered) + Int64(lastCovered)
+            centreCost = abs(windowCentre2 - workCentre2)
+        } else {
+            centreCost = 0
+        }
+        return WindowWorkStats(
+            total: total, longestBlockRun: longest, centringCost: centreCost)
+    }
+
+    private static func actionablePingCount(
+        _ pings: [Ping],
+        workBlocks: [Block],
+        window: Int,
+        minSlice: Int)
+        -> Int
+    {
+        let floor = max(minSlice, 1)
+        return pings.reduce(into: 0) { count, ping in
+            if windowWorkStats(
+                anchor: ping.atMin, window: window, workBlocks: workBlocks
+            ).longestBlockRun >= floor {
+                count += 1
+            }
+        }
+    }
+
+    /// Absolute upper bound on floor-sized budgets: physical anchors fit only
+    /// inside the range whose windows touch work, and disjoint windows cannot
+    /// each consume `minSlice` minutes more times than total painted work allows.
+    private static func maximumActionablePingUpperBound(
+        _ workBlocks: [Block],
+        window: Int,
+        minSlice: Int)
+        -> Int
+    {
+        let blocks = workBlocks.filter { $0.end > $0.start }
+        guard let first = blocks.first, let last = blocks.last else { return 0 }
+        let earliestAnchor = first.start - window + 1
+        let latestAnchor = last.end - 1
+        let geometric = (latestAnchor - earliestAnchor) / window + 1
+        let totalWork = blocks.reduce(0) { $0 + $1.end - $1.start }
+        return min(geometric, totalWork / max(minSlice, 1))
+    }
+
+    private static func isBetterActionablePlan(
+        _ lhs: ActionablePlanChoice,
+        than rhs: ActionablePlanChoice)
+        -> Bool
+    {
+        if lhs.anchors.count != rhs.anchors.count {
+            return lhs.anchors.count > rhs.anchors.count
+        }
+        if lhs.balanceCost != rhs.balanceCost {
+            return lhs.balanceCost < rhs.balanceCost
+        }
+        if lhs.centringCost != rhs.centringCost {
+            return lhs.centringCost < rhs.centringCost
+        }
+        // Exact ties choose the earlier phase, matching `firstBoundaryOffset`'s
+        // floor division when two integer-minute centres are equally close.
+        return lhs.anchors.lexicographicallyPrecedes(rhs.anchors)
     }
 
     /// Plan one day's pings for multiple accounts.
