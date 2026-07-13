@@ -42,11 +42,10 @@ public enum CloudFallbackPlanner {
     ///   - nextFireAt: the next planned *local* fire, or `nil` when there is
     ///     nothing to back up (feature disabled, scheduler off, account not
     ///     schedulable, or an empty week ahead) — `nil` drives `disable`.
-    ///   - lastAnchoredFireAt: the fire time of the most recent local ping this
-    ///     daemon run *observed anchoring* (in-memory, not persisted). After a
-    ///     restart this is `nil`, which only delays the forward re-arm until
-    ///     the armed moment passes — at most one redundant cloud turn, never a
-    ///     coverage gap.
+    ///   - lastAnchoredFireAt: the latest local-fire time whose pending
+    ///     backstop is resolved: a verified local anchor, or a slot a known
+    ///     live window already made unnecessary. The historical parameter name
+    ///     remains for source compatibility.
     ///   - now: injected clock.
     public static func plan(
         state: AccountCloudFallbackState,
@@ -86,7 +85,7 @@ public enum CloudFallbackPlanner {
         if desired < armedFor { return .arm(desired) }
         if now >= armedFor { return .arm(desired) }
         if armedFor.addingTimeInterval(-lead) > now { return .arm(desired) }
-        if let anchored = lastAnchoredFireAt, anchored.addingTimeInterval(lead) >= armedFor {
+        if let resolved = lastAnchoredFireAt, resolved.addingTimeInterval(lead) >= armedFor {
             return .arm(desired)
         }
         return .none // pending backstop — hold until it resolves

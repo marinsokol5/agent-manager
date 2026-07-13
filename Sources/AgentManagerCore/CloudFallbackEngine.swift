@@ -2,7 +2,9 @@ import Foundation
 
 /// One sync request from the scheduler daemon: "this account's next local fire
 /// is at `nextFireAt` (nil = nothing to back up — disable); the most recent
-/// local ping I saw anchor was the `lastAnchoredFireAt` one."
+/// local fire whose old backstop is resolved was `lastAnchoredFireAt`. The
+/// property keeps its original name for source compatibility, but resolution
+/// now also includes a slot already covered by a verified-open window.
 public struct CloudFallbackSyncRequest: Sendable, Equatable {
     public var accountID: String
     public var nextFireAt: Date?

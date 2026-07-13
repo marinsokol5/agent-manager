@@ -13,12 +13,27 @@ import Foundation
 
 /// One planned scheduled ping: fire `accountID` at `fireAt`.
 public struct QueueEntry: Codable, Equatable, Sendable {
+    /// When to actually fire. Usually the planned minute; when runtime
+    /// deferral shifted the entry past a known-open window
+    /// (`RuntimeAnchorPolicy`), this is the shifted *effective* time — which
+    /// is what the wake helper must arm for, so it stays in this field.
     public var fireAt: Date
     public var accountID: String
-    public init(fireAt: Date, accountID: String) {
+    /// The nominal planned minute this entry stands for when `fireAt` was
+    /// shifted; `nil` = `fireAt` is nominal. Watermarks (`lastHandled`) always
+    /// advance to the *nominal* time so queue rebuilds keep consuming exactly
+    /// one weekly slot per handled entry.
+    public var plannedAt: Date?
+
+    public init(fireAt: Date, accountID: String, plannedAt: Date? = nil) {
         self.fireAt = fireAt
         self.accountID = accountID
+        self.plannedAt = plannedAt
     }
+
+    /// The planned minute this entry stands for (its identity in the weekly
+    /// plan), whether or not the effective fire time was shifted.
+    public var nominalFireAt: Date { plannedAt ?? fireAt }
 }
 
 public enum PingQueuePlanner {

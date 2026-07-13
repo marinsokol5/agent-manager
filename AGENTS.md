@@ -176,7 +176,12 @@ design follows from them.
   account and for when. Written **only** by the daemon's `CloudFallbackEngine`
   (single writer); the app/CLI just read it for display.
 - `scheduler-status.json` — the scheduler daemon's heartbeat + upcoming-queue
-  snapshot, rewritten every tick (plus `scheduler.lock`, its flock file).
+  snapshot, optional `inFlight` attempt checkpoint (kept separate from the
+  handled watermark so a deferred child cannot lose its slot), per-account
+  `windowStates` (the best-known real window expiry that runtime deferral
+  schedules around), and `lastResolvedFire` (the latest local-fire time whose
+  cloud backstop may safely move forward), rewritten every tick (plus
+  `scheduler.lock`, its flock file).
 - `usage.json`, `usage-ratelimit.json` — cached readings / 429 backoff.
 - `keychain-grants.json` — which Keychain services the `/usr/bin/security` read
   path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
@@ -224,18 +229,25 @@ Work the chain in this order:
 1. **Was the daemon alive?** `scheduler-status.json` is the heartbeat,
    rewritten every tick. `updatedAt` more than ~3 min stale at some point
    means the daemon was dead or unloaded then; `startedAt`/`pid` reveal
-   restarts; `lastHandled` is the per-account watermark of the last fire it
-   handled (fired *or* deliberately dropped); `upcoming` is what it planned
-   next. `am scheduler status` pretty-prints it.
+   restarts; `lastHandled` is the per-account watermark of the last resolved
+   fire (fired *or* deliberately dropped), while `inFlight` identifies a child
+   whose outcome is not resolved yet; `upcoming` is what it planned next.
+   `am scheduler status` pretty-prints it.
 2. **Did each fire happen, skip, or fail?** `audit.log.jsonl`, keyed by the
    dotted `action` field: `scheduler.start` marks a daemon (re)launch; each
    attempt is `ping.start` → `ping` (with `ok` and a one-line `detail`);
    deliberate drops are `ping.skip`, whose detail says why — `"stale ping
-   (due 34m ago)"`, `"N stale pings (slept through…)"`, or `"cloud routine
-   covered this fire"`. Cloud-fallback arming appears as `routine.create` /
-   `routine.adopt` / `routine.arm` / `routine.disable` — and since `cloud-fallback-state.json`
-   only holds the *current* arming, the last `routine.arm` with `ok: true`
-   before the night is what tells you what was armed going in. Caveat: a
+   (due 34m ago)"`, `"N stale pings (slept through…)"`, `"cloud routine
+   covered this fire"`, or `"open window leaves no usable budget slice"`.
+   A fire that ran *minutes past its planned minute on purpose* logs
+   `ping.defer` first (from the daemon when it shifts the queue past a
+   known-open window, or from the child's preflight when it catches one at
+   fire time) — deferral is the fix for phantom pings, not a malfunction: a
+   turn fired into a still-open window anchors nothing. Cloud-fallback arming
+   appears as `routine.create` / `routine.adopt` / `routine.arm` /
+   `routine.disable` — and since `cloud-fallback-state.json` only holds the
+   *current* arming, the last `routine.arm` with `ok: true` before the night is
+   what tells you what was armed going in. Caveat: a
    plain "stale ping" skip does *not* rule out cloud coverage — the daemon
    can only log `"cloud routine covered…"` when it can reach the routines
    API at tick time (an expired token there means it reports a bare stale
@@ -245,8 +257,12 @@ Work the chain in this order:
 3. **Did the window actually anchor?** `activity.jsonl` has one record per
    ping outcome, and `anchored` is the truth signal, not `ok`: a stale skip
    is `ok: true, anchored: false`, while a cloud-covered fire is
-   `anchored: true` with no local ping. A failed ping's `transcriptPath`
-   points at the saved PTY transcript (`logs/<account>-<epoch>.transcript`) —
+   `anchored: true` with no local ping. A successful turn whose postflight
+   usage is unavailable is conservatively scheduled but remains
+   `anchored: false`; likewise, a cloud routine that fired inside an existing
+   window is logged as a phantom with `anchored: false`. A failed ping's
+   `transcriptPath` points at the saved PTY transcript
+   (`logs/<account>-<epoch>.transcript`) —
    read that to see what the official CLI actually printed.
 4. **What went over the wire?** `network.jsonl` records every HTTP exchange
    (usage fetches, trigger calls) with request and response, credential
@@ -263,9 +279,17 @@ Work the chain in this order:
    timestamps are local, not UTC), and `pmset -g sched` lists currently
    armed RTC wakes.
 
-Exit codes, when reading daemon ↔ child traces: `am ping` exits 0 = anchored,
-2 = failed, 3 = stale-skip (`PingOutcome`); the daemon reads any unknown code
-as failed.
+Exit codes, when reading daemon ↔ child traces: `am ping` exits 0 = anchored
+(verified against post-turn usage for scheduled pings), 2 = failed, 3 =
+stale-skip, 4 = deferred (preflight or postflight proved the window was already
+open — the daemon re-fires just past its expiry), 5 = anchor unverified (a turn
+ran but usage couldn't confirm the window moved; scheduled around
+conservatively, never
+treated as an anchor by the cloud fallback) — see `PingOutcome`; the daemon
+reads any unknown code as failed. The daemon's best-known window expiry per
+account travels as `windowStates` in `scheduler-status.json`, fed by usage
+readings (`resets_at` is exact) and observed/scheduled anchor events
+(event-derived fallbacks).
 
 ## Testing
 

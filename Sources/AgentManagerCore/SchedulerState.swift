@@ -62,6 +62,39 @@ public struct SchedulerConfigStore {
     }
 }
 
+/// A queue entry durably marked as running, but not yet resolved into the
+/// `lastHandled` watermark.
+///
+/// Keeping this separate is what lets a child report "window still open"
+/// without a crash window that permanently consumes its nominal slot. If the
+/// daemon dies mid-child, the next incarnation either recovers exact evidence
+/// that the window predated the attempt (leave the slot pending) or resolves
+/// the abandoned attempt conservatively (advance it, preserving the older
+/// no-double-fire guarantee).
+public struct SchedulerInFlight: Codable, Sendable, Equatable {
+    public var accountID: String
+    public var nominalFireAt: Date
+    public var effectiveFireAt: Date
+    public var startedAt: Date
+    /// The rolling-window length used by this attempt. Persist it because the
+    /// user can repaint/change planner knobs while the child is running.
+    public var windowSeconds: TimeInterval
+
+    public init(
+        accountID: String,
+        nominalFireAt: Date,
+        effectiveFireAt: Date,
+        startedAt: Date,
+        windowSeconds: TimeInterval)
+    {
+        self.accountID = accountID
+        self.nominalFireAt = nominalFireAt
+        self.effectiveFireAt = effectiveFireAt
+        self.startedAt = startedAt
+        self.windowSeconds = windowSeconds
+    }
+}
+
 /// `scheduler-status.json` — the daemon's heartbeat + introspection snapshot,
 /// rewritten on every tick. This is how the app answers "is the background
 /// scheduler actually alive and what happens next" without polling launchd, and
@@ -83,7 +116,8 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
     /// Per account, the fire time of the last queue entry the daemon *handled*
     /// (fired or deliberately dropped as stale). Queue rebuilds exclude anything
     /// at/before this, which is what makes rebuild-every-tick idempotent and a
-    /// daemon restart double-fire-safe.
+    /// daemon restart double-fire-safe. A running child lives in `inFlight`
+    /// until its outcome is known; its slot is not advanced here early.
     public var lastHandled: [String: Date]
     /// Entries scheduled before this are out of scope entirely (set to
     /// "activation time − grace" whenever the daemon starts fresh or the
@@ -91,7 +125,23 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
     /// the log with drops.
     public var horizonFloor: Date
     /// Set while a ping child is in flight, for "pinging <id>…" display.
+    /// Kept for the compact UI/readers; `inFlight` carries the durable identity.
     public var currentAccountID: String?
+    /// The durable identity of that child attempt. Unlike `lastHandled`, this
+    /// does not consume the slot before the child outcome is known.
+    public var inFlight: SchedulerInFlight?
+    /// Per account, the best-known exact or event-derived expiry of the current
+    /// window — what runtime deferral (`RuntimeAnchorPolicy`) schedules around.
+    /// Persisted so a daemon restart reconstructs the same deferral instead of
+    /// re-firing a phantom into a window it just anchored. Optional so status
+    /// files written before this field decode unchanged.
+    public var windowStates: [String: AccountWindowState]?
+    /// Per account, the latest effective local-fire time whose cloud backstop
+    /// is resolved: a verified local anchor, a passed cloud one-shot, or a slot
+    /// already covered by a known window. Persisting this prevents a daemon
+    /// restart between local resolution and API re-arm from letting the old
+    /// one-shot fire redundantly.
+    public var lastResolvedFire: [String: Date]?
 
     public init(
         version: Int = SchedulerDaemonStatus.currentVersion,
@@ -102,7 +152,10 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
         upcoming: [QueueEntry],
         lastHandled: [String: Date],
         horizonFloor: Date,
-        currentAccountID: String? = nil)
+        currentAccountID: String? = nil,
+        inFlight: SchedulerInFlight? = nil,
+        windowStates: [String: AccountWindowState]? = nil,
+        lastResolvedFire: [String: Date]? = nil)
     {
         self.version = version
         self.pid = pid
@@ -113,6 +166,9 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
         self.lastHandled = lastHandled
         self.horizonFloor = horizonFloor
         self.currentAccountID = currentAccountID
+        self.inFlight = inFlight
+        self.windowStates = windowStates
+        self.lastResolvedFire = lastResolvedFire
     }
 
     /// Whether the heartbeat is recent enough to call the daemon alive.

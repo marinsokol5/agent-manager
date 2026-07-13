@@ -109,7 +109,7 @@ case "list":
 case "usage":
     await runUsage(Array(arguments.dropFirst()))
 case "ping":
-    runPing(Array(arguments.dropFirst()))
+    await runPing(Array(arguments.dropFirst()))
 case "scheduler":
     await runScheduler(Array(arguments.dropFirst()))
 case "wake":
@@ -354,9 +354,17 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 /// window. This is the one ping operation: the manual "test ping" *and* exactly
 /// what the resident scheduler daemon spawns for each queue entry
 /// (`am ping <id> --manage-sleep --scheduled-for <epoch>`, workspace via
-/// `AGENT_MANAGER_ROOT`), so a hand-run ping and a scheduled one take an
-/// identical path through `AccountPinger.ping`.
-func runPing(_ args: [String]) {
+/// `AGENT_MANAGER_ROOT`), so a hand-run ping and a scheduled one drive the
+/// same turn runner. Scheduled pings additionally bracket the turn with
+/// read-only usage checks: a **preflight** that refuses to burn a phantom
+/// turn into a still-open window (exit 4 — the daemon re-fires just past the
+/// real expiry), and a **postflight** that verifies the window actually
+/// advanced (exit 0), proved the old window stayed open (exit 4 — re-fire at
+/// its expiry), or remains unverifiable (exit 5, scheduled around
+/// conservatively, never treated as an anchor by the cloud fallback). Manual
+/// pings stay unconditional, but their Activity record remains anchor-unverified
+/// because they deliberately avoid the scheduler's usage-read feedback loop.
+func runPing(_ args: [String]) async {
     // The positional <id>: first non-flag token that isn't a value-flag's value.
     let valueFlags: Set<String> = ["--scheduled-for"]
     let id = args.enumerated().first { i, a in
@@ -367,6 +375,15 @@ func runPing(_ args: [String]) {
     // hand-run `am ping`): hold the Mac awake for the turn, then — only if it's
     // provably unattended — return it to sleep. A manual ping leaves power alone.
     let manageSleep = hasFlag("--manage-sleep", in: args)
+    // The scheduler daemon passes the queue entry's effective time (nominal
+    // unless runtime deferral shifted it); without that there is nothing to be
+    // late against and no plan to guard (fail-open — a manual or oddly-invoked
+    // ping is never suppressed).
+    let scheduledFor = value("--scheduled-for", in: args).flatMap(Double.init)
+        .map(Date.init(timeIntervalSince1970:))
+    let isScheduled = manageSleep && scheduledFor != nil
+    let scheduledWindow = TimeInterval(
+        ((try? ScheduleStore(workspace: workspace).load()) ?? WorkSchedule()).windowMinutes * 60)
 
     // A scheduled ping that runs long after its minute means the Mac slept
     // through the scheduled time. Anchoring that late is worse than skipping, so
@@ -374,12 +391,8 @@ func runPing(_ args: [String]) {
     // `--manage-sleep`) are never subject to this.
     if manageSleep {
         let now = Date()
-        // The scheduler daemon passes the queue entry's planned time; without
-        // it there is nothing to be late against (fail-open, never suppress).
-        let scheduled = value("--scheduled-for", in: args).flatMap(Double.init)
-            .map(Date.init(timeIntervalSince1970:))
-        if StalePingPolicy.isStale(scheduledFire: scheduled, now: now), let scheduled {
-            let lateMin = Int((now.timeIntervalSince(scheduled) / 60).rounded())
+        if StalePingPolicy.isStale(scheduledFire: scheduledFor, now: now), let scheduledFor {
+            let lateMin = Int((now.timeIntervalSince(scheduledFor) / 60).rounded())
             let detail = "skipped: stale ping (fired \(lateMin)m late)"
             AuditLog(workspace: workspace).append(accountID: id, action: "ping.skip", ok: true, detail: detail)
             ActivityLog(workspace: workspace).append(
@@ -396,19 +409,120 @@ func runPing(_ args: [String]) {
     // makes that crash-safe, covering the fail/exit paths below for free.
     let entry = manageSleep ? PowerProbe().read() : nil
     let caffeinate = manageSleep ? SystemPower.holdIdleAssertion(untilPID: getpid()) : nil
-    do {
-        let result = try AccountPinger(workspace: workspace).ping(id)
+    // Release power and honor the unattended re-sleep on every deliberate exit;
+    // error paths keep today's behavior (the PID-bound assertion dies with us).
+    func finish(_ code: Int32) -> Never {
         caffeinate?.terminate()
-        print("\(result.ok ? "✅" : "✗") [\(id)] \(result.detail)")
         if let entry, ReSleepPolicy.shouldReturnToSleep(entry: entry, exit: PowerProbe().read()) {
             SystemPower.sleepNow()
         }
-        exit(result.ok ? PingOutcome.anchoredExitCode : PingOutcome.failedExitCode)
+        exit(code)
+    }
+
+    // Preflight (scheduled only): never dispatch an anchor turn into a window
+    // that is provably still open — it would anchor nothing (a phantom), log a
+    // false success, and desync the rest of the day's chain. This guard is
+    // deliberately cache-only: the single read-only network fetch belongs
+    // after the turn, where it both verifies the anchor and feeds the daemon.
+    // Missing/stale evidence falls soft into running exactly as before; the
+    // postflight can still prove a phantom and ask the daemon to retry it.
+    let cacheStore = UsageCache(workspace: workspace)
+    let account: Account? = isScheduled ? ((try? AccountStore(workspace: workspace).find(id)) ?? nil) : nil
+    var preReading: UsageReading? = nil
+    if isScheduled {
+        preReading = cacheStore.load()[id]
+        let preflightNow = Date()
+        // A corrupt/future cache value must not both suppress the child and
+        // authorize Claude's delegated refresh. Drop it from scheduling input;
+        // the daemon applies the same physical bound.
+        if let resets = preReading?.primaryResetsAt,
+           resets > preflightNow.addingTimeInterval(
+               scheduledWindow + RuntimeAnchorPolicy.margin)
+        {
+            preReading = nil
+        }
+        let decisionNow = Date()
+        if let resets = preReading?.primaryResetsAt,
+           RuntimeAnchorPolicy.isPlausibleLiveExpiry(
+               resets, at: decisionNow, window: scheduledWindow)
+        {
+            let inMin = max(Int((resets.timeIntervalSinceNow / 60).rounded()), 0)
+            let detail = "deferred: 5h window still open (resets in \(inMin)m) — a turn now would anchor nothing"
+            AuditLog(workspace: workspace).append(accountID: id, action: "ping.defer", ok: true, detail: detail)
+            print("⏳ [\(id)] \(detail)")
+            finish(PingOutcome.deferredOpenWindowExitCode)
+        }
+    }
+
+    do {
+        let pinger = AccountPinger(workspace: workspace)
+        guard isScheduled else {
+            let result = try pinger.ping(id)
+            print("\(result.ok ? "✅" : "✗") [\(id)] \(result.detail)")
+            finish(result.ok ? PingOutcome.anchoredExitCode : PingOutcome.failedExitCode)
+        }
+
+        let attemptStarted = Date()
+        let result = try pinger.runTurn(id)
+        let attemptFinished = Date()
+        guard result.ok else {
+            pinger.recordOutcome(id, result: result, anchored: false)
+            print("✗ [\(id)] \(result.detail)")
+            finish(PingOutcome.failedExitCode)
+        }
+
+        // Postflight: the token is fresh (the real CLI just ran), so one
+        // read-only usage fetch is safe — and its `resets_at` is the ground
+        // truth the daemon schedules the next fire around.
+        var post: UsageReading? = nil
+        if let account {
+            post = try? await UsageService.fetch(
+                account: account, gate: UsageRateLimitGate(workspace: workspace),
+                allowInteraction: false, cachedReading: preReading,
+                log: NetworkLog(workspace: workspace))
+            if let post { saveUsageReading(post, for: id, in: cacheStore) }
+        }
+        switch AnchorVerification.classify(
+            pre: preReading,
+            post: post,
+            turnStartedAt: attemptStarted,
+            turnFinishedAt: attemptFinished,
+            window: scheduledWindow)
+        {
+        case .verified:
+            pinger.recordOutcome(id, result: result, anchored: true)
+            print("✅ [\(id)] \(result.detail)")
+            finish(PingOutcome.anchoredExitCode)
+        case .phantom(let openUntil):
+            let inMin = max(Int((openUntil.timeIntervalSinceNow / 60).rounded()), 0)
+            let detail = result.detail + " — phantom: window was already open (resets in \(inMin)m), nothing anchored"
+            pinger.recordOutcome(id, result: result, anchored: false, detail: detail)
+            print("✗ [\(id)] \(detail)")
+            // Same retry contract as a preflight deferral: exact postflight
+            // proved this turn landed inside the old window, so the nominal
+            // slot must remain pending and re-fire just after that reset.
+            finish(PingOutcome.deferredOpenWindowExitCode)
+        case .unknown:
+            let detail = result.detail + " (anchor unverified — usage did not prove a new window)"
+            pinger.recordOutcome(id, result: result, anchored: false, detail: detail)
+            print("✅ [\(id)] \(detail)")
+            finish(PingOutcome.anchorUnknownExitCode)
+        }
     } catch let error as AccountPinger.PingError {
         fail("\(error)", code: PingOutcome.failedExitCode)
     } catch {
         fail("\(error)")
     }
+}
+
+/// Merge one fresh reading into the shared usage cache (load-modify-save,
+/// whole-file atomic like every other writer). A lost race against the app's
+/// own refresh only costs precision — the daemon falls back to its
+/// conservative window bound.
+func saveUsageReading(_ reading: UsageReading, for id: String, in store: UsageCache) {
+    var readings = store.load()
+    readings[id] = reading
+    store.save(readings)
 }
 
 // MARK: - scheduler (the resident daemon + its controls)
@@ -473,7 +587,11 @@ func printSchedulerStatus() {
     } else {
         let clockStyle = PreferencesStore(workspace: workspace).load().clockStyle
         for entry in upcoming.prefix(8) {
-            print("next:   \(clockStyle.dateTimeString(entry.fireAt))  \(entry.accountID)")
+            // A shifted entry shows its nominal slot too: "deferred" means the
+            // planned minute sits inside a still-open window, so the fire
+            // waits for the real expiry instead of burning a phantom turn.
+            let deferred = entry.plannedAt.map { "  (deferred from \(clockStyle.dateTimeString($0)))" } ?? ""
+            print("next:   \(clockStyle.dateTimeString(entry.fireAt))  \(entry.accountID)\(deferred)")
         }
     }
     for account in status.accounts {

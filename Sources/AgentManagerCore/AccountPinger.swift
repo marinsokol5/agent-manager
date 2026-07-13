@@ -30,6 +30,23 @@ public struct AccountPinger {
     }
 
     public func ping(_ id: String, timeout: TimeInterval = 90) throws -> ClaudePingRunner.Result {
+        let result = try runTurn(id, timeout: timeout)
+        // A manual "test ping" does not read post-turn usage, so process
+        // success cannot truthfully claim the rolling window moved. Record it
+        // as unverified; the scheduled child uses `runTurn` + postflight and
+        // records a verified anchor through `recordOutcome` itself.
+        let detail = result.ok
+            ? result.detail + " (anchor unverified — manual ping does not read usage)"
+            : result.detail
+        recordOutcome(id, result: result, anchored: false, detail: detail)
+        return result
+    }
+
+    /// Run the gated, audited TUI turn *without* writing the activity record.
+    /// Callers that verify anchoring for real (the scheduled ping child, see
+    /// `AnchorVerification`) decide `anchored` afterwards and record through
+    /// `recordOutcome`.
+    public func runTurn(_ id: String, timeout: TimeInterval = 90) throws -> ClaudePingRunner.Result {
         guard let account = try store.find(id) else { throw PingError.notFound(id) }
         guard account.status == .connected else { throw PingError.notConnected(account.status) }
 
@@ -50,16 +67,22 @@ public struct AccountPinger {
                 workingDirectory: home.url, timeout: timeout)
         }
         audit.append(accountID: id, action: "ping", ok: result.ok, detail: result.detail)
+        return result
+    }
 
-        // The Activity screen reads this: ✓/✗ + whether a window actually anchored
-        // (for the `tui` ping, a dispatched turn == an anchored window). Save every
-        // transcript (not just failures) so Monitoring can show what the agent
-        // replied — and so a bad ping is still debuggable after the fact.
+    /// The Activity screen reads this: ✓/✗ + whether a window actually anchored.
+    /// Save every transcript (not just failures) so Monitoring can show what the
+    /// agent replied — and so a bad ping is still debuggable after the fact.
+    public func recordOutcome(
+        _ id: String,
+        result: ClaudePingRunner.Result,
+        anchored: Bool,
+        detail: String? = nil)
+    {
         let now = Date()
         let transcriptPath = activity.saveTranscript(result.transcript, accountID: id, at: now)
         activity.append(ActivityRecord(
-            time: now, accountID: id, ok: result.ok, anchored: result.ok,
-            detail: result.detail, transcriptPath: transcriptPath))
-        return result
+            time: now, accountID: id, ok: result.ok, anchored: anchored,
+            detail: detail ?? result.detail, transcriptPath: transcriptPath))
     }
 }
