@@ -58,11 +58,30 @@ final class ScheduleEngineTests: XCTestCase {
         }
     }
 
-    func testAfternoonBlockRidesMorningWindowThenRepings() {
-        // 08:00–12:00 and 14:00–18:00. The 10:00 window covers until 15:00, so the
-        // afternoon block needs no pre-ping; it re-pings at 15:00.
+    func testSeparatedBlocksRephaseToRaiseSmallestBatch() {
+        // 08:00–12:00 and 14:00–18:00 admit three batches. The old block-local
+        // 05:00/10:00/15:00 phase assigned 120m/180m/180m; shifting by 30m
+        // raises the minimum to 150m with a 150m/180m/150m distribution.
         let pings = ScheduleEngine.planDay([block(480, 720), block(840, 1080)], window: w)
-        XCTAssertEqual(mins(pings), [300, 600, 900]) // 05:00, 10:00, 15:00
+        XCTAssertEqual(mins(pings), [330, 630, 930]) // 05:30, 10:30, 15:30
+    }
+
+    func testEqualBatchCountMaximizesSmallestBatchWorkTime() {
+        // Work 10:00–12:00 + 13:00–16:00 contains five painted hours. Only two
+        // floor-sized 5h windows fit, so the secondary token-max objective is to
+        // maximize the smaller batch's painted time. Splitting at 13:30 gives
+        // 150m/150m, the theoretical optimum (300m total / 2 batches); the old
+        // block-local phase [06:00, 11:00] produced a lopsided 60m/240m split.
+        let day = [block(600, 720), block(780, 960)]
+        let pings = ScheduleEngine.planDay(day, window: w, minSlice: 60)
+
+        XCTAssertEqual(mins(pings), [510, 810]) // 08:30, 13:30
+        XCTAssertEqual(pings.map { ping in
+            day.reduce(0) { total, b in
+                total + max(0, min(ping.atMin + w, b.end) - max(ping.atMin, b.start))
+            }
+        }, [150, 150])
+        assertCovers(pings, day, "10–12 + 13–16, floor 60")
     }
 
     // MARK: - regression: phantom mid-window pings

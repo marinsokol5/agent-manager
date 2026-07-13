@@ -188,11 +188,11 @@ public enum ScheduleEngine {
     /// a fresh block's ideal pre-ping clamps forward to the previous window's
     /// expiry when the two collide — mirroring `appendBlockPings` on the
     /// multi-account path. That greedy clamp is only the safety baseline: if it
-    /// loses a floor-sized budget that a different phase could preserve — or
-    /// spends an extra ping a different phase makes unnecessary — a bounded
-    /// whole-day search rephases the anchors. Keeping the greedy result
-    /// whenever it is already maximal preserves the established, block-local
-    /// placement tie-breaks without sacrificing usable budgets.
+    /// loses a floor-sized budget that a different phase could preserve,
+    /// spends an extra ping a different phase makes unnecessary, or leaves the
+    /// smallest of equally many batches unnecessarily short, a bounded
+    /// whole-day search rephases the anchors. Batch count remains the primary
+    /// token-max objective; max-min painted work per batch breaks count ties.
     public static func planDay(_ workBlocks: [Block], window: Int, minSlice: Int = minSliceFloorMinutes) -> [Ping] {
         precondition(window > 0, "window must be positive")
         let pings = greedyDayPings(workBlocks, window: window, minSlice: minSlice)
@@ -207,24 +207,61 @@ public enum ScheduleEngine {
         // search off every plan that cannot possibly improve.
         let actionableGreedy = actionablePingCount(
             pings, workBlocks: workBlocks, window: window, minSlice: minSlice)
-        if workBlocks.filter({ $0.end > $0.start }).count > 1,
-           // Worth searching when a new budget may exist — or when greedy spent
-           // more pings than it has actionable budgets (a sub-floor coverage
-           // ping a rephase might shed).
-           pings.count > actionableGreedy
-               || maximumActionablePingUpperBound(
-                   workBlocks, window: window, minSlice: minSlice
-               ) > actionableGreedy,
-           let improved = maximalActionablePlan(
-               workBlocks, window: window, minSlice: minSlice),
-           // Every window in the searched plan clears the floor, so its count is
-           // also its actionable-budget count. Replace greedy only for a strict
-           // win: more budgets, or the same budgets on strictly fewer pings.
-           // Exact ties keep the established block-local tie-breaks.
-           improved.count > actionableGreedy
-               || (improved.count == actionableGreedy && improved.count < pings.count)
+        let greedyChoice = actionablePlanChoice(
+            pings, workBlocks: workBlocks, window: window, minSlice: minSlice)
+        let totalWork = workBlocks.reduce(0) { total, block in
+            total + max(block.end - block.start, 0)
+        }
+        let maxMinMayImprove: Bool
+        if let greedyChoice, !greedyChoice.workMinutes.isEmpty {
+            // No equal-count plan can make its smallest batch exceed the
+            // average. Reaching that bound proves the greedy phase is already
+            // max-min optimal and keeps the minute search off the hot path.
+            maxMinMayImprove = (greedyChoice.workMinutes.first ?? 0)
+                < totalWork / greedyChoice.workMinutes.count
+        } else {
+            maxMinMayImprove = false
+        }
+        let actionableUpperBound = maximumActionablePingUpperBound(
+            workBlocks, window: window, minSlice: minSlice)
+        let shouldOptimize = pings.count > actionableGreedy
+            || actionableUpperBound > actionableGreedy
+            || maxMinMayImprove
+        guard workBlocks.filter({ $0.end > $0.start }).count > 1,
+              shouldOptimize
+        else { return pings }
+
+        // Most equal-count rephases are a translation of one consecutive chain.
+        // If such a phase reaches the average painted time, it attains the
+        // mathematical max-min ceiling and no recursive search can improve it.
+        if actionableUpperBound == pings.count,
+           let greedyChoice,
+           let translated = bestConsecutivePhase(
+               count: pings.count,
+               workBlocks: workBlocks,
+               window: window,
+               minSlice: minSlice),
+           translated.workMinutes.first == totalWork / pings.count,
+           isBetterBatchWorkDistribution(translated, than: greedyChoice)
         {
-            return improved
+            return translated.anchors.map(Ping.init(atMin:))
+        }
+
+        if let improved = maximalActionablePlan(
+            workBlocks, window: window, minSlice: minSlice),
+           // Every searched window clears the floor, so its anchor count is its
+           // actionable-budget count. Replace greedy only for a strict
+           // lexicographic win: more batches; equally many batches on fewer
+           // pings; or equal count with a better max-min work distribution.
+           improved.anchors.count > actionableGreedy
+               || (improved.anchors.count == actionableGreedy
+                   && improved.anchors.count < pings.count)
+               || (improved.anchors.count == pings.count
+                   && greedyChoice.map {
+                       isBetterBatchWorkDistribution(improved, than: $0)
+                   } == true)
+        {
+            return improved.anchors.map(Ping.init(atMin:))
         }
         return pings
     }
@@ -274,21 +311,19 @@ public enum ScheduleEngine {
 
     // MARK: - whole-day single-account optimisation
 
-    /// Memo key for the first minute the next non-overlapping window may start.
-    /// Every earlier work minute is already covered by the prefix plan.
-    private struct ActionablePlanState: Hashable {
-        var cursor: Int
-    }
-
-    /// One complete suffix plan. Count is the primary objective; the additive
-    /// costs only choose a stable, robust phase among equally rich plans.
+    /// One complete suffix plan. Count is the primary objective, the sorted
+    /// work vector provides exact max-min fairness, and centring only stabilizes
+    /// ties whose batch-time distributions are identical.
     private struct ActionablePlanChoice {
         var anchors: [Int]
-        var balanceCost: Int64
+        /// Painted work minutes assigned to each physical window. Count is
+        /// fixed before these are compared; sorting them least-first gives the
+        /// exact max-min batch-time objective.
+        var workMinutes: [Int]
         var centringCost: Int64
 
         static let empty = ActionablePlanChoice(
-            anchors: [], balanceCost: 0, centringCost: 0)
+            anchors: [], workMinutes: [], centringCost: 0)
     }
 
     private struct WindowWorkStats {
@@ -320,19 +355,34 @@ public enum ScheduleEngine {
         _ workBlocks: [Block],
         window: Int,
         minSlice: Int)
-        -> [Ping]?
+        -> ActionablePlanChoice?
     {
         let blocks = workBlocks.filter { $0.end > $0.start }
-        guard let first = blocks.first else { return [] }
+        guard let first = blocks.first, let last = blocks.last else { return .empty }
         let floor = max(minSlice, 1)
-        var memo: [ActionablePlanState: ActionablePlanChoice] = [:]
-        var deadEnds: Set<ActionablePlanState> = []
+        let initialCursor = first.start - window + 1
+        let maximumCursor = last.end + window
+        var memo = [ActionablePlanChoice?](
+            repeating: nil, count: maximumCursor - initialCursor + 1)
+        var visited = [Bool](repeating: false, count: memo.count)
+        var statsMemo = [WindowWorkStats?](
+            repeating: nil, count: last.end - initialCursor + 1)
+
+        func stats(at anchor: Int) -> WindowWorkStats {
+            let index = anchor - initialCursor
+            if let cached = statsMemo[index] { return cached }
+            let computed = windowWorkStats(
+                anchor: anchor, window: window, workBlocks: blocks)
+            statsMemo[index] = computed
+            return computed
+        }
 
         func solve(cursor: Int) -> ActionablePlanChoice? {
-            let state = ActionablePlanState(cursor: cursor)
-            if let cached = memo[state] { return cached }
-            if deadEnds.contains(state) { return nil }
+            let index = cursor - initialCursor
+            if visited[index] { return memo[index] }
+            visited[index] = true
             guard let nextWork = nextWorkMinute(atOrAfter: cursor, in: blocks) else {
+                memo[index] = .empty
                 return .empty
             }
 
@@ -341,35 +391,102 @@ public enum ScheduleEngine {
             let lower = max(cursor, nextWork - window + 1)
             var best: ActionablePlanChoice?
             for anchor in lower...nextWork {
-                let stats = windowWorkStats(
-                    anchor: anchor, window: window, workBlocks: blocks)
-                guard stats.longestBlockRun >= floor,
+                let windowStats = stats(at: anchor)
+                guard windowStats.longestBlockRun >= floor,
                       let suffix = solve(cursor: anchor + window)
                 else { continue }
 
-                let total = Int64(stats.total)
                 let candidate = ActionablePlanChoice(
                     anchors: [anchor] + suffix.anchors,
-                    // Total covered work is fixed, so minimising the sum of
-                    // squares is max-min fairness: it balances edge budgets.
-                    balanceCost: total * total + suffix.balanceCost,
-                    centringCost: stats.centringCost + suffix.centringCost)
+                    workMinutes: insertingLeastFirst(
+                        windowStats.total, into: suffix.workMinutes),
+                    centringCost: windowStats.centringCost + suffix.centringCost)
                 if best == nil || isBetterActionablePlan(candidate, than: best!) {
                     best = candidate
                 }
             }
 
             if let best {
-                memo[state] = best
+                memo[index] = best
                 return best
             }
-            deadEnds.insert(state)
             return nil
         }
 
         // `+ 1` is the earliest integer-minute anchor whose half-open window
         // still contains the first painted minute.
-        return solve(cursor: first.start - window + 1)?.anchors.map(Ping.init(atMin:))
+        return solve(cursor: initialCursor)
+    }
+
+    /// Describe an existing plan in the same objective space as the whole-day
+    /// search. A nil result means at least one ping fails the floor, so it cannot
+    /// participate in an equal-actionable-count max-min comparison.
+    private static func actionablePlanChoice(
+        _ pings: [Ping],
+        workBlocks: [Block],
+        window: Int,
+        minSlice: Int)
+        -> ActionablePlanChoice?
+    {
+        let floor = max(minSlice, 1)
+        var workMinutes: [Int] = []
+        var centringCost: Int64 = 0
+        for ping in pings {
+            let stats = windowWorkStats(
+                anchor: ping.atMin, window: window, workBlocks: workBlocks)
+            guard stats.longestBlockRun >= floor else { return nil }
+            workMinutes.append(stats.total)
+            centringCost += stats.centringCost
+        }
+        return ActionablePlanChoice(
+            anchors: pings.map(\.atMin),
+            workMinutes: workMinutes.sorted(),
+            centringCost: centringCost)
+    }
+
+    /// Cheapest exact solution for the common case: translate a fixed number
+    /// of back-to-back windows across the work span and retain the best
+    /// floor-clearing phase. Callers may accept it without the general search
+    /// only when its smallest batch reaches the average, the global max-min
+    /// ceiling.
+    private static func bestConsecutivePhase(
+        count: Int,
+        workBlocks: [Block],
+        window: Int,
+        minSlice: Int)
+        -> ActionablePlanChoice?
+    {
+        let blocks = workBlocks.filter { $0.end > $0.start }
+        guard count > 0, let first = blocks.first, let last = blocks.last else {
+            return count == 0 ? .empty : nil
+        }
+        let lower = last.end - count * window
+        let upper = first.start
+        guard lower <= upper else { return nil }
+
+        var best: ActionablePlanChoice?
+        for firstAnchor in lower...upper {
+            let pings = (0..<count).map {
+                Ping(atMin: firstAnchor + $0 * window)
+            }
+            guard let candidate = actionablePlanChoice(
+                pings,
+                workBlocks: blocks,
+                window: window,
+                minSlice: minSlice)
+            else { continue }
+            if best == nil || isBetterActionablePlan(candidate, than: best!) {
+                best = candidate
+            }
+        }
+        return best
+    }
+
+    private static func insertingLeastFirst(_ value: Int, into sorted: [Int]) -> [Int] {
+        var result = sorted
+        let index = result.firstIndex { $0 >= value } ?? result.endIndex
+        result.insert(value, at: index)
+        return result
     }
 
     private static func nextWorkMinute(atOrAfter minute: Int, in workBlocks: [Block]) -> Int? {
@@ -430,22 +547,62 @@ public enum ScheduleEngine {
         }
     }
 
-    /// Absolute upper bound on floor-sized budgets: physical anchors fit only
-    /// inside the range whose windows touch work, and disjoint windows cannot
-    /// each consume `minSlice` minutes more times than total painted work allows.
+    /// Exact upper bound on floor-sized budgets before requiring full coverage.
+    /// A window has a contiguous `minSlice` overlap with a block precisely when
+    /// its anchor lies in `[block.start + floor - window, block.end - floor]`.
+    /// Greedily packing earliest anchors across the union of those intervals is
+    /// optimal for fixed minimum spacing; ignoring coverage can only overstate
+    /// what the full planner can achieve, which is exactly what this guard needs.
     private static func maximumActionablePingUpperBound(
         _ workBlocks: [Block],
         window: Int,
         minSlice: Int)
         -> Int
     {
-        let blocks = workBlocks.filter { $0.end > $0.start }
-        guard let first = blocks.first, let last = blocks.last else { return 0 }
-        let earliestAnchor = first.start - window + 1
-        let latestAnchor = last.end - 1
-        let geometric = (latestAnchor - earliestAnchor) / window + 1
-        let totalWork = blocks.reduce(0) { $0 + $1.end - $1.start }
-        return min(geometric, totalWork / max(minSlice, 1))
+        let floor = max(minSlice, 1)
+        let intervals = workBlocks.compactMap { block -> ClosedRange<Int>? in
+            guard block.end - block.start >= floor else { return nil }
+            return (block.start + floor - window)...(block.end - floor)
+        }.sorted { $0.lowerBound < $1.lowerBound }
+        guard !intervals.isEmpty else { return 0 }
+
+        var merged: [ClosedRange<Int>] = []
+        for interval in intervals {
+            if let last = merged.last,
+               interval.lowerBound <= last.upperBound + 1
+            {
+                merged[merged.count - 1] = last.lowerBound...max(
+                    last.upperBound, interval.upperBound)
+            } else {
+                merged.append(interval)
+            }
+        }
+
+        var count = 0
+        var nextAnchor = Int.min
+        for interval in merged {
+            var anchor = max(interval.lowerBound, nextAnchor)
+            while anchor <= interval.upperBound {
+                count += 1
+                anchor += window
+                nextAnchor = anchor
+            }
+        }
+        return count
+    }
+
+    private static func isBetterBatchWorkDistribution(
+        _ lhs: ActionablePlanChoice,
+        than rhs: ActionablePlanChoice)
+        -> Bool
+    {
+        guard lhs.workMinutes.count == rhs.workMinutes.count else {
+            return lhs.workMinutes.count > rhs.workMinutes.count
+        }
+        for (left, right) in zip(lhs.workMinutes, rhs.workMinutes) where left != right {
+            return left > right
+        }
+        return false
     }
 
     private static func isBetterActionablePlan(
@@ -456,8 +613,8 @@ public enum ScheduleEngine {
         if lhs.anchors.count != rhs.anchors.count {
             return lhs.anchors.count > rhs.anchors.count
         }
-        if lhs.balanceCost != rhs.balanceCost {
-            return lhs.balanceCost < rhs.balanceCost
+        if lhs.workMinutes != rhs.workMinutes {
+            return isBetterBatchWorkDistribution(lhs, than: rhs)
         }
         if lhs.centringCost != rhs.centringCost {
             return lhs.centringCost < rhs.centringCost

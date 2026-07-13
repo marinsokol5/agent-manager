@@ -170,6 +170,22 @@ final class LaunchAgentPlannerTests: XCTestCase {
         }
     }
 
+    func testDisplayPlanKeepsMaxMinRephaseForSeparatedBlocks() {
+        // Coverage-screen reproduction: Thu 10:00–12:00 + 13:00–16:00 must
+        // project the same balanced two-window phase as ScheduleEngine, not the
+        // old block-local 06:00/11:00 split.
+        var schedule = WorkSchedule()
+        schedule.set(weekday: 3, hours: [10, 11, 13, 14, 15])
+        let weekly = LaunchAgentPlanner.weeklyPings(
+            accountIDs: ["claude"], schedule: schedule)
+        let projected = LaunchAgentPlanner.displayPlan(
+            forWeekday: 3, weekly: weekly, schedule: schedule)
+
+        XCTAssertEqual(
+            projected.accounts.first?.pings.map(\.atMin),
+            [510, 810]) // 08:30, 13:30
+    }
+
     func testDisplayPlanShowsOnlyFirableAnchorsAcrossMidnight() {
         // The daemon fires Mon 19:00 / Tue 00:00 / Tue 05:00 for this shape.
         // The coverage screen must show exactly those, each on the day whose
