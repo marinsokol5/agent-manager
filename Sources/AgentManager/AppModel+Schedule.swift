@@ -229,7 +229,10 @@ extension AppModel {
         Task {
             let message = await Task.detached(priority: .userInitiated) { () -> String in
                 do {
-                    try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: on))
+                    // Load-modify-save so we never clobber the `cloudPrimary` bit.
+                    var config = CloudFallbackConfigStore(workspace: ws).load()
+                    config.enabled = on
+                    try CloudFallbackConfigStore(workspace: ws).save(config)
                 } catch {
                     return "cloud fallback toggle failed: \(error)"
                 }
@@ -239,6 +242,36 @@ extension AppModel {
                 return on
                     ? "Claude Routine fallback on — routines arm on the daemon's next tick"
                     : "Claude Routine fallback off — routines are disabled on the daemon's next tick"
+            }.value
+            statusMessage = message
+            refreshMonitoring()
+        }
+    }
+
+    /// The nested "Routines only" switch under the fallback card. Promotes the
+    /// routine from backstop to the *sole* anchor for Claude accounts. Only
+    /// writes `cloud-fallback.json` (load-modify-save, preserving `enabled`);
+    /// the daemon arms at the exact planned fire and stops spawning local
+    /// Claude pings on its next tick. No-op unless fallback is on.
+    func setCloudPrimaryEnabled(_ on: Bool) {
+        guard on != cloudPrimaryEnabled else { return }
+        cloudPrimaryEnabled = on
+        let ws = workspace
+        Task {
+            let message = await Task.detached(priority: .userInitiated) { () -> String in
+                do {
+                    var config = CloudFallbackConfigStore(workspace: ws).load()
+                    config.cloudPrimary = on
+                    try CloudFallbackConfigStore(workspace: ws).save(config)
+                } catch {
+                    return "cloud-primary toggle failed: \(error)"
+                }
+                AuditLog(workspace: ws).append(
+                    accountID: nil, action: on ? "cloud.primary.enable" : "cloud.primary.disable",
+                    ok: true, detail: "via app toggle")
+                return on
+                    ? "Routines only — Claude anchored from the cloud at each slot; no local pings"
+                    : "Routines only off — routines revert to covering missed pings"
             }.value
             statusMessage = message
             refreshMonitoring()
@@ -287,7 +320,7 @@ extension AppModel {
                        registration: WakeHelperAppService.Registration,
                        schedReg: SchedulerAppService.Registration,
                        wakeProcess: WakeHelperSetup.ProcessState,
-                       cloudEnabled: Bool, cloudState: CloudFallbackState,
+                       cloudEnabled: Bool, cloudPrimary: Bool, cloudState: CloudFallbackState,
                        recent: [ActivityRecord], logs: [MonitoringLogEntry]) in
                 let scheduler = Scheduler(workspace: ws)
                 // Heal a daemon running a binary older than the one launchd
@@ -301,7 +334,7 @@ extension AppModel {
                 let wakeProcess = wakeSetup.processState()
                 let registration = WakeHelperAppService.registration()
                 let schedReg = SchedulerAppService.registration()
-                let cloudEnabled = CloudFallbackConfigStore(workspace: ws).load().enabled
+                let cloudConfig = CloudFallbackConfigStore(workspace: ws).load()
                 let cloudState = CloudFallbackStateStore(workspace: ws).load()
                 // Monitoring shows everything from the last 48 hours (the UI says
                 // so); the limit is only a guard against a pathological file.
@@ -310,7 +343,7 @@ extension AppModel {
                 let audit = AuditLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let network = NetworkLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let logs = MonitoringLogEntry.merge(activity: activity, audit: audit, network: network)
-                return (scheduler.status(), wake, registration, schedReg, wakeProcess, cloudEnabled, cloudState, activity, logs)
+                return (scheduler.status(), wake, registration, schedReg, wakeProcess, cloudConfig.enabled, cloudConfig.cloudPrimary, cloudState, activity, logs)
             }.value
             let wasAwaitingWakeApproval = self.wakeRegistration == .requiresApproval
             let wasAwaitingSchedApproval = self.schedulerRegistration == .requiresApproval
@@ -322,6 +355,7 @@ extension AppModel {
             self.wakeRegistration = result.registration
             self.wakeProcessState = result.wakeProcess
             self.cloudFallbackEnabled = result.cloudEnabled
+            self.cloudPrimaryEnabled = result.cloudPrimary
             self.cloudFallbackState = result.cloudState
             if wasAwaitingWakeApproval && result.registration == .enabled {
                 self.statusMessage = "wake helper approved — active"

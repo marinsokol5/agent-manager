@@ -170,8 +170,11 @@ design follows from them.
 - `wake.json` — the "Wake Mac for pings" opt-in (app toggle / `am wake
   enable`). Read by the root wake helper; flipping it is the helper's entire
   runtime control surface.
-- `cloud-fallback.json` — the experimental cloud-fallback opt-in (Preferences
-  toggle / `am cloud enable`). Read by the scheduler daemon each tick.
+- `cloud-fallback.json` — the experimental cloud-fallback opt-in (`enabled`,
+  Preferences toggle / `am cloud enable`) plus the nested cloud-**primary**
+  opt-in (`cloudPrimary`, the "Routines only" sub-toggle / `am cloud primary
+  enable`; only meaningful when `enabled`). Read by the scheduler daemon each
+  tick.
 - `cloud-fallback-state.json` — which claude.ai anchor routine is armed per
   account and for when. Written **only** by the daemon's `CloudFallbackEngine`
   (single writer); the app/CLI just read it for display.
@@ -404,6 +407,21 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   code (0 anchored / 2 failed / 3 stale-skip — a skip must never read as an
   anchor). Everything is fail-soft: any API error just logs, backs off, and
   leaves local scheduling untouched.
+- **Cloud-primary mode inverts the backstop.** With `cloudPrimary` on (the
+  "Routines only" sub-toggle, only honored while `enabled`), the routine stops
+  being a dead-man's switch and becomes the *sole* anchor for Claude accounts:
+  the daemon arms it at the **exact planned fire** (`cloudLead == 0`, not
+  `+5 min`) and **never spawns a local Claude ping** — for a Mac too unreliable
+  to ping locally (chronic sleep races). Mechanically it's the same code path
+  with `lead = 0`: `reconcilePassedCloudFire` resolves each Claude fire the
+  routine covered (real anchor vs. phantom still decided by usage evidence),
+  and a drain-loop guard skips any Claude entry the routine hasn't confirmed
+  yet — that one window goes **unanchored by design** (logged
+  `skipped: cloud-primary …`) rather than falling back to the flaky local turn.
+  Codex is untouched (no cloud routine → keeps pinging locally). The lead is
+  threaded end to end (`CloudFallbackSyncRequest.leadSeconds` →
+  `CloudFallbackPlanner.plan(lead:)`), so arm target, convergence check, and
+  `armedFor - lead` covered-fire math all stay consistent.
 - **Missing menu-bar item after running a dev *and* a packaged build.** If the
   status item doesn't appear even though the app is running and `menuBarMode`
   isn't `.hidden`, suspect a stale ControlCenter record, not the code. Running a

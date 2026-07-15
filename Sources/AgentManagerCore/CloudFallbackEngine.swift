@@ -10,12 +10,22 @@ public struct CloudFallbackSyncRequest: Sendable, Equatable {
     public var nextFireAt: Date?
     public var lastAnchoredFireAt: Date?
     public var now: Date
+    /// The planner's arm lead for this account: `CloudFallbackPlanner.lead` in
+    /// fallback mode, `0` in cloud-primary mode (arm at the exact planned fire).
+    public var leadSeconds: TimeInterval
 
-    public init(accountID: String, nextFireAt: Date?, lastAnchoredFireAt: Date?, now: Date) {
+    public init(
+        accountID: String,
+        nextFireAt: Date?,
+        lastAnchoredFireAt: Date?,
+        now: Date,
+        leadSeconds: TimeInterval = CloudFallbackPlanner.lead)
+    {
         self.accountID = accountID
         self.nextFireAt = nextFireAt
         self.lastAnchoredFireAt = lastAnchoredFireAt
         self.now = now
+        self.leadSeconds = leadSeconds
     }
 }
 
@@ -162,7 +172,8 @@ public struct CloudFallbackEngine: Sendable {
             state: account,
             nextFireAt: request.nextFireAt,
             lastAnchoredFireAt: request.lastAnchoredFireAt,
-            now: request.now)
+            now: request.now,
+            lead: request.leadSeconds)
         guard action != .none else { return }
 
         let updated = await execute(action, accountID: request.accountID, current: account, now: request.now)

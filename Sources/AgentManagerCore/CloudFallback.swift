@@ -21,10 +21,35 @@ public struct CloudFallbackConfig: Codable, Sendable, Equatable {
 
     public var version: Int
     public var enabled: Bool
+    /// Promote the claude.ai routine from a dead-man's-switch *backstop* to the
+    /// *only* anchor for Claude accounts: the daemon arms it at each planned
+    /// fire (no `+lead`) and never spawns a local Claude ping — the reverse of
+    /// the fallback default, for a Mac that can't be trusted to ping reliably
+    /// (chronic sleep races). Codex accounts are unaffected (they have no cloud
+    /// routine and keep pinging locally). Meaningless unless `enabled` — a
+    /// fallback you don't run can't be the primary. Off by default.
+    public var cloudPrimary: Bool
 
-    public init(version: Int = CloudFallbackConfig.currentVersion, enabled: Bool = false) {
+    public init(
+        version: Int = CloudFallbackConfig.currentVersion,
+        enabled: Bool = false,
+        cloudPrimary: Bool = false)
+    {
         self.version = version
         self.enabled = enabled
+        self.cloudPrimary = cloudPrimary
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, enabled, cloudPrimary }
+
+    /// Forgiving decode so a `cloud-fallback.json` written before `cloudPrimary`
+    /// existed still loads (and keeps `enabled` on) instead of failing the
+    /// whole file and silently reverting to disabled on upgrade.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? CloudFallbackConfig.currentVersion
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        cloudPrimary = try c.decodeIfPresent(Bool.self, forKey: .cloudPrimary) ?? false
     }
 }
 

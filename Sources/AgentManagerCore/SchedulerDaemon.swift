@@ -104,6 +104,12 @@ public actor SchedulerDaemon {
     private var providersByID: [String: Provider] = [:]
     /// The experimental cloud-fallback opt-in (`cloud-fallback.json`).
     private var cloudFallbackEnabled = false
+    /// Cloud-primary mode (`cloudPrimary` in `cloud-fallback.json`, only ever
+    /// true when `cloudFallbackEnabled` is too): the claude.ai routine is the
+    /// *sole* anchor for Claude accounts — armed at the exact planned fire
+    /// (`cloudLead == 0`), and local Claude pings are never spawned. Codex is
+    /// unaffected. Reloaded with the other config stamps.
+    private var cloudPrimaryEnabled = false
     /// Effective local-fire times whose cloud backstops are resolved: a
     /// verified local anchor, a passed one-shot, or an entry already covered
     /// by a known-open window. Persisted because losing this between the local
@@ -278,6 +284,22 @@ public actor SchedulerDaemon {
                 dropped.append(head)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
+            } else if cloudPrimaryEnabled
+                && providersByID[head.accountID]?.supportsCloudAnchorRoutines == true
+            {
+                // Cloud-primary: this account is anchored solely by its
+                // claude.ai routine, never a local ping.
+                // `reconcilePassedCloudFire` already resolved (and logged) any
+                // fire the routine covered, so reaching a *due* entry here means
+                // the routine isn't confirmed for this fire — not yet armed, or
+                // its arm is erroring. We consume the slot without pinging: this
+                // one window goes unanchored by design rather than fall back to
+                // the flaky local turn the mode exists to avoid; the post-drain
+                // sync re-arms the routine forward for the next fire.
+                markHandled(head)
+                logCloudPrimarySkip(head)
+                let checkpoint = adjustedQueue()
+                writeStatus(upcoming: checkpoint.entries, current: nil)
             } else {
                 let fireStarted = now()
                 // Checkpoint the attempt separately from `lastHandled` before
@@ -390,7 +412,8 @@ public actor SchedulerDaemon {
                 accountID: id,
                 nextFireAt: nextFire,
                 lastAnchoredFireAt: lastResolvedFire[id],
-                now: now()))
+                now: now(),
+                leadSeconds: cloudLead))
         }
     }
 
@@ -402,6 +425,17 @@ public actor SchedulerDaemon {
         audit.append(accountID: entry.accountID, action: "ping.skip", ok: true, detail: detail)
         activity.append(ActivityRecord(
             time: now(), accountID: entry.accountID, ok: true, anchored: true, detail: detail))
+    }
+
+    /// Cloud-primary mode consumed a Claude slot without a local ping because
+    /// its routine wasn't confirmed for this fire (not yet armed, or its arm is
+    /// erroring). `anchored: false` — nothing anchored from our side this time;
+    /// once the routine arms, `reconcilePassedCloudFire` covers later fires.
+    private func logCloudPrimarySkip(_ entry: QueueEntry) {
+        let detail = "skipped: cloud-primary — no local ping; routine anchors this account"
+        audit.append(accountID: entry.accountID, action: "ping.skip", ok: true, detail: detail)
+        activity.append(ActivityRecord(
+            time: now(), accountID: entry.accountID, ok: true, anchored: false, detail: detail))
     }
 
     /// The one-shot ran, but runtime evidence proves another window was still
@@ -482,7 +516,19 @@ public actor SchedulerDaemon {
         let knownAccountIDs = Set(providersByID.keys)
         windowStates = windowStates.filter { knownAccountIDs.contains($0.key) }
         lastResolvedFire = lastResolvedFire.filter { knownAccountIDs.contains($0.key) }
-        cloudFallbackEnabled = CloudFallbackConfigStore(workspace: workspace, fileManager: fileManager).load().enabled
+        let cloudConfig = CloudFallbackConfigStore(workspace: workspace, fileManager: fileManager).load()
+        cloudFallbackEnabled = cloudConfig.enabled
+        cloudPrimaryEnabled = cloudConfig.enabled && cloudConfig.cloudPrimary
+    }
+
+    /// The routine arm lead for this daemon's mode: `0` in cloud-primary (arm
+    /// the routine at the exact planned fire, the account's only anchor), the
+    /// planner's `lead` otherwise (armed as a backstop after the local ping).
+    /// Threaded to `syncCloudFallback` and to every place the daemon reasons
+    /// about a routine's covered fire (`armedFor - lead`) so the two stay
+    /// consistent.
+    private var cloudLead: TimeInterval {
+        cloudPrimaryEnabled ? 0 : CloudFallbackPlanner.lead
     }
 
     // MARK: - queue
@@ -611,7 +657,7 @@ public actor SchedulerDaemon {
                   now() >= armedFor
             else { continue }
 
-            let coveredFire = armedFor.addingTimeInterval(-CloudFallbackPlanner.lead)
+            let coveredFire = armedFor.addingTimeInterval(-cloudLead)
             if let resolved = lastResolvedFire[id], resolved >= coveredFire { continue }
 
             let sameInstant: (Date, Date) -> Bool = {
@@ -713,7 +759,7 @@ public actor SchedulerDaemon {
     /// the same already-open window. Otherwise leave it armed: it may still be
     /// the event that anchors after a reset occurring before the +5m mark.
     private func resolveRedundantBackstopIfProven(for entry: QueueEntry) {
-        let backstopAt = entry.fireAt.addingTimeInterval(CloudFallbackPlanner.lead)
+        let backstopAt = entry.fireAt.addingTimeInterval(cloudLead)
         if windowWasAlreadyOpen(entry.accountID, at: backstopAt) {
             markCloudFireResolved(entry.accountID, fireAt: entry.fireAt)
         }

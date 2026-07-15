@@ -71,7 +71,7 @@ build:
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" $(APP_BUNDLE)
 
 run: build
-	pkill -x "$(EXEC_NAME)" 2>/dev/null || true
+	pkill -f "$(notdir $(APP_BUNDLE))/Contents/MacOS/Agent Manager" 2>/dev/null || true
 	sleep 0.2
 	open $(APP_BUNDLE)
 

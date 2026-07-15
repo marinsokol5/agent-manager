@@ -43,6 +43,27 @@ final class CloudFallbackTests: XCTestCase {
         XCTAssertFalse(store.load().enabled) // corrupt → disabled, never throws
     }
 
+    func testConfigRoundTripsCloudPrimary() throws {
+        let ws = makeWorkspace()
+        let store = CloudFallbackConfigStore(workspace: ws)
+        try store.save(CloudFallbackConfig(enabled: true, cloudPrimary: true))
+        let loaded = store.load()
+        XCTAssertTrue(loaded.enabled)
+        XCTAssertTrue(loaded.cloudPrimary)
+    }
+
+    func testConfigDecodesMissingCloudPrimaryToFalseKeepingEnabled() throws {
+        // A `cloud-fallback.json` written before `cloudPrimary` existed must
+        // still load with `enabled` intact — decoding must not fail the whole
+        // file (which would silently revert an upgrading user to disabled).
+        let ws = makeWorkspace()
+        try fm.createDirectory(at: ws.root, withIntermediateDirectories: true)
+        try Data(#"{"version": 1, "enabled": true}"#.utf8).write(to: ws.cloudFallbackConfigFile)
+        let loaded = CloudFallbackConfigStore(workspace: ws).load()
+        XCTAssertTrue(loaded.enabled)
+        XCTAssertFalse(loaded.cloudPrimary)
+    }
+
     func testStateStoreRoundTripsWithWholeSecondDates() throws {
         let ws = makeWorkspace()
         let store = CloudFallbackStateStore(workspace: ws)
@@ -87,6 +108,44 @@ final class CloudFallbackTests: XCTestCase {
         let action = CloudFallbackPlanner.plan(
             state: state, nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
         XCTAssertEqual(action, .none)
+    }
+
+    func testPlannerConvergesDespiteSubSecondFireJitter() {
+        // The re-arm churn bug: a deferred/unverified fire inherits sub-second
+        // jitter from usage `resets_at`, but `armedFor` round-trips through the
+        // state store at whole-second granularity (`.iso8601`). The arm target
+        // is floored to the second so convergence holds instead of re-arming
+        // (re-`PATCH`ing the routine) on every tick.
+        let jittery = date(2026, 7, 6, 5, 0).addingTimeInterval(0.169) // 05:00:00.169
+
+        // First arm: target is floored, so it's a clean whole second.
+        let armed = CloudFallbackPlanner.plan(
+            state: AccountCloudFallbackState(),
+            nextFireAt: jittery, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
+        XCTAssertEqual(armed, .arm(date(2026, 7, 6, 5, 5))) // (05:00:00.169 + 5m) floored → 05:05:00
+
+        // Whole-second `armedFor` (what the store reloads) vs. the still-jittery
+        // fire: must converge, not re-arm.
+        let converged = CloudFallbackPlanner.plan(
+            state: AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 5)),
+            nextFireAt: jittery, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
+        XCTAssertEqual(converged, .none)
+    }
+
+    func testPlannerWithZeroLeadArmsAtTheExactPlannedFire() {
+        // Cloud-primary mode: the routine *is* the anchor, so it arms at the
+        // planned minute itself, not 5 minutes later.
+        let fire = date(2026, 7, 6, 5, 0)
+        let armed = CloudFallbackPlanner.plan(
+            state: AccountCloudFallbackState(),
+            nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0), lead: 0)
+        XCTAssertEqual(armed, .arm(fire))
+
+        // And it converges at that exact time (no perpetual re-arm).
+        let converged = CloudFallbackPlanner.plan(
+            state: AccountCloudFallbackState(triggerID: "t", armedFor: fire),
+            nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0), lead: 0)
+        XCTAssertEqual(converged, .none)
     }
 
     func testPlannerAdvancesAfterAnchoredLocalPing() {

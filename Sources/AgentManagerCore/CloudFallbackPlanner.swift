@@ -26,6 +26,20 @@ public enum CloudFallbackPlanner {
     /// one failed arm per fire is a backstop gap; hammering the API is worse.
     public static let errorBackoff: TimeInterval = 5 * 60
 
+    /// Floor a Date to the whole second — the granularity the routine state
+    /// store persists (`CloudFallbackStateStore` encodes `armedFor` with
+    /// `.iso8601`, which drops sub-second precision). The arm target is passed
+    /// through this before it's compared or armed so that a `desired` recomputed
+    /// from an anchor-derived fire time — usage `resets_at` carries fractional
+    /// seconds, so a deferred/unverified fire does too — stays bit-equal to the
+    /// reloaded `armedFor` instead of drifting by that sub-second remainder and
+    /// re-`PATCH`ing the routine every single tick. Flooring keeps the
+    /// one-shot's minute intact; the <1 s shift is far inside the covered-fire
+    /// matching tolerance and never crosses a window boundary.
+    static func flooredToSecond(_ date: Date) -> Date {
+        Date(timeIntervalSinceReferenceDate: date.timeIntervalSinceReferenceDate.rounded(.down))
+    }
+
     public enum Action: Equatable, Sendable {
         /// Nothing to do (already converged, or holding a pending backstop).
         case none
@@ -47,11 +61,15 @@ public enum CloudFallbackPlanner {
     ///     live window already made unnecessary. The historical parameter name
     ///     remains for source compatibility.
     ///   - now: injected clock.
+    ///   - lead: how far after the local fire to arm the backstop. The
+    ///     `lead` constant (5 min) in fallback mode; `0` in cloud-primary mode,
+    ///     where the routine *is* the anchor and fires at the planned minute.
     public static func plan(
         state: AccountCloudFallbackState,
         nextFireAt: Date?,
         lastAnchoredFireAt: Date?,
-        now: Date)
+        now: Date,
+        lead: TimeInterval = CloudFallbackPlanner.lead)
         -> Action
     {
         // Error backoff: after a failed sync, hold everything briefly. The
@@ -65,7 +83,12 @@ public enum CloudFallbackPlanner {
             return (state.triggerID != nil && !state.disabled) ? .disable : .none
         }
 
-        let desired = nextFireAt.addingTimeInterval(lead)
+        // Whole-second granularity so the compare below and the persisted
+        // `armedFor` agree — see `flooredToSecond`. Without it, a sub-second
+        // `desired` (deferred/unverified fires inherit `resets_at`'s fractional
+        // seconds) never equals the whole-second `armedFor` that round-trips
+        // through the state store, and the routine re-`PATCH`es every tick.
+        let desired = CloudFallbackPlanner.flooredToSecond(nextFireAt.addingTimeInterval(lead))
         guard let armedFor = state.armedFor, !state.disabled, state.triggerID != nil else {
             return .arm(desired) // first arm, re-enable, or recreate
         }

@@ -93,8 +93,9 @@ USAGE:
 // - `am wake install|uninstall|enable|disable|status` — the classic sudo
 //   install path for dev/bare-binary setups; the supported surface is the
 //   app's "Wake Mac for pings" toggle (SMAppService).
-// - `am cloud status|enable|disable` — the experimental cloud fallback; the
-//   supported surface is the Preferences toggle.
+// - `am cloud status|enable|disable|primary` — the experimental cloud fallback
+//   (`primary enable|disable` toggles cloud-primary mode); the supported
+//   surface is the Preferences toggle.
 
 guard let command = arguments.first else {
     print(usage)
@@ -606,25 +607,50 @@ func printSchedulerStatus() {
 /// ("AgentManager Routine") kept armed as a one-shot five minutes after each
 /// scheduled ping, so a Mac that sleeps through a ping (closed lid on battery,
 /// where RTC wakes are firmware-blocked) still gets its window anchored — from
-/// Anthropic's cloud. enable/disable just write `cloud-fallback.json`; the
+/// Anthropic's cloud. `primary enable` flips that around: the routine becomes
+/// the *only* anchor for Claude accounts (armed at each planned slot, no local
+/// Claude pings), for a Mac too unreliable to ping locally; Codex is
+/// unaffected. enable/disable/primary just write `cloud-fallback.json`; the
 /// resident scheduler daemon does all the arming/disabling on its next tick.
 func runCloud(_ args: [String]) {
     switch args.first {
     case "enable", "disable":
         let on = args.first == "enable"
         do {
-            try CloudFallbackConfigStore(workspace: workspace).save(CloudFallbackConfig(enabled: on))
+            // Load-modify-save so we never clobber the `cloudPrimary` bit.
+            var config = CloudFallbackConfigStore(workspace: workspace).load()
+            config.enabled = on
+            try CloudFallbackConfigStore(workspace: workspace).save(config)
         } catch { fail("could not write cloud-fallback.json: \(error)") }
         AuditLog(workspace: workspace).append(
             accountID: nil, action: on ? "cloud.enable" : "cloud.disable", ok: true, detail: "via am cloud")
         print(on
             ? "cloud fallback on — the scheduler daemon arms claude.ai anchor routines on its next tick"
             : "cloud fallback off — armed routines are disabled on the daemon's next tick")
+    case "primary":
+        guard let sub = args.dropFirst().first, sub == "enable" || sub == "disable" else {
+            fail("usage: am cloud primary enable | disable")
+        }
+        let on = sub == "enable"
+        do {
+            var config = CloudFallbackConfigStore(workspace: workspace).load()
+            config.cloudPrimary = on
+            try CloudFallbackConfigStore(workspace: workspace).save(config)
+        } catch { fail("could not write cloud-fallback.json: \(error)") }
+        AuditLog(workspace: workspace).append(
+            accountID: nil, action: on ? "cloud.primary.enable" : "cloud.primary.disable",
+            ok: true, detail: "via am cloud")
+        print(on
+            ? "cloud-primary on — Claude accounts are anchored only by their routine (armed at each planned slot; no local pings). Needs cloud fallback enabled."
+            : "cloud-primary off — routines revert to fallback (armed after each local ping)")
     case "status", nil:
         let config = CloudFallbackConfigStore(workspace: workspace).load()
         let state = CloudFallbackStateStore(workspace: workspace).load()
         let clock = PreferencesStore(workspace: workspace).load().clockStyle
         print("cloud fallback: \(config.enabled ? "enabled" : "disabled")")
+        if config.enabled {
+            print("mode:           \(config.cloudPrimary ? "primary (routines only — no local Claude pings)" : "fallback (routines cover missed pings)")")
+        }
         if state.accounts.isEmpty {
             print("routines:       none tracked yet (the daemon arms them on its next tick after a plan exists)")
         } else {
@@ -640,7 +666,7 @@ func runCloud(_ args: [String]) {
             }
         }
     default:
-        fail("usage: am cloud status | enable | disable")
+        fail("usage: am cloud status | enable | disable | primary enable|disable")
     }
 }
 

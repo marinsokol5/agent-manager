@@ -238,6 +238,11 @@ final class AppModel {
     /// `cloud-fallback.json`), flipped optimistically by
     /// `setCloudFallbackEnabled` and reconciled on refresh.
     var cloudFallbackEnabled = false
+    /// The nested "Routines only" (cloud-primary) opt-in (`cloudPrimary` in
+    /// `cloud-fallback.json`), flipped optimistically by
+    /// `setCloudPrimaryEnabled` and reconciled on refresh. Only meaningful when
+    /// `cloudFallbackEnabled`.
+    var cloudPrimaryEnabled = false
     /// Per-account cloud routine state (`cloud-fallback-state.json`, written by
     /// the daemon's engine) for the Monitoring row and the Preferences caption.
     /// nil = not read yet.

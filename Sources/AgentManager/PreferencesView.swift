@@ -229,48 +229,70 @@ private struct ClaudeRoutineFallbackCard: View {
 
     var body: some View {
         let caption = self.caption
-        return HStack(spacing: 12) {
-            Image(systemName: "cloud.fill")
-                .font(.system(size: 16))
-                .foregroundStyle(model.cloudFallbackEnabled ? Color.white : Color.secondary)
-                .frame(width: 26, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(model.cloudFallbackEnabled ? Theme.accent : Color.primary.opacity(0.07)))
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("Claude Routine fallback")
-                        .font(.system(size: 13.5, weight: .semibold))
-                    Text("CLAUDE")
-                        .font(.system(size: 9, weight: .bold))
-                        .tracking(0.5)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Theme.accent.opacity(0.15)))
-                        .foregroundStyle(Theme.accent)
-                    Text("EXPERIMENTAL")
-                        .font(.system(size: 9, weight: .bold))
-                        .tracking(0.5)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Theme.warning.opacity(0.15)))
-                        .foregroundStyle(Theme.warning)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: "cloud.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(model.cloudFallbackEnabled ? Color.white : Color.secondary)
+                    .frame(width: 26, height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(model.cloudFallbackEnabled ? Theme.accent : Color.primary.opacity(0.07)))
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Claude Routine fallback")
+                            .font(.system(size: 13.5, weight: .semibold))
+                        Text("CLAUDE")
+                            .font(.system(size: 9, weight: .bold))
+                            .tracking(0.5)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Theme.accent.opacity(0.15)))
+                            .foregroundStyle(Theme.accent)
+                        Text("EXPERIMENTAL")
+                            .font(.system(size: 9, weight: .bold))
+                            .tracking(0.5)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Theme.warning.opacity(0.15)))
+                            .foregroundStyle(Theme.warning)
+                    }
+                    Text("Asleep on **battery**: no wake is possible, so your claude.ai account runs the ping in the cloud instead.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(caption.text)
+                        .font(.system(size: 12))
+                        .foregroundStyle(caption.tint)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Asleep on **battery**: no wake is possible, so your claude.ai account runs the ping in the cloud instead.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(caption.text)
-                    .font(.system(size: 12))
-                    .foregroundStyle(caption.tint)
-                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Toggle("Claude Routine fallback", isOn: Binding(
+                    get: { model.cloudFallbackEnabled },
+                    set: { model.setCloudFallbackEnabled($0) }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
             }
-            Spacer(minLength: 8)
-            Toggle("Claude Routine fallback", isOn: Binding(
-                get: { model.cloudFallbackEnabled },
-                set: { model.setCloudFallbackEnabled($0) }))
-                .labelsHidden()
-                .toggleStyle(.switch)
+            if model.cloudFallbackEnabled {
+                Divider().padding(.leading, 38)
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Routines only")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Text("Anchor Claude **entirely from the cloud** at each planned slot — no local pings on this Mac. For a Mac too unreliable to ping. Codex still pings locally.")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Toggle("Routines only", isOn: Binding(
+                        get: { model.cloudPrimaryEnabled },
+                        set: { model.setCloudPrimaryEnabled($0) }))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                .padding(.leading, 38)
+            }
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 11)
@@ -297,6 +319,12 @@ private struct ClaudeRoutineFallbackCard: View {
             return ("Sync problem: \(bad) — see Monitoring.", Theme.warning)
         }
         let armed = entries.values.compactMap(\.armedFor).filter { $0 > Date() }.sorted()
+        if model.cloudPrimaryEnabled {
+            if let next = armed.first {
+                return ("Primary — anchors Claude from the cloud at \(model.clockStyle.dayTimeString(next)); no local pings.", Theme.success)
+            }
+            return ("Primary — anchors each Claude slot from the cloud; no local pings.", Theme.success)
+        }
         if let next = armed.first {
             return ("Active — covers the next ping at \(model.clockStyle.dayTimeString(next.addingTimeInterval(-CloudFallbackPlanner.lead))); runs only if the Mac misses it.", Theme.success)
         }

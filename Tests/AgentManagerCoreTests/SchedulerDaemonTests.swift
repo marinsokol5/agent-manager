@@ -291,6 +291,55 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 6))
     }
 
+    func testCloudPrimarySuppressesLocalClaudePingAndArmsAtExactFire() async throws {
+        // Cloud-primary on, no routine confirmed for this fire yet: the daemon
+        // must NOT spawn a local Claude ping (the mode's whole point), and it
+        // arms the routine at the exact planned fire (lead 0), not +5m.
+        let ws = try seedWorkspace()
+        try CloudFallbackConfigStore(workspace: ws).save(
+            CloudFallbackConfig(enabled: true, cloudPrimary: true))
+
+        let clock = TestClock(date(2026, 7, 6, 5, 0, 30)) // 05:00 slot, due, within grace
+        let recorder = PingRecorder()
+        let syncs = SyncRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
+        _ = await daemon.tick()
+
+        XCTAssertTrue(recorder.requests.isEmpty) // no local Claude ping spawned
+        let records = ActivityLog(workspace: ws).readRecent(limit: 10)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertFalse(records[0].anchored) // nothing anchored from our side
+        XCTAssertTrue(records[0].detail.contains("cloud-primary"), records[0].detail)
+
+        // The post-drain sync arms with lead 0 → the next fire is armed at its
+        // exact planned minute (10:00), not 10:05.
+        XCTAssertEqual(syncs.requests.last?.leadSeconds, 0)
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 0))
+    }
+
+    func testCloudPrimaryLeavesCodexPingingLocally() async throws {
+        // Codex has no cloud routine, so cloud-primary must not touch it — it
+        // keeps firing local pings exactly as before.
+        let ws = Workspace(root: tmp.appendingPathComponent("ws-codex", isDirectory: true))
+        let store = AccountStore(workspace: ws)
+        try store.insert(Account(
+            id: "cx", label: "cx", provider: .codex,
+            home: ws.managedHome(forAccountID: "cx").path, rank: 0, status: .connected))
+        var sched = WorkSchedule()
+        sched.set(weekday: 0, hours: [8, 9, 10, 11])
+        try ScheduleStore(workspace: ws).save(sched)
+        try SchedulerConfigStore(workspace: ws).save(SchedulerConfig(active: true))
+        try CloudFallbackConfigStore(workspace: ws).save(
+            CloudFallbackConfig(enabled: true, cloudPrimary: true))
+
+        let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+        _ = await daemon.tick()
+
+        XCTAssertEqual(recorder.requests, [.init(accountID: "cx", scheduledFor: date(2026, 7, 6, 5, 0))])
+    }
+
     func testCloudUsageResetTightensACloudFireDetectedHoursLate() async throws {
         // The Mac comes back two hours after the 05:05 one-shot. Detection
         // time + window would pretend the window lasts until noon and swallow

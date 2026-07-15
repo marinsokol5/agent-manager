@@ -70,6 +70,12 @@ public enum CodexPingRunner {
             // Pin a cheap model so the ping stays tiny (mirrors Claude's `--model
             // haiku`); the turn only needs to anchor the window, not reason.
             "-m", "gpt-5.4-mini",
+            // Pin the reasoning effort too — the ping only needs to anchor the
+            // window, not reason. Leaving it to the account config lets an
+            // arbitrary `model_reasoning_effort` leak in; a value the pinned
+            // model rejects (e.g. `"max"`) 400s the turn so it never anchors.
+            // Quoted so the override parses as a TOML string (no shell strips it).
+            "-c", "model_reasoning_effort=\"low\"",
             // Suppress the on-startup update banner, which otherwise blocks the
             // launch box we wait for.
             "-c", "check_for_update_on_startup=false",
