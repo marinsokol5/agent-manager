@@ -46,7 +46,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     /// `nil` for Codex accounts (token lives in `auth.json`) and for legacy
     /// Claude accounts that pre-date this field.
     public var keychainService: String?
-    /// Whether this account is pinned to the menu-bar compact display.
+    /// Whether this account shows in the menu-bar compact display. A straight
+    /// per-account visibility toggle: the menu bar surfaces exactly the pinned
+    /// connected accounts. Defaults to `true` (init and decode alike) so new
+    /// accounts — and pre-existing inventories that predate the field — show
+    /// up without any action; unpinning is the opt-out.
     public var pinned: Bool
     /// Whether this account opts out of the planner/scheduler. Excluded
     /// accounts get no scheduled pings, take no lane in the planned week, and
@@ -88,7 +92,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         status: AccountStatus = .disconnected,
         identityEmail: String? = nil,
         keychainService: String? = nil,
-        pinned: Bool = false,
+        pinned: Bool = true,
         excludedFromScheduling: Bool = false,
         usageRefreshSeconds: Int? = nil,
         createdAt: Date = Date(),
@@ -145,7 +149,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         status = try c.decode(AccountStatus.self, forKey: .status)
         identityEmail = try c.decodeIfPresent(String.self, forKey: .identityEmail)
         keychainService = try c.decodeIfPresent(String.self, forKey: .keychainService)
-        pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
+        pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? true
         excludedFromScheduling = try c.decodeIfPresent(Bool.self, forKey: .excludedFromScheduling) ?? false
         usageRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .usageRefreshSeconds)
         createdAt = try c.decode(Date.self, forKey: .createdAt)

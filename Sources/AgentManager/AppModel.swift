@@ -316,15 +316,14 @@ final class AppModel {
         refreshMonitoring()
     }
 
-    var pinnedAccounts: [Account] { accounts.filter { $0.pinned } }
-
-    /// The accounts the menu bar surfaces, in priority order. Usage only makes
-    /// sense for connected agents; if any are pinned we honor that as a filter,
-    /// otherwise every connected agent shows (so it works out of the box).
+    /// The accounts the menu bar surfaces, in priority order: exactly the
+    /// pinned connected agents. Pinning is a per-account visibility toggle
+    /// (default on — see `Account.pinned`), so unpinning hides that one
+    /// account and nothing else; usage only makes sense for connected agents,
+    /// hence the status filter. An all-unpinned list is fine: the dropdown
+    /// shows its empty state and individual mode keeps one generic item.
     var menuBarAccounts: [Account] {
-        let connected = accounts.filter { $0.status == .connected }
-        let pinned = connected.filter { $0.pinned }
-        return pinned.isEmpty ? connected : pinned
+        accounts.filter { $0.status == .connected && $0.pinned }
     }
 
     /// The agent to run *right now* — see `AgentRecommender` in Core for the rule
