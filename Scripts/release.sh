@@ -87,4 +87,25 @@ TAP_CLONE="$(brew --repository)/Library/Taps/marinsokol5/homebrew-tap"
 [[ -d "$TAP_CLONE" ]] && git -C "$TAP_CLONE" pull --ff-only >/dev/null 2>&1 || true
 brew audit --cask --online marinsokol5/tap/agent-manager || true
 
-echo "==> $TAG published. Upgrade with: brew upgrade --cask agent-manager"
+# 6. Upgrade the local install to the version we just shipped. Best-effort:
+#    the release is already out, so a machine without the brew copy installed
+#    must not turn the whole publish into a failure.
+brew upgrade --yes --cask marinsokol5/tap/agent-manager \
+    || echo "!! local brew upgrade failed — run manually: brew upgrade --cask agent-manager"
+
+# 7. Restart the running app so the upgraded bundle takes over (the cask swap
+#    leaves the old build running from a deleted bundle). Anchor the match to
+#    the GUI executable only — the bundled `am` scheduler daemon and any
+#    in-flight ping child live under the same bundle path but restart
+#    themselves on upgrade (see AGENTS.md); never kill those.
+APP_EXEC="/Applications/AgentManager.app/Contents/MacOS/Agent Manager"
+if pkill -f "^$APP_EXEC" 2>/dev/null; then
+    sleep 0.5
+    open "/Applications/AgentManager.app" \
+        || echo "!! relaunch failed — open Agent Manager manually"
+    echo "==> restarted Agent Manager on the new build"
+else
+    echo "==> Agent Manager wasn't running — not relaunched"
+fi
+
+echo "==> $TAG published."

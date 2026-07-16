@@ -202,6 +202,13 @@ struct AccountRowView: View {
                 .help(account.pinned
                     ? "Hide this account from the menu-bar compact display"
                     : "Show this account in the menu-bar compact display")
+                Button { model.toggleExcludedFromScheduling(account) } label: {
+                    Label(account.excludedFromScheduling ? "Include in scheduler" : "Exclude from scheduler",
+                          systemImage: account.excludedFromScheduling ? "calendar.badge.plus" : "calendar.badge.minus")
+                }
+                .help(account.excludedFromScheduling
+                    ? "Give this agent scheduled pings and a lane in the planned week again"
+                    : "Skip this agent in the scheduler/planner; manual runs and pings still work")
                 Button { model.verify(account) } label: {
                     Label("Verify identity", systemImage: "checkmark.shield")
                 }

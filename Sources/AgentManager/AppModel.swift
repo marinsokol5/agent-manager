@@ -488,12 +488,10 @@ final class AppModel {
         reload()
     }
 
-    func updateAccount(_ account: Account, label: String, color: String, pinned: Bool, excludedFromScheduling: Bool, usageRefreshSeconds: Int?) {
+    func updateAccount(_ account: Account, label: String, color: String, usageRefreshSeconds: Int?) {
         guard var current = accounts.first(where: { $0.id == account.id }) else { return }
         current.label = label.isEmpty ? current.label : label
         current.color = color
-        current.pinned = pinned
-        current.excludedFromScheduling = excludedFromScheduling
         current.usageRefreshSeconds = usageRefreshSeconds
         try? store.upsert(current)
         statusMessage = "updated \(current.label)"
@@ -504,6 +502,16 @@ final class AppModel {
         guard var current = accounts.first(where: { $0.id == account.id }) else { return }
         current.pinned.toggle()
         try? store.upsert(current)
+        reload()
+    }
+
+    func toggleExcludedFromScheduling(_ account: Account) {
+        guard var current = accounts.first(where: { $0.id == account.id }) else { return }
+        current.excludedFromScheduling.toggle()
+        try? store.upsert(current)
+        statusMessage = current.excludedFromScheduling
+            ? "\(current.label) excluded from scheduling"
+            : "\(current.label) included in scheduling"
         reload()
     }
 

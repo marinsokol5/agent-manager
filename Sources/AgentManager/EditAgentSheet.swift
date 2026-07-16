@@ -9,8 +9,6 @@ struct EditAgentSheet: View {
 
     @State private var label: String
     @State private var colorHex: String
-    @State private var pinned: Bool
-    @State private var excludedFromScheduling: Bool
     /// `-1` = use app default (1 min); `0` = manual only; else interval seconds.
     @State private var refreshSeconds: Int
 
@@ -19,8 +17,6 @@ struct EditAgentSheet: View {
         self.account = account
         _label = State(initialValue: account.label)
         _colorHex = State(initialValue: account.color)
-        _pinned = State(initialValue: account.pinned)
-        _excludedFromScheduling = State(initialValue: account.excludedFromScheduling)
         _refreshSeconds = State(initialValue: account.usageRefreshSeconds ?? -1)
     }
 
@@ -36,15 +32,6 @@ struct EditAgentSheet: View {
                     Text(account.id).font(.system(.body, design: .monospaced)).foregroundStyle(.secondary)
                 }
                 row("Color") { ColorField(hex: $colorHex) }
-                row("Menu bar") {
-                    Toggle("Pin to menu bar", isOn: $pinned)
-                        .toggleStyle(.checkbox)
-                }
-                row("Scheduler") {
-                    Toggle("Exclude from scheduled pings", isOn: $excludedFromScheduling)
-                        .toggleStyle(.checkbox)
-                        .help("The scheduler and planner skip this agent entirely; manual runs and pings still work.")
-                }
                 row("Usage refresh") {
                     Picker("Usage refresh", selection: $refreshSeconds) {
                         Text("Default (1 min)").tag(-1)
@@ -69,8 +56,6 @@ struct EditAgentSheet: View {
                         account,
                         label: label.trimmingCharacters(in: .whitespaces),
                         color: colorHex,
-                        pinned: pinned,
-                        excludedFromScheduling: excludedFromScheduling,
                         usageRefreshSeconds: refreshSeconds == -1 ? nil : refreshSeconds)
                     dismiss()
                 }
