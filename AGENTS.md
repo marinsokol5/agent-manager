@@ -172,7 +172,7 @@ design follows from them.
   runtime control surface.
 - `cloud-fallback.json` — the experimental cloud-fallback opt-in (`enabled`,
   Preferences toggle / `am cloud enable`) plus the nested cloud-**primary**
-  opt-in (`cloudPrimary`, the "Routines only" sub-toggle / `am cloud primary
+  opt-in (`cloudPrimary`, the "Fallback / Routines only" mode selector / `am cloud primary
   enable`; only meaningful when `enabled`). Read by the scheduler daemon each
   tick.
 - `cloud-fallback-state.json` — which claude.ai anchor routine is armed per
@@ -419,7 +419,7 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   anchor). Everything is fail-soft: any API error just logs, backs off, and
   leaves local scheduling untouched.
 - **Cloud-primary mode inverts the backstop.** With `cloudPrimary` on (the
-  "Routines only" sub-toggle, only honored while `enabled`), the routine stops
+  "Routines only" mode, only honored while `enabled`), the routine stops
   being a dead-man's switch and becomes the *sole* anchor for Claude accounts:
   the daemon arms it at the **exact planned fire** (`cloudLead == 0`, not
   `+5 min`) and **never spawns a local Claude ping** — for a Mac too unreliable

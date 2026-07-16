@@ -258,12 +258,12 @@ final class AppModel {
     /// The self-heal is attempted at most once per app run: if re-registering
     /// doesn't fix the spawn failure, retrying in a loop won't either.
     var wakeHealAttempted = false
-    /// The experimental "Cloud fallback" opt-in switch (mirrors
+    /// The experimental Claude cloud-routine opt-in switch (mirrors
     /// `cloud-fallback.json`), flipped optimistically by
     /// `setCloudFallbackEnabled` and reconciled on refresh.
     var cloudFallbackEnabled = false
-    /// The nested "Routines only" (cloud-primary) opt-in (`cloudPrimary` in
-    /// `cloud-fallback.json`), flipped optimistically by
+    /// The Fallback / Routines only (cloud-primary) mode (`cloudPrimary` in
+    /// `cloud-fallback.json`), changed optimistically by
     /// `setCloudPrimaryEnabled` and reconciled on refresh. Only meaningful when
     /// `cloudFallbackEnabled`.
     var cloudPrimaryEnabled = false

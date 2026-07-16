@@ -75,17 +75,17 @@ struct PreferencesView: View {
     private var wakeSection: some View {
         section(
             title: "Scheduled pings",
-            subtitle: "Safety nets for pings that land while the Mac is asleep — which one applies depends on whether it's plugged in.")
+            subtitle: "Wake this Mac for local pings, or configure a Claude cloud routine for scheduled Claude windows.")
         {
             WakeToggleCard(model: model)
-            ClaudeRoutineFallbackCard(model: model)
+            ClaudeCloudRoutineCard(model: model)
         }
     }
 
     private var pingMethodSection: some View {
         section(
-            title: "Ping method",
-            subtitle: "Choose separately per provider. Scheduled pings verify the real window before treating any method as an anchor.")
+            title: "Local ping method",
+            subtitle: "Used by Test ping and scheduled pings that run on this Mac. Choose separately per provider; scheduled runs still verify anchoring.")
         {
             Picker("Provider", selection: $pingMethodProvider) {
                 Text("Claude").tag(Provider.claude)
@@ -93,6 +93,8 @@ struct PreferencesView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
+            .frame(width: 220, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             pingMethodGroup(
                 provider: pingMethodProvider,
@@ -304,12 +306,13 @@ private struct WakeToggleCard: View {
     }
 }
 
-/// The experimental "Claude Routine fallback" switch, styled like
-/// `WakeToggleCard` and living right under it — the two cards split the
-/// sleeping-Mac problem by power source (charging → wake helper; battery →
-/// this). The second caption line is live state: what's armed (from
-/// `cloud-fallback-state.json`), the last sync error, or why nothing will arm.
-private struct ClaudeRoutineFallbackCard: View {
+/// The experimental Claude cloud-routine switch, styled like `WakeToggleCard`
+/// and kept with the other scheduled-ping controls. Its mode selector makes
+/// the scheduling boundary explicit: fallback supplements local scheduled
+/// turns, while Routines only replaces those turns without changing Test ping.
+/// The caption reports what's armed (from `cloud-fallback-state.json`), the
+/// last sync error, or why nothing will arm.
+private struct ClaudeCloudRoutineCard: View {
     @Bindable var model: AppModel
 
     var body: some View {
@@ -325,7 +328,7 @@ private struct ClaudeRoutineFallbackCard: View {
                             .fill(model.cloudFallbackEnabled ? Theme.accent : Color.primary.opacity(0.07)))
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Claude Routine fallback")
+                        Text("Claude cloud routine")
                             .font(.system(size: 13.5, weight: .semibold))
                         Text("CLAUDE")
                             .font(.system(size: 9, weight: .bold))
@@ -342,7 +345,7 @@ private struct ClaudeRoutineFallbackCard: View {
                             .background(Capsule().fill(Theme.warning.opacity(0.15)))
                             .foregroundStyle(Theme.warning)
                     }
-                    Text("Asleep on **battery**, fallback to Anthropic compute. Keeps a claude.ai routine scheduled 5 minutes after the next scheduled ping for when we can't wake up Mac.")
+                    Text("Adds a one-shot claude.ai routine to scheduled Claude slots. Use it as a fallback for missed local pings, or let routines handle scheduled pings entirely.")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -352,7 +355,7 @@ private struct ClaudeRoutineFallbackCard: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
-                Toggle("Claude Routine fallback", isOn: Binding(
+                Toggle("Claude cloud routine", isOn: Binding(
                     get: { model.cloudFallbackEnabled },
                     set: { model.setCloudFallbackEnabled($0) }))
                     .labelsHidden()
@@ -360,21 +363,22 @@ private struct ClaudeRoutineFallbackCard: View {
             }
             if model.cloudFallbackEnabled {
                 Divider().padding(.leading, 38)
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Routines only")
-                            .font(.system(size: 12.5, weight: .semibold))
-                        Text("For Claude agents, the claude.ai routine becomes the **only** token window scheduler, no local ping attempts.")
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 8)
-                    Toggle("Routines only", isOn: Binding(
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Scheduled Claude mode")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Picker("Scheduled Claude mode", selection: Binding(
                         get: { model.cloudPrimaryEnabled },
-                        set: { model.setCloudPrimaryEnabled($0) }))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                        set: { model.setCloudPrimaryEnabled($0) })) {
+                        Text("Fallback").tag(false)
+                        Text("Routines only").tag(true)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 260, alignment: .leading)
+                    Text(modeDescription)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.leading, 38)
             }
@@ -391,7 +395,7 @@ private struct ClaudeRoutineFallbackCard: View {
 
     private var caption: (text: String, tint: Color) {
         guard model.cloudFallbackEnabled else {
-            return ("Off — pings missed on battery stay skipped.", Color.secondary)
+            return ("Off — scheduled Claude pings use the local method only.", Color.secondary)
         }
         guard model.accounts.contains(where: { $0.provider.supportsCloudAnchorRoutines && $0.status == .connected }) else {
             return ("No connected Claude account — nothing to cover.", Theme.warning)
@@ -406,14 +410,21 @@ private struct ClaudeRoutineFallbackCard: View {
         let armed = entries.values.compactMap(\.armedFor).filter { $0 > Date() }.sorted()
         if model.cloudPrimaryEnabled {
             if let next = armed.first {
-                return ("Primary — anchors Claude from the cloud at \(model.clockStyle.dayTimeString(next)); no local pings.", Theme.success)
+                return ("Routines only — cloud handles the next scheduled Claude slot at \(model.clockStyle.dayTimeString(next)); Test ping stays local.", Theme.success)
             }
-            return ("Primary — anchors each Claude slot from the cloud; no local pings.", Theme.success)
+            return ("Routines only — cloud handles scheduled Claude slots; Test ping stays local.", Theme.success)
         }
         if let next = armed.first {
-            return ("Active — covers the next ping at \(model.clockStyle.dayTimeString(next.addingTimeInterval(-CloudFallbackPlanner.lead))); runs only if the Mac misses it.", Theme.success)
+            return ("Fallback — covers the local ping at \(model.clockStyle.dayTimeString(next.addingTimeInterval(-CloudFallbackPlanner.lead))); runs only if the Mac misses it.", Theme.success)
         }
-        return ("Active — arms before each scheduled Claude ping.", Theme.success)
+        return ("Fallback — targets five minutes after each scheduled local Claude ping.", Theme.success)
+    }
+
+    private var modeDescription: String {
+        if model.cloudPrimaryEnabled {
+            return "Cloud handles scheduled Claude slots instead of local pings. Test ping still uses the selected local method."
+        }
+        return "Scheduled Claude pings use the selected local method. The cloud routine runs only when the Mac misses one."
     }
 }
 

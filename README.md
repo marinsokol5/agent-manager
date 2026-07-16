@@ -72,7 +72,7 @@ the clock the moment you sit down.
 ![Planner screen: working hours painted on a weekly grid, the ping schedule, and the daily token-window timeline](screenshots/planner.png)
 
 Controlled terminal is the default and only verified-anchoring method. For
-provider A/B testing, **Preferences → Ping method** can instead use `claude -p` /
+provider A/B testing, **Preferences → Local ping method** can instead use `claude -p` /
 `codex exec` or the official SDKs, separately for Claude and Codex. Scheduled
 pings verify the post-turn usage window regardless of method, so a programmatic
 turn that burns tokens without opening the 5-hour window is never reported as an
@@ -82,10 +82,14 @@ anchor. SDK dependencies are user-installed; Agent Manager never installs them.
 seconds before each ping, the ping runs, and the Mac goes back to sleep if
 nobody's around.
 
-**Lid closed *on battery*?** That's the one case no software can wake on Mac, so for Claude Code accounts we use Anthropic's cloud compute for routines to start the token window. Just flip the **Claude Routine fallback** toggle in Preferences. It keeps a tiny one-shot routine — "AgentManager Routine",
-visible at claude.ai/code/routines — armed 5 minutes after each scheduled ping.
-A ping that runs locally disarms the pending routine, so it never fires; but a ping
-the sleeping Mac misses lets Anthropic's cloud run it instead.
+**Lid closed *on battery*?** That's the one case no software can wake on Mac, so
+Claude Code accounts can use Anthropic's cloud compute to start the token window.
+Turn on **Claude cloud routine** in Preferences and choose **Fallback** to keep a
+tiny one-shot routine — "AgentManager Routine", visible at
+claude.ai/code/routines — armed 5 minutes after each scheduled local ping. A
+local ping moves it forward before it fires; a ping the sleeping Mac misses lets
+Anthropic's cloud run it instead. **Routines only** makes the cloud routine handle
+scheduled Claude slots entirely; Test ping still uses the selected local method.
 
 ## CLI reference
 
@@ -110,7 +114,7 @@ Everything else is doable only in the app, the CLI handles only running-related 
   or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
   (`api.anthropic.com`, `chatgpt.com`): the usage reads the real CLI already
-  makes, plus — only if you turn the experimental Claude Routine fallback on — managing
+  makes, plus — only if you turn the experimental Claude cloud routine on — managing
   the anchor routine in your own claude.ai account. No backend, no analytics.
 - **One quiet background agent.** Scheduled pings come from a single resident
   launchd agent with an in-process queue — flipping the scheduler on and off

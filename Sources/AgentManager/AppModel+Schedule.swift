@@ -246,7 +246,7 @@ extension AppModel {
         }
     }
 
-    /// The experimental "Cloud fallback" switch. Only writes
+    /// The experimental Claude cloud-routine switch. Only writes
     /// `cloud-fallback.json` — the resident daemon does everything else on its
     /// next tick: arming one claude.ai routine per Claude account (on), or
     /// disabling them (off). No launchd, no prompt, nothing to install; the
@@ -269,16 +269,16 @@ extension AppModel {
                     accountID: nil, action: on ? "cloud.enable" : "cloud.disable",
                     ok: true, detail: "via app toggle")
                 return on
-                    ? "Claude Routine fallback on — routines arm on the daemon's next tick"
-                    : "Claude Routine fallback off — routines are disabled on the daemon's next tick"
+                    ? "Claude cloud routine on — routines arm on the daemon's next tick"
+                    : "Claude cloud routine off — routines are disabled on the daemon's next tick"
             }.value
             statusMessage = message
             refreshMonitoring()
         }
     }
 
-    /// The nested "Routines only" switch under the fallback card. Promotes the
-    /// routine from backstop to the *sole* anchor for Claude accounts. Only
+    /// The Fallback / Routines only mode selector. Routines only promotes the
+    /// routine from backstop to the *sole* anchor for scheduled Claude slots. Only
     /// writes `cloud-fallback.json` (load-modify-save, preserving `enabled`);
     /// the daemon arms at the exact planned fire and stops spawning local
     /// Claude pings on its next tick. No-op unless fallback is on.
@@ -299,8 +299,8 @@ extension AppModel {
                     accountID: nil, action: on ? "cloud.primary.enable" : "cloud.primary.disable",
                     ok: true, detail: "via app toggle")
                 return on
-                    ? "Routines only — Claude anchored from the cloud at each slot; no local pings"
-                    : "Routines only off — routines revert to covering missed pings"
+                    ? "Routines only — cloud handles scheduled Claude slots; Test ping still uses the local method"
+                    : "Fallback mode — cloud routine covers missed local Claude pings"
             }.value
             statusMessage = message
             refreshMonitoring()
