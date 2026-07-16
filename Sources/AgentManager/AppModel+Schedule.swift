@@ -39,7 +39,33 @@ extension AppModel {
         schedule = (try? scheduleStore.load()) ?? WorkSchedule()
     }
 
+    /// How long the calendar must sit untouched before an edit lands in
+    /// `schedule.json`. The daemon re-arms each account's cloud routine within
+    /// a tick of the file changing, so writing mid-editing-burst turns every
+    /// repaint into a routines-API PATCH; batching until the user has clearly
+    /// stopped keeps that churn to one write per editing session.
+    static let scheduleSaveDebounceInterval: TimeInterval = 30
+
+    /// Persist the in-memory schedule, debounced: (re)starts a quiet-period
+    /// timer, and the write happens only once `scheduleSaveDebounceInterval`
+    /// passes with no further edits. Every schedule mutation funnels through
+    /// here. The pending write is flushed early when something is about to
+    /// *read* `schedule.json` (`setSchedulerActive`) and on app quit.
     func saveSchedule() {
+        scheduleSaveDebounce?.cancel()
+        scheduleSaveDebounce = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(AppModel.scheduleSaveDebounceInterval))
+            guard !Task.isCancelled else { return }
+            self?.scheduleSaveDebounce = nil
+            self?.persistScheduleNow()
+        }
+    }
+
+    /// Write `schedule.json` now, cancelling any pending debounced save.
+    /// Harmless when nothing is pending (the store's write is idempotent).
+    func persistScheduleNow() {
+        scheduleSaveDebounce?.cancel()
+        scheduleSaveDebounce = nil
         try? scheduleStore.save(schedule)
     }
 
@@ -134,6 +160,9 @@ extension AppModel {
     /// off if activation found no connected accounts or failed).
     func setSchedulerActive(_ on: Bool) {
         guard !scheduleBusy, on != schedulerActive else { return }
+        // Activation replans off `schedule.json` — a debounced paint still in
+        // memory must land first or the daemon starts on the stale calendar.
+        persistScheduleNow()
         scheduleBusy = true
         schedulerActive = on
         statusMessage = on ? "starting scheduler…" : "stopping scheduler…"

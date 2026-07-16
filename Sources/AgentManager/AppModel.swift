@@ -182,6 +182,9 @@ final class AppModel {
     // MARK: - Journey 4 (schedule) state
     /// The painted weekly work-hour selection (mirrors `schedule.json`).
     var schedule = WorkSchedule()
+    /// The pending debounced `schedule.json` write, if any — see `saveSchedule()`.
+    /// Non-nil exactly while in-memory `schedule` is ahead of disk.
+    @ObservationIgnored var scheduleSaveDebounce: Task<Void, Never>?
     /// Memo for `plan(forWeekday:)`: the compiled continuous weekly plan for
     /// the given inputs. Compiling the week is the expensive step (it can run
     /// the whole-day search); projecting a weekday out of it is cheap, and the
@@ -599,6 +602,14 @@ final class AppModel {
                 if let at = self.monitoringRefreshedAt, Date().timeIntervalSince(at) < 5 { return }
                 self.refreshMonitoring()
             }
+        })
+        // Quitting inside the schedule-save debounce window must not drop the
+        // edit. Synchronous on purpose: a `Task` hopped onto the main actor
+        // would race process exit — willTerminate is the last main-thread call
+        // we're guaranteed.
+        presenceObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.persistScheduleNow() }
         })
     }
 
