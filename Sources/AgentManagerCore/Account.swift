@@ -48,6 +48,12 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var keychainService: String?
     /// Whether this account is pinned to the menu-bar compact display.
     public var pinned: Bool
+    /// Whether this account opts out of the planner/scheduler. Excluded
+    /// accounts get no scheduled pings, take no lane in the planned week, and
+    /// have any armed cloud routine disabled on the daemon's next sync — but
+    /// stay fully usable for manual runs, pings, and usage display. Distinct
+    /// from `status`: exclusion is a user choice, not a connection state.
+    public var excludedFromScheduling: Bool
     /// How often (seconds) the menu bar auto-refreshes this account's usage.
     /// `nil` → the app default (`defaultUsageRefreshSeconds`, 5 min); `0` →
     /// manual only (no auto-refresh); any positive value → that interval.
@@ -83,6 +89,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         identityEmail: String? = nil,
         keychainService: String? = nil,
         pinned: Bool = false,
+        excludedFromScheduling: Bool = false,
         usageRefreshSeconds: Int? = nil,
         createdAt: Date = Date(),
         lastVerifiedAt: Date? = nil)
@@ -99,6 +106,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.identityEmail = identityEmail
         self.keychainService = keychainService
         self.pinned = pinned
+        self.excludedFromScheduling = excludedFromScheduling
         self.usageRefreshSeconds = usageRefreshSeconds
         self.createdAt = createdAt
         self.lastVerifiedAt = lastVerifiedAt
@@ -138,6 +146,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         identityEmail = try c.decodeIfPresent(String.self, forKey: .identityEmail)
         keychainService = try c.decodeIfPresent(String.self, forKey: .keychainService)
         pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
+        excludedFromScheduling = try c.decodeIfPresent(Bool.self, forKey: .excludedFromScheduling) ?? false
         usageRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .usageRefreshSeconds)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         lastVerifiedAt = try c.decodeIfPresent(Date.self, forKey: .lastVerifiedAt)

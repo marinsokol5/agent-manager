@@ -44,6 +44,9 @@ final class SchedulerTests: XCTestCase {
         }
         // A disconnected account that must be excluded from scheduling.
         try store.insert(Account(id: "ghost", label: "ghost", provider: .claude, home: ws.managedHome(forAccountID: "ghost").path, status: .disconnected))
+        // A connected account the user opted out of scheduling — equally
+        // invisible to the planner (and to activate's no-accounts check).
+        try store.insert(Account(id: "opt-out", label: "opt-out", provider: .claude, home: ws.managedHome(forAccountID: "opt-out").path, status: .connected, excludedFromScheduling: true))
         try ScheduleStore(workspace: ws).save(schedule)
         return ws
     }
@@ -116,7 +119,7 @@ final class SchedulerTests: XCTestCase {
         let fake = FakeLaunchctl()
 
         let report = try makeScheduler(ws, fake).activate()
-        XCTAssertEqual(report.accountIDs, ["a1", "a2"]) // ghost excluded
+        XCTAssertEqual(report.accountIDs, ["a1", "a2"]) // ghost + opt-out excluded
         XCTAssertTrue(report.agentUpdated)  // first install writes the plist
         XCTAssertTrue(report.agentLoaded)
         XCTAssertTrue(report.accounts.allSatisfy { $0.pingsPerWeek == 2 }) // 2 pings Mon each
@@ -194,7 +197,9 @@ final class SchedulerTests: XCTestCase {
         XCTAssertFalse(try makeScheduler(ws, fake).deactivate().wasActive)
     }
 
-    func testActivateWithNoConnectedAccountsStaysInactiveWithoutInstalling() throws {
+    /// Neither the disconnected ghost nor the connected-but-excluded opt-out
+    /// counts as schedulable — with no other accounts, activation is a no-op.
+    func testActivateWithNoSchedulableAccountsStaysInactiveWithoutInstalling() throws {
         let ws = try seed(connected: [], schedule: monSchedule())
         let fake = FakeLaunchctl()
 

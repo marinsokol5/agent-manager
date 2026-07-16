@@ -507,7 +507,11 @@ public actor SchedulerDaemon {
         // heartbeat keeps reporting so the UI can show something is wrong.
         schedule = (try? ScheduleStore(workspace: workspace, fileManager: fileManager).load()) ?? WorkSchedule()
         let accounts = (try? AccountStore(workspace: workspace, fileManager: fileManager).load()) ?? []
-        accountIDs = accounts.filter { $0.status == .connected }.inPriorityOrder().map(\.id)
+        // Same eligibility rule as `Scheduler.schedulableAccounts`: connected
+        // and not user-excluded. `providersByID` below stays unfiltered on
+        // purpose — dropping out of `accountIDs` is what lets `syncCloudFallback`
+        // disarm a newly excluded/disconnected account's cloud routine.
+        accountIDs = accounts.filter { $0.status == .connected && !$0.excludedFromScheduling }.inPriorityOrder().map(\.id)
         weeklyEntries = active
             ? LaunchAgentPlanner.entriesByAccount(
                 accountIDs: accountIDs, schedule: schedule)

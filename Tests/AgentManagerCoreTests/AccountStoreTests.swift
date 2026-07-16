@@ -62,6 +62,28 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(back, original)
     }
 
+    func testExcludedFromSchedulingRoundTripsThroughJSON() throws {
+        let s = store()
+        var a = makeAccount("work", status: .connected)
+        a.excludedFromScheduling = true
+        try s.insert(a)
+        XCTAssertEqual(try store().find("work")?.excludedFromScheduling, true)
+    }
+
+    func testExcludedFromSchedulingDefaultsFalseOnLegacyJSON() throws {
+        // accounts.json written before the field existed must decode with the
+        // account still included in scheduling — exclusion is an explicit opt-out.
+        let legacy = """
+        {"version": 1, "accounts": [{
+            "id": "legacy", "label": "Legacy", "color": "#7C7CFF",
+            "provider": "claude", "home": "/tmp/legacy", "status": "connected",
+            "createdAt": "2023-11-14T22:13:20Z"
+        }]}
+        """
+        try Data(legacy.utf8).write(to: file)
+        XCTAssertEqual(try store().find("legacy")?.excludedFromScheduling, false)
+    }
+
     func testSourceHomeRoundTripsThroughJSON() throws {
         let s = store()
         var a = makeAccount("work", status: .connected)

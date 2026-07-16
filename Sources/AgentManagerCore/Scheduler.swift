@@ -47,12 +47,12 @@ public struct Scheduler {
     var configStore: SchedulerConfigStore { SchedulerConfigStore(workspace: workspace, fileManager: fileManager) }
 
     /// Accounts eligible for scheduling: **connected** only (a queue entry that
-    /// can't ping is just a daily failure), in canonical priority order. The
-    /// order *is* the stagger phase order, and it matches what the app + CLI
-    /// display.
+    /// can't ping is just a daily failure) and not user-excluded
+    /// (`excludedFromScheduling`), in canonical priority order. The order *is*
+    /// the stagger phase order, and it matches what the app + CLI display.
     public func schedulableAccounts() throws -> [Account] {
         try store.load()
-            .filter { $0.status == .connected }
+            .filter { $0.status == .connected && !$0.excludedFromScheduling }
             .inPriorityOrder()
     }
 

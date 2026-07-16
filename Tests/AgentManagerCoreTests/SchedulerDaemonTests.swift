@@ -148,6 +148,31 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 13, 5, 0))
     }
 
+    /// A connected account marked `excludedFromScheduling` never enters the
+    /// daemon's queue: the week is planned as if it didn't exist, so the
+    /// remaining account keeps the single-account plan (05:00/10:00) and no
+    /// ping is ever requested for the excluded one.
+    func testExcludedAccountIsNeverQueuedOrPinged() async throws {
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        let store = AccountStore(workspace: ws)
+        var a2 = try XCTUnwrap(store.find("a2"))
+        a2.excludedFromScheduling = true
+        try store.upsert(a2)
+
+        let clock = TestClock(date(2026, 7, 6, 4, 50))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+        _ = await daemon.tick()
+
+        clock.now = date(2026, 7, 6, 5, 0, 30)
+        _ = await daemon.tick()
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 0))])
+
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertTrue(status?.upcoming.allSatisfy { $0.accountID == "a1" } ?? false,
+                      "excluded account leaked into the queue: \(status?.upcoming ?? [])")
+    }
+
     func testInactiveDaemonFiresNothing() async throws {
         let ws = try seedWorkspace(active: false)
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))

@@ -8,11 +8,12 @@ import Foundation
 extension AppModel {
     var scheduleStore: ScheduleStore { ScheduleStore(workspace: workspace) }
 
-    /// Connected accounts in scheduling (stagger) order. `accounts` is already in
-    /// canonical priority order, so filtering preserves it — the same order
-    /// `Scheduler.schedulableAccounts` stages token windows in.
+    /// Connected, non-excluded accounts in scheduling (stagger) order.
+    /// `accounts` is already in canonical priority order, so filtering preserves
+    /// it — the same eligibility rule and order `Scheduler.schedulableAccounts`
+    /// stages token windows in.
     var scheduledAccounts: [Account] {
-        accounts.filter { $0.status == .connected }
+        accounts.filter { $0.status == .connected && !$0.excludedFromScheduling }
     }
 
     /// The live multi-account plan for one weekday, computed from in-memory
