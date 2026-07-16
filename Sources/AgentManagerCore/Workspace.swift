@@ -76,9 +76,14 @@ public struct Workspace: Sendable {
     /// from the usage API is respected across refreshes *and* app relaunches.
     public var usageRateLimitFile: URL { root.appendingPathComponent("usage-ratelimit.json") }
 
-    /// `preferences.json` — display preferences (e.g. clock style) shared by the
-    /// GUI app and the `am` CLI so both render times the same way.
+    /// `preferences.json` — display and provider ping-method preferences shared
+    /// by the GUI app and the `am` CLI.
     public var preferencesFile: URL { root.appendingPathComponent("preferences.json") }
+
+    /// `sdk-ping/` — versioned helper scripts materialized on demand for SDK
+    /// pings. Dependencies are intentionally user-installed beside the scripts;
+    /// Agent Manager never contacts a package registry or installs them itself.
+    public var sdkPingDir: URL { root.appendingPathComponent("sdk-ping", isDirectory: true) }
 
     /// `keychain-grants.json` — Keychain services for which a `/usr/bin/security`
     /// read is verified to succeed silently. Shared by the app, `am`, and the

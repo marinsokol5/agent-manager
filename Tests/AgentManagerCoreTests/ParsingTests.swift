@@ -367,16 +367,31 @@ final class ParsingTests: XCTestCase {
         let store = PreferencesStore(fileURL: url)
         defer { try? fm.removeItem(at: url) }
 
-        // Missing file → defaults (12-hour, system theme).
+        // Missing file → defaults (12-hour, system theme, terminal pings).
         XCTAssertEqual(store.load().clockStyle, .twelveHour)
         XCTAssertEqual(store.load().theme, .system)
+        XCTAssertEqual(store.load().claudePingMethod, .terminal)
+        XCTAssertEqual(store.load().codexPingMethod, .terminal)
 
-        store.save(Preferences(clockStyle: .twentyFourHour, theme: .dark))
-        XCTAssertEqual(store.load(), Preferences(clockStyle: .twentyFourHour, theme: .dark))
+        let changed = Preferences(
+            clockStyle: .twentyFourHour,
+            theme: .dark,
+            claudePingMethod: .headless,
+            codexPingMethod: .sdk)
+        store.save(changed)
+        XCTAssertEqual(store.load(), changed)
+        XCTAssertEqual(changed.pingMethod(for: .claude), .headless)
+        XCTAssertEqual(changed.pingMethod(for: .codex), .sdk)
 
-        // A file predating `theme` → the missing field falls back to its default.
+        // A file predating theme/ping methods → every missing field gets its own default.
         try? #"{"clockStyle":"twentyFourHour"}"#.data(using: .utf8)!.write(to: url)
         XCTAssertEqual(store.load(), Preferences(clockStyle: .twentyFourHour, theme: .system))
+
+        // Unknown method values also fall back independently, preserving a valid sibling.
+        try? #"{"claudePingMethod":"future","codexPingMethod":"sdk"}"#
+            .data(using: .utf8)!.write(to: url)
+        XCTAssertEqual(store.load().claudePingMethod, .terminal)
+        XCTAssertEqual(store.load().codexPingMethod, .sdk)
 
         // Corrupt file → defaults, never throws.
         try? "{ not json".data(using: .utf8)!.write(to: url)

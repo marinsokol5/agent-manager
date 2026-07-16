@@ -59,7 +59,9 @@ final class MonitoringLogTests: XCTestCase {
 
     func testMergeAssignsCategoriesAndHints() {
         let merged = MonitoringLogEntry.merge(
-            activity: [ActivityRecord(accountID: "work", ok: true, anchored: true, detail: "anchored")],
+            activity: [ActivityRecord(
+                accountID: "work", ok: true, anchored: true, detail: "anchored",
+                pingMethod: .headless)],
             audit: [
                 AuditEvent(accountID: "work", action: "run.exec", ok: true, detail: "claude: /bin/claude"),
                 AuditEvent(accountID: nil, action: "scheduler.start", ok: true, detail: "pid 1"),
@@ -79,6 +81,7 @@ final class MonitoringLogTests: XCTestCase {
         let ping = merged.first { $0.kind == .ping }
         XCTAssertEqual(ping?.category, .pings)
         XCTAssertNil(ping?.providerHint)
+        XCTAssertTrue(ping?.detail.hasPrefix("headless · anchored") == true)
 
         XCTAssertEqual(byKindAndTitle("Run exec")?.category, .runs)
         XCTAssertEqual(byKindAndTitle("Scheduler start")?.category, .scheduler)

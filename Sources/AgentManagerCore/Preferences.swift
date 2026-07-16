@@ -121,20 +121,45 @@ public enum AppTheme: String, Codable, Sendable, CaseIterable, Identifiable {
 public struct Preferences: Codable, Sendable, Equatable {
     public var clockStyle: ClockStyle
     public var theme: AppTheme
+    public var claudePingMethod: PingMethod
+    public var codexPingMethod: PingMethod
 
-    public init(clockStyle: ClockStyle = .twelveHour, theme: AppTheme = .system) {
+    public init(
+        clockStyle: ClockStyle = .twelveHour,
+        theme: AppTheme = .system,
+        claudePingMethod: PingMethod = .terminal,
+        codexPingMethod: PingMethod = .terminal)
+    {
         self.clockStyle = clockStyle
         self.theme = theme
+        self.claudePingMethod = claudePingMethod
+        self.codexPingMethod = codexPingMethod
+    }
+
+    /// Provider-wide delivery method, loaded afresh by every ping invocation so
+    /// changing Preferences affects both manual turns and future daemon children
+    /// without replanning or restarting the scheduler.
+    public func pingMethod(for provider: Provider) -> PingMethod {
+        switch provider {
+        case .claude: claudePingMethod
+        case .codex: codexPingMethod
+        }
     }
 
     public static let `default` = Preferences()
 
-    private enum CodingKeys: String, CodingKey { case clockStyle, theme }
+    private enum CodingKeys: String, CodingKey {
+        case clockStyle, theme, claudePingMethod, codexPingMethod
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         clockStyle = (try? c.decode(ClockStyle.self, forKey: .clockStyle)) ?? Self.default.clockStyle
         theme = (try? c.decode(AppTheme.self, forKey: .theme)) ?? Self.default.theme
+        claudePingMethod = (try? c.decode(PingMethod.self, forKey: .claudePingMethod))
+            ?? Self.default.claudePingMethod
+        codexPingMethod = (try? c.decode(PingMethod.self, forKey: .codexPingMethod))
+            ?? Self.default.codexPingMethod
     }
 }
 

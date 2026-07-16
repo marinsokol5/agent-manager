@@ -189,7 +189,11 @@ design follows from them.
 - `keychain-grants.json` — which Keychain services the `/usr/bin/security` read
   path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
   any of them stay silent (see `KeychainGrantStore`).
-- `preferences.json` — display preferences (e.g. clock style), shared by app + CLI.
+- `preferences.json` — display preferences plus the provider-wide Claude and
+  Codex ping methods (`terminal` / `headless` / `sdk`), shared by app + CLI.
+- `sdk-ping/` — the Node/Python helper scripts materialized by the installed
+  binary when an SDK ping runs. SDK dependencies are user-installed here; the
+  app never runs npm/pip or contacts a package registry.
 - `audit.log.jsonl`, `activity.jsonl`, `network.jsonl` — the three local logs
   shown in Monitoring.
 - `homes/<id>/` — the managed config home per account (created `0o700`).
@@ -357,9 +361,16 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   monitoring refresh: active + registration reading `.notRegistered`/
   `.notFound` → one `register()` per app run (`scheduler.reregister` in the
   audit log) — a real state change, so it can't re-notify an approved agent.
-- **Anchoring needs a real TUI turn.** Only a `tui`-style ping over a PTY anchors
-  a window; headless `claude -p` / `codex exec` burn tokens without opening the
-  window. Don't "optimize" pings into headless calls.
+- **Terminal is the verified anchoring method.** Controlled-terminal pings over
+  a PTY remain the default and the only method verified to anchor the rolling
+  window. Preferences exposes provider-wide experimental `headless` (`claude
+  -p` / `codex exec`) and `sdk` methods for re-testing provider behavior; `am
+  ping <id> --method terminal|headless|sdk` supplies a one-off override. Never
+  equate method/process success with anchoring: scheduled children still bracket
+  every method with usage reads, and only `AnchorVerification` may report a moved
+  window. SDK helpers are materialized in `<workspace>/sdk-ping`; users install
+  `@anthropic-ai/claude-agent-sdk` / `openai-codex` themselves, and Agent Manager
+  must never auto-install them or contact a package registry.
 - **Sleep & stale pings.** The daemon spawns each scheduled ping as
   `am ping <id> --manage-sleep --scheduled-for <epoch>`: the child holds the Mac
   awake for the turn (a `caffeinate` idle assertion bound to the ping's PID) and

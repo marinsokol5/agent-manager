@@ -15,6 +15,16 @@ public enum ClaudePingRunner {
         public let ok: Bool
         public let detail: String
         public let transcript: String
+        /// Delivery method selected by `AccountPinger`. Low-level runners leave
+        /// this nil; the choke point stamps it before audit/activity logging.
+        public let pingMethod: PingMethod?
+
+        public init(ok: Bool, detail: String, transcript: String, pingMethod: PingMethod? = nil) {
+            self.ok = ok
+            self.detail = detail
+            self.transcript = transcript
+            self.pingMethod = pingMethod
+        }
     }
 
     public static func run(

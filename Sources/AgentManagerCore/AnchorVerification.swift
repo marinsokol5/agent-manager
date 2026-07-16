@@ -3,7 +3,7 @@ import Foundation
 /// Did a ping's turn actually anchor a fresh window? Pure classification over
 /// the usage readings the scheduled ping child fetches around its turn.
 ///
-/// Why this exists: "the TUI turn succeeded" and "the 5h window advanced" are
+/// Why this exists: "the selected turn method succeeded" and "the 5h window advanced" are
 /// different facts. A turn dispatched into a *still-open* window succeeds and
 /// anchors nothing (usage inside a window never moves its boundary) — the
 /// phantom this whole feature exists to kill. The discriminator is
@@ -27,9 +27,9 @@ public enum AnchorVerification {
     ///   - pre: the account's cached reading from *before* the turn;
     ///     `nil` = no prior knowledge.
     ///   - post: the reading fetched right after the turn completed.
-    ///   - turnStartedAt: conservative lower bound captured before the TUI
+    ///   - turnStartedAt: conservative lower bound captured before the selected
     ///     runner starts; provider dispatch/completion happens at or after it.
-    ///   - turnFinishedAt: upper bound captured when the TUI runner returns.
+    ///   - turnFinishedAt: upper bound captured when the selected runner returns.
     public static func classify(
         pre: UsageReading?,
         post: UsageReading?,

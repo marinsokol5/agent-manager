@@ -1,4 +1,5 @@
 import AgentManagerCore
+import AppKit
 import SwiftUI
 
 /// The **Preferences** screen. Hosts the set-once "Wake Mac for pings" opt-in
@@ -7,12 +8,14 @@ import SwiftUI
 /// menu-bar display mode, the theme, and the clock style.
 struct PreferencesView: View {
     @Bindable var model: AppModel
+    @State private var pingMethodProvider: Provider = .claude
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 wakeSection
+                pingMethodSection
                 menuBarSection
                 themeSection
                 timeFormatSection
@@ -79,6 +82,56 @@ struct PreferencesView: View {
         }
     }
 
+    private var pingMethodSection: some View {
+        section(
+            title: "Ping method",
+            subtitle: "Choose separately per provider. Scheduled pings verify the real window before treating any method as an anchor.")
+        {
+            Picker("Provider", selection: $pingMethodProvider) {
+                Text("Claude").tag(Provider.claude)
+                Text("Codex").tag(Provider.codex)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+
+            pingMethodGroup(
+                provider: pingMethodProvider,
+                selection: pingMethodProvider == .claude
+                    ? model.claudePingMethod
+                    : model.codexPingMethod)
+            { method in
+                switch pingMethodProvider {
+                case .claude: model.claudePingMethod = method
+                case .codex: model.codexPingMethod = method
+                }
+            }
+        }
+    }
+
+    private func pingMethodGroup(
+        provider: Provider,
+        selection: PingMethod,
+        select: @escaping (PingMethod) -> Void)
+        -> some View
+    {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(PingMethod.allCases) { method in
+                let setupCommand = method == .sdk
+                    ? SDKPingRunner.setupCommand(provider: provider, workspace: model.workspace)
+                    : nil
+                PreferenceRadioCard(
+                    systemImage: method.displaySymbol,
+                    title: method.displayTitle,
+                    subtitle: method.displaySubtitle(
+                        for: provider,
+                        setupCommand: setupCommand),
+                    copyCommand: setupCommand,
+                    isSelected: selection == method,
+                    action: { select(method) })
+            }
+        }
+    }
+
     /// Shared section chrome: a semibold title, a secondary subtitle, and a
     /// vertical stack of the section's radio cards.
     private func section<Content: View>(
@@ -135,6 +188,38 @@ private extension ClockStyle {
         switch self {
         case .twelveHour: "Shows times like 4:00pm."
         case .twentyFourHour: "Shows times like 16:00."
+        }
+    }
+}
+
+private extension PingMethod {
+    var displayTitle: String {
+        switch self {
+        case .terminal: "Controlled terminal"
+        case .headless: "Programmatic CLI"
+        case .sdk: "SDK"
+        }
+    }
+
+    var displaySymbol: String {
+        switch self {
+        case .terminal: "terminal"
+        case .headless: "chevron.left.forwardslash.chevron.right"
+        case .sdk: "shippingbox"
+        }
+    }
+
+    func displaySubtitle(for provider: Provider, setupCommand: String?) -> String {
+        switch self {
+        case .terminal:
+            return "Drives the real interactive TUI — the verified-anchoring default."
+        case .headless:
+            return provider == .claude
+                ? "claude -p — a lighter, non-interactive turn with structured output."
+                : "codex exec — a lighter, non-interactive turn with structured output."
+        case .sdk:
+            let sdk = provider == .claude ? "Claude Agent SDK" : "Codex SDK"
+            return "Install the \(sdk) once: \(setupCommand ?? "")"
         }
     }
 }
@@ -337,47 +422,94 @@ private struct PreferenceRadioCard: View {
     let systemImage: String
     let title: String
     let subtitle: String
+    let copyCommand: String?
     let isSelected: Bool
     let action: () -> Void
 
     @State private var hovering = false
+    @State private var copied = false
+
+    init(
+        systemImage: String,
+        title: String,
+        subtitle: String,
+        copyCommand: String? = nil,
+        isSelected: Bool,
+        action: @escaping () -> Void)
+    {
+        self.systemImage = systemImage
+        self.title = title
+        self.subtitle = subtitle
+        self.copyCommand = copyCommand
+        self.isSelected = isSelected
+        self.action = action
+    }
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 16))
-                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
-                    .frame(width: 26, height: 26)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7)
-                            .fill(isSelected ? Theme.accent : Color.primary.opacity(0.07)))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 13.5, weight: .semibold))
-                    Text(subtitle)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+        HStack(spacing: 4) {
+            Button(action: action) {
+                HStack(spacing: 12) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 16))
+                        .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                        .frame(width: 26, height: 26)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7)
+                                .fill(isSelected ? Theme.accent : Color.primary.opacity(0.07)))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 13.5, weight: .semibold))
+                        Text(subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 16))
+                        .foregroundStyle(isSelected ? Theme.accent : Color.secondary.opacity(0.5))
                 }
-                Spacer(minLength: 8)
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 16))
-                    .foregroundStyle(isSelected ? Theme.accent : Color.secondary.opacity(0.5))
+                .padding(.leading, 13)
+                .padding(.trailing, copyCommand == nil ? 13 : 4)
+                .padding(.vertical, 11)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 11)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 11)
-                    .fill(hovering ? Color.primary.opacity(0.05) : Color.primary.opacity(0.02)))
-            .overlay(
-                RoundedRectangle(cornerRadius: 11)
-                    .strokeBorder(isSelected ? Theme.accent.opacity(0.6) : Color.primary.opacity(0.08),
-                                  lineWidth: isSelected ? 1.5 : 1))
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            if copyCommand != nil {
+                Button(action: copySetupCommand) {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(copied ? Theme.success : Theme.accent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.primary.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                .help("Copy the one-time SDK setup command")
+                .padding(.trailing, 11)
+            }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 11)
+                .fill(hovering ? Color.primary.opacity(0.05) : Color.primary.opacity(0.02)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11)
+                .strokeBorder(isSelected ? Theme.accent.opacity(0.6) : Color.primary.opacity(0.08),
+                              lineWidth: isSelected ? 1.5 : 1))
         .onHover { hovering = $0 }
+    }
+
+    private func copySetupCommand() {
+        guard let copyCommand else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(copyCommand, forType: .string)
+        copied = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            copied = false
+        }
     }
 }

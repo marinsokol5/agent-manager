@@ -37,6 +37,16 @@ public enum Provider: String, Codable, Sendable, CaseIterable {
         }
     }
 
+    /// Direct API-billing environment variables that must not leak into a ping.
+    /// Pings exercise the managed subscription identity written by the official
+    /// CLI; inheriting one of these would silently test a different billing path.
+    public var apiKeyEnvironmentKeys: [String] {
+        switch self {
+        case .claude: ["ANTHROPIC_API_KEY"]
+        case .codex: ["OPENAI_API_KEY"]
+        }
+    }
+
     /// Arguments that drive the provider's one-time interactive login.
     public var loginArguments: [String] {
         switch self {

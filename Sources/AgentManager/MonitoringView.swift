@@ -436,6 +436,11 @@ struct MonitoringView: View {
             Text(model.clockStyle.stampString(record.time))
                 .font(Theme.Font.caption).foregroundStyle(.secondary).monospacedDigit()
             Text(record.accountID).font(.system(size: 12.5, weight: .medium))
+            if let method = record.pingMethod {
+                Text(method.rawValue)
+                    .font(Theme.Font.caption)
+                    .foregroundStyle(.secondary)
+            }
             Text(anchorText(record))
                 .font(Theme.Font.caption)
                 .foregroundStyle(record.ok ? (record.anchored ? Theme.success : Theme.warning) : .secondary)

@@ -9,8 +9,8 @@ import Foundation
 /// each outcome as a distinct code (an internal daemon↔child contract;
 /// launchd never inspects them), and the daemon maps them back here.
 public enum PingOutcome: String, Sendable, Equatable {
-    /// The ping dispatched a real TUI turn and (where verification ran) the
-    /// account's 5h window verifiably anchored.
+    /// The selected method completed a turn and the account's 5h window
+    /// verifiably anchored.
     case anchored
     /// The ping ran but no turn dispatched (or the account wasn't pingable).
     case failed

@@ -71,9 +71,12 @@ the clock the moment you sit down.
 
 ![Planner screen: working hours painted on a weekly grid, the ping schedule, and the daily token-window timeline](screenshots/planner.png)
 
-Each ping is a real interactive turn in the CLI over a managed terminal, not an SDK or programmatic call, to stay future-proof and not lose access
-through policy changes like
-[this one](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+Controlled terminal is the default and only verified-anchoring method. For
+provider A/B testing, **Preferences → Ping method** can instead use `claude -p` /
+`codex exec` or the official SDKs, separately for Claude and Codex. Scheduled
+pings verify the post-turn usage window regardless of method, so a programmatic
+turn that burns tokens without opening the 5-hour window is never reported as an
+anchor. SDK dependencies are user-installed; Agent Manager never installs them.
 
 **Lid closed or Mac sleeping?** Flip **Wake Mac for pings** in Preferences: a tiny helper arms a hardware wake ~45
 seconds before each ping, the ping runs, and the Mac goes back to sleep if
@@ -90,6 +93,7 @@ the sleeping Mac misses lets Anthropic's cloud run it instead.
 am list                   list accounts with status + provider
 am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
 am usage [<id>]           capacity for connected accounts (--week, --provider, --sort)
+am ping <id>              run a ping (--method terminal|headless|sdk overrides once)
 ```
 
 Everything else is doable only in the app, the CLI handles only running-related actions.
@@ -100,9 +104,10 @@ Everything else is doable only in the app, the CLI handles only running-related 
   under the app's folder. Only the identity file (`.claude.json` / `auth.json`) is
   real and per-account; the rest is symlinked from your real config, so accounts
   share settings and history without stepping on each other's login.
-- **Official CLI only.** Logins, pings, and launches all run the real `claude` /
-  `codex` binary. Agent Manager only reads the credentials those tools write — it
-  never relays or stores a token.
+- **Official tooling only.** Logins and launches run the real `claude` / `codex`
+  binary. Pings use those binaries directly or through their official SDKs.
+  Agent Manager only reads the credentials those tools write — it never relays
+  or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
   (`api.anthropic.com`, `chatgpt.com`): the usage reads the real CLI already
   makes, plus — only if you turn the experimental Claude Routine fallback on — managing
@@ -133,7 +138,8 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `wake.json` | the "Wake Mac for pings" opt-in |
 | `cloud-fallback.json` / `cloud-fallback-state.json` | the cloud-fallback opt-in + which claude.ai routine is armed per account |
 | `usage.json` | last-known usage reading per account |
-| `preferences.json` | display preferences (e.g. clock style) |
+| `preferences.json` | display preferences plus separate Claude/Codex ping methods |
+| `sdk-ping/` | SDK helper scripts and user-installed SDK dependencies (only when SDK pings are used) |
 | `audit.log.jsonl` / `activity.jsonl` / `network.jsonl` | local logs (auth headers redacted) |
 | `homes/<id>/` | per-account config home (created `0700`) |
 

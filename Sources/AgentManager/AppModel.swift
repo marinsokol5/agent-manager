@@ -110,6 +110,27 @@ final class AppModel {
         }
     }
 
+    /// Provider-wide ping delivery preferences. Every ping process reloads the
+    /// file at invocation time, so these take effect immediately for Test ping
+    /// and future scheduler children without touching the launchd agent.
+    var claudePingMethod: PingMethod = .terminal {
+        didSet {
+            guard claudePingMethod != oldValue else { return }
+            var prefs = preferencesStore.load()
+            prefs.claudePingMethod = claudePingMethod
+            preferencesStore.save(prefs)
+        }
+    }
+
+    var codexPingMethod: PingMethod = .terminal {
+        didSet {
+            guard codexPingMethod != oldValue else { return }
+            var prefs = preferencesStore.load()
+            prefs.codexPingMethod = codexPingMethod
+            preferencesStore.save(prefs)
+        }
+    }
+
     /// Persisted app appearance (preferences.json). Defaults to following macOS.
     var theme: AppTheme = .system {
         didSet {
@@ -281,6 +302,8 @@ final class AppModel {
         let prefs = preferencesStore.load()
         clockStyle = prefs.clockStyle
         theme = prefs.theme
+        claudePingMethod = prefs.claudePingMethod
+        codexPingMethod = prefs.codexPingMethod
         applyTheme() // didSet doesn't fire during init — apply the loaded theme explicitly
         reload()
         reconcileAll()

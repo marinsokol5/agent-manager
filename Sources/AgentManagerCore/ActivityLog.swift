@@ -3,11 +3,10 @@ import Foundation
 /// One ping outcome, for the Activity screen's "is it actually working?" view.
 ///
 /// `anchored` is the make-or-break signal the design calls out: did a window
-/// *actually* open, not just "did the command exit 0". For the `tui` ping that's
-/// the same as `ok` (a dispatched interactive turn anchors the 5h window); we
-/// keep it a separate field so a future headless/SDK path can record "ran but
-/// didn't anchor". On failure, `transcriptPath` points at the saved PTY
-/// transcript for debugging.
+/// *actually* open, not just "did the command exit 0". `pingMethod` identifies
+/// the experiment independently of that truth signal and remains optional so
+/// historical JSONL records decode unchanged. On failure, `transcriptPath`
+/// points at the saved turn transcript for debugging.
 public struct ActivityRecord: Codable, Sendable, Equatable {
     public var time: Date
     public var accountID: String
@@ -15,19 +14,29 @@ public struct ActivityRecord: Codable, Sendable, Equatable {
     public var anchored: Bool
     public var detail: String
     public var transcriptPath: String?
+    public var pingMethod: PingMethod?
 
-    public init(time: Date = Date(), accountID: String, ok: Bool, anchored: Bool, detail: String, transcriptPath: String? = nil) {
+    public init(
+        time: Date = Date(),
+        accountID: String,
+        ok: Bool,
+        anchored: Bool,
+        detail: String,
+        transcriptPath: String? = nil,
+        pingMethod: PingMethod? = nil)
+    {
         self.time = time
         self.accountID = accountID
         self.ok = ok
         self.anchored = anchored
         self.detail = detail
         self.transcriptPath = transcriptPath
+        self.pingMethod = pingMethod
     }
 }
 
 /// Append-only JSONL ping log. Best-effort — like `AuditLog`, a logging failure
-/// never breaks the ping it observes. Both the launchd runner (`am bump`) and the
+/// never breaks the ping it observes. Both the launchd runner (`am ping`) and the
 /// App's "Test ping" write here (through `AccountPinger`).
 public struct ActivityLog {
     let fileURL: URL

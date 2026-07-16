@@ -32,7 +32,7 @@ struct MonitoringLogEntry: Identifiable, Sendable {
     let detail: String
     /// Populated for `.http` rows so the row can expand to the full exchange.
     let http: NetworkLogEntry?
-    /// Populated for `.ping` rows that saved a PTY transcript, so the row can
+    /// Populated for `.ping` rows that saved a turn transcript, so the row can
     /// expand to show what the agent actually replied (read lazily from disk).
     let transcriptPath: String?
     /// Usecase bucket the Logs filter toggles on (see `Category`).
@@ -56,11 +56,12 @@ struct MonitoringLogEntry: Identifiable, Sendable {
 
         for r in activity {
             let outcome = r.ok ? (r.anchored ? "anchored" : "ran · no anchor") : "failed"
+            let method = r.pingMethod.map { "\($0.rawValue) · " } ?? ""
             out.append(.init(
                 id: "ping-\(r.time.timeIntervalSince1970)-\(r.accountID)",
                 time: r.time, kind: .ping, ok: r.ok, accountID: r.accountID,
                 title: "Ping \(r.accountID)",
-                detail: "\(outcome) · \(r.detail)", http: nil, transcriptPath: r.transcriptPath,
+                detail: "\(method)\(outcome) · \(r.detail)", http: nil, transcriptPath: r.transcriptPath,
                 category: .pings, providerHint: nil))
         }
 

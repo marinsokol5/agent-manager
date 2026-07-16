@@ -11,7 +11,7 @@ import Darwin
 //   am run <id> [<args>…]     launch a session as <id> (exec-replaces this process)
 //   am list                   inventory accounts + connection status
 //   am usage [<id>] [--week]  per-account capacity
-//   am ping <id>              fire one tui-ping (manual, and what the scheduler fires)
+//   am ping <id>              fire one configured ping (manual, and what the scheduler fires)
 //   am scheduler …            the resident scheduler daemon (run / status / uninstall)
 //   am wake …                 undocumented: classic sudo install of the wake helper
 //                             (the app's toggle + SMAppService is the supported path)
@@ -82,8 +82,10 @@ USAGE:
                             capacity for connected accounts (or just <id>); one-row
                             table for 2+ accounts (rank order; --sort reorders it,
                             --provider filters by provider), --week shows the 7d window
-  am ping <id>              fire one tui-ping now — anchors <id>'s 5h window; this is
-                            also exactly what the background scheduler fires per slot
+  am ping <id> [--method terminal|headless|sdk]
+                            fire one configured ping now; --method is a one-off
+                            override for A/B testing. The background scheduler uses
+                            the provider's saved preference and verifies anchoring.
 """
 // Deliberately unlisted verb sets (functional, but the supported surfaces
 // live elsewhere):
@@ -351,8 +353,9 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 
 // MARK: - ping (manual + scheduled anchoring)
 
-/// `am ping <id>` — fire one minimal tui-ping for `id` now, anchoring its 5h
-/// window. This is the one ping operation: the manual "test ping" *and* exactly
+/// `am ping <id>` — fire one minimal turn for `id` now using its provider-wide
+/// preference (or a one-off `--method`). This is the one ping operation: the
+/// manual "test ping" *and* exactly
 /// what the resident scheduler daemon spawns for each queue entry
 /// (`am ping <id> --manage-sleep --scheduled-for <epoch>`, workspace via
 /// `AGENT_MANAGER_ROOT`), so a hand-run ping and a scheduled one drive the
@@ -367,11 +370,18 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 /// because they deliberately avoid the scheduler's usage-read feedback loop.
 func runPing(_ args: [String]) async {
     // The positional <id>: first non-flag token that isn't a value-flag's value.
-    let valueFlags: Set<String> = ["--scheduled-for"]
+    let valueFlags: Set<String> = ["--scheduled-for", "--method"]
     let id = args.enumerated().first { i, a in
         !a.hasPrefix("-") && !(i > 0 && valueFlags.contains(args[i - 1]))
     }?.element
-    guard let id else { fail("usage: am ping <id>") }
+    guard let id else { fail("usage: am ping <id> [--method terminal|headless|sdk]") }
+    let methodOverride: PingMethod? = {
+        guard args.contains("--method") else { return nil }
+        guard let raw = value("--method", in: args), let method = PingMethod(rawValue: raw) else {
+            fail("--method must be one of: terminal, headless, sdk")
+        }
+        return method
+    }()
     // `--manage-sleep` is the internal knob the scheduler passes (never a
     // hand-run `am ping`): hold the Mac awake for the turn, then — only if it's
     // provably unattended — return it to sleep. A manual ping leaves power alone.
@@ -458,13 +468,13 @@ func runPing(_ args: [String]) async {
     do {
         let pinger = AccountPinger(workspace: workspace)
         guard isScheduled else {
-            let result = try pinger.ping(id)
+            let result = try pinger.ping(id, methodOverride: methodOverride)
             print("\(result.ok ? "✅" : "✗") [\(id)] \(result.detail)")
             finish(result.ok ? PingOutcome.anchoredExitCode : PingOutcome.failedExitCode)
         }
 
         let attemptStarted = Date()
-        let result = try pinger.runTurn(id)
+        let result = try pinger.runTurn(id, methodOverride: methodOverride)
         let attemptFinished = Date()
         guard result.ok else {
             pinger.recordOutcome(id, result: result, anchored: false)
