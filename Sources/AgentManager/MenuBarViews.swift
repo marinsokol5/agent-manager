@@ -12,7 +12,11 @@ struct MergedMenuView: View {
         VStack(alignment: .leading, spacing: 0) {
             let accounts = model.menuBarAccounts
             if accounts.isEmpty {
-                MenuEmptyState()
+                // Distinguish "nothing connected" from "connected but all
+                // unpinned" — the list is the *pinned* connected accounts.
+                MenuEmptyState(message: model.accounts.contains { $0.status == .connected }
+                    ? "No pinned agents"
+                    : "No connected agents")
             } else {
                 let recommendedID = model.recommendedAgent?.id
                 VStack(alignment: .leading, spacing: 10) {
@@ -265,11 +269,13 @@ private struct PercentBadge: View {
 }
 
 private struct MenuEmptyState: View {
+    let message: String
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "person.2.slash")
                 .foregroundStyle(.tertiary)
-            Text("No connected agents")
+            Text(message)
                 .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
         }
