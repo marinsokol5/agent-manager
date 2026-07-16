@@ -257,7 +257,7 @@ private struct ClaudeRoutineFallbackCard: View {
                             .background(Capsule().fill(Theme.warning.opacity(0.15)))
                             .foregroundStyle(Theme.warning)
                     }
-                    Text("Asleep on **battery**: no wake is possible, so your claude.ai account runs the ping in the cloud instead.")
+                    Text("Asleep on **battery**, fallback to Anthropic compute. Keeps a claude.ai routine scheduled 5 minutes after the next scheduled ping for when we can't wake up Mac.")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -279,7 +279,7 @@ private struct ClaudeRoutineFallbackCard: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Routines only")
                             .font(.system(size: 12.5, weight: .semibold))
-                        Text("Anchor Claude **entirely from the cloud** at each planned slot — no local pings on this Mac. For a Mac too unreliable to ping. Codex still pings locally.")
+                        Text("For Claude agents, the claude.ai routine becomes the **only** token window scheduler, no local ping attempts.")
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
