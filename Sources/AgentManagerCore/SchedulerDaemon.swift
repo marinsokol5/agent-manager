@@ -628,7 +628,20 @@ public actor SchedulerDaemon {
                     calendar: calendar,
                     from: from,
                     to: to,
-                    minimumDuration: TimeInterval(schedule.resolvedMinSliceMinutes * 60))
+                    // The floor is measured from the *deferred* fire, so it has
+                    // to tolerate the deferral itself: see
+                    // `RuntimeAnchorPolicy.maxSliceShortfall`. Never negative —
+                    // at 0 the check degrades to "any painted work at all",
+                    // which still drops a fire pushed into off-hours.
+                    // The floor is measured from the *deferred* fire, so it has
+                    // to tolerate the deferral itself: see
+                    // `RuntimeAnchorPolicy.maxSliceShortfall`. Never negative —
+                    // at 0 the check degrades to "any painted work at all",
+                    // which still drops a fire pushed into off-hours.
+                    minimumDuration: max(
+                        TimeInterval(schedule.resolvedMinSliceMinutes * 60)
+                            - RuntimeAnchorPolicy.maxSliceShortfall,
+                        0))
             })
     }
 
@@ -916,10 +929,12 @@ public actor SchedulerDaemon {
     }
 
     /// Does a continuous painted-work stretch of at least `minimumDuration`
-    /// overlap `[from, to)`? Runtime deferral must honor the same minimum slice
-    /// floor as the planner; anchoring five hours for a few leftover minutes
-    /// would violate the cadence invariant. Walks calendar days and maps block
-    /// minutes as wall time so DST transitions stay correct.
+    /// overlap `[from, to)`? Runtime deferral honors the planner's minimum slice
+    /// floor — anchoring five hours for a few leftover minutes would violate the
+    /// cadence invariant — but relaxed by `RuntimeAnchorPolicy.maxSliceShortfall`,
+    /// because the caller measures the slice from the deferred fire rather than
+    /// the planned minute. Walks calendar days and maps block minutes as wall
+    /// time so DST transitions stay correct.
     static func paintedWorkOverlaps(
         schedule: WorkSchedule,
         calendar: Calendar,

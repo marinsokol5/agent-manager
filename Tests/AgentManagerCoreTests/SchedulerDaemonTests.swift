@@ -907,6 +907,66 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertTrue(records[0].detail.contains("no usable budget slice"), records[0].detail)
     }
 
+    func testTailSliceAtTheFloorSurvivesTheDeferralMargin() async throws {
+        // Painted Mon 08:00–10:00 plans 04:00 + 09:00, and the 09:00 slot's
+        // slice is *exactly* the one-hour floor — the planner rebalances every
+        // block that way. The 04:00 window expires right at 09:00, so the 09:00
+        // fire defers to 09:01, where only 59 painted minutes remain. Re-testing
+        // the planner's floor verbatim dropped the slot every time: as a covered
+        // skip once due, and — hours earlier — as a silent disappearance from the
+        // published queue, which is what the cloud routine arms from.
+        let ws = try seedWorkspace(hours: [8, 9])
+        seedUsage(ws, id: "a1", resetsAt: date(2026, 7, 6, 9, 0), fetchedAt: date(2026, 7, 6, 4, 30))
+        let clock = TestClock(date(2026, 7, 6, 8, 55))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+
+        _ = await daemon.tick()
+        XCTAssertTrue(recorder.requests.isEmpty)
+        // Still queued, deferred one margin past the real expiry — not dropped,
+        // and not silently replaced by next week's first slot.
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.upcoming.first?.fireAt,
+            date(2026, 7, 6, 9, 1))
+
+        clock.now = date(2026, 7, 6, 9, 1, 10)
+        _ = await daemon.tick()
+        XCTAssertEqual(
+            recorder.requests,
+            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 1))])
+        // The watermark still advances to the nominal minute, so the weekly
+        // slot is consumed exactly once.
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"],
+            date(2026, 7, 6, 9, 0))
+    }
+
+    func testTailSliceSurvivesRealAnchorLatencyNotJustTheMargin() async throws {
+        // The general case of the above: a local ping doesn't anchor at its
+        // planned minute but at planned + latency (dispatch, or a whole turn for
+        // Codex), so the 04:00 window expires at 09:01:30 and the tail slice
+        // measures 57 minutes rather than 60. That drift is jitter, not a real
+        // shortfall — the slot must still fire, at 09:02:30.
+        let ws = try seedWorkspace(hours: [8, 9])
+        seedUsage(
+            ws, id: "a1", resetsAt: date(2026, 7, 6, 9, 1, 30),
+            fetchedAt: date(2026, 7, 6, 4, 30))
+        let clock = TestClock(date(2026, 7, 6, 8, 55))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+
+        _ = await daemon.tick()
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.upcoming.first?.fireAt,
+            date(2026, 7, 6, 9, 2, 30))
+
+        clock.now = date(2026, 7, 6, 9, 2, 40)
+        _ = await daemon.tick()
+        XCTAssertEqual(
+            recorder.requests,
+            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 2, 30))])
+    }
+
     func testAnchorUnknownDefersConservativelyButWithholdsCloudSignal() async throws {
         // A turn ran but couldn't be verified (exit 5): schedule around it as
         // if it anchored (defer the successor), yet never hand the cloud

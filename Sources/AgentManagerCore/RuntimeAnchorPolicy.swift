@@ -62,6 +62,26 @@ public enum RuntimeAnchorPolicy {
     /// `reset + margin`.
     public static let margin: TimeInterval = 60
 
+    /// How far *below* the planner's minimum slice a deferred fire may land and
+    /// still be worth anchoring.
+    ///
+    /// The planner rebalances each painted block into slices at or just above
+    /// `minSliceMinutes`, so a block's final slice is routinely packed to
+    /// *exactly* the floor. Meanwhile a real anchor starts at its planned
+    /// minute plus latency (PTY spawn, CLI boot, dispatch — a whole completed
+    /// turn for Codex), and this policy adds `margin` on top before refiring.
+    /// So the tail slot of every block measures a little short once deferred,
+    /// and re-testing the planner's own floor against the shifted time would
+    /// drop it *every time* — silently forfeiting the last budget slice of the
+    /// day (and, in cloud-primary mode, leaving that window with neither a
+    /// local ping nor an armed routine).
+    ///
+    /// Forgiving a few minutes keeps the planner's decision stable under that
+    /// jitter while still dropping genuine shortfalls, which are tens of
+    /// minutes — a window that outlives its planned fire by an hour leaves far
+    /// more than this missing.
+    public static let maxSliceShortfall: TimeInterval = 5 * 60
+
     /// Whether an expiry can describe a window that is live at `now`.
     /// Besides being in the future, it cannot be more than one full rolling
     /// window plus a small clock tolerance away: an anchor cannot happen in
@@ -145,7 +165,9 @@ public enum RuntimeAnchorPolicy {
     ///   - hasPaintedWork: does a planner-worthy painted-work slice overlap
     ///     `[from, to)`? Injected because mapping Dates onto the painted week
     ///     and applying its minimum-slice floor needs the daemon's calendar +
-    ///     schedule.
+    ///     schedule. The caller is expected to relax that floor by
+    ///     `maxSliceShortfall`, since this policy measures the slice from the
+    ///     *deferred* fire — see that constant for why.
     public static func adjust(
         _ queue: [QueueEntry],
         windowStates: [String: AccountWindowState],
