@@ -5,8 +5,9 @@
 # zip we just built, so version/sha can never drift out of sync by hand.
 #
 # Usage:
-#   Scripts/release.sh              # release the version in Support/Info.plist.in
+#   Scripts/release.sh              # print the current version, ask what to bump to, release
 #   Scripts/release.sh 0.1.3        # bump Info.plist.in to 0.1.3 (+commit), then release
+#                                   # (non-interactive with no argument: release as-is)
 #
 # Env overrides:
 #   REPO=marinsokol5/agent-manager        GitHub repo (owner/name)
@@ -26,33 +27,75 @@ PLIST="Support/Info.plist.in"
 
 cd "$(git rev-parse --show-toplevel)"
 
-# 0. Optional version bump (only commits if the value actually changed). Keep the
-#    compiled fallback in AppVersion.swift in lockstep with the plist, so the bare
-#    `.build/debug/am --version` matches even before the next bundle is assembled.
-if [[ $# -ge 1 ]]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $1" "$PLIST"
-    /usr/bin/sed -i '' -E "s/(static let fallback = \")[^\"]*(\")/\1$1\2/" \
-        Sources/AgentManagerCore/AppVersion.swift
-    git add "$PLIST" Sources/AgentManagerCore/AppVersion.swift
-    if ! git diff --cached --quiet; then
-        git commit -m "Bump to $1" >/dev/null
-        echo "==> bumped $PLIST to $1"
-    fi
-fi
-
-VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")"
-TAG="v$VERSION"
-ZIP=".build/AgentManager-$VERSION.zip"
-
-# 1. Preflight — fail before we build/publish anything, not halfway through.
+# 0. Preflight the things that don't depend on the version, so a dirty tree or a
+#    missing tap fails *before* you're asked to pick a number.
 [[ -f "$CASK" ]] || { echo "!! cask not found: $CASK (set TAP_DIR)"; exit 1; }
 if [[ -z "${ALLOW_DIRTY:-}" && -n "$(git status --porcelain)" ]]; then
     echo "!! working tree is dirty — commit first (or ALLOW_DIRTY=1):"; git status --short; exit 1
 fi
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-    echo "!! release $TAG already exists — bump the version first"; exit 1
+
+CURRENT="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")"
+
+# 1. Pick the version to ship. An explicit argument wins (that's `make publish
+#    V=0.1.3`); otherwise ask, showing what's shipping now and the three semver
+#    bumps off it, so nobody has to go read the plist first. Non-interactive with
+#    no argument keeps the old behaviour: release whatever the plist says.
+VERSION="$CURRENT"
+if [[ $# -ge 1 && -n "$1" ]]; then
+    VERSION="$1"
+elif [[ -t 0 ]]; then
+    echo "==> current version: $CURRENT"
+    if [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        MAJOR="${BASH_REMATCH[1]}"; MINOR="${BASH_REMATCH[2]}"; PATCH="${BASH_REMATCH[3]}"
+        BUMP_PATCH="$MAJOR.$MINOR.$((PATCH + 1))"
+        BUMP_MINOR="$MAJOR.$((MINOR + 1)).0"
+        BUMP_MAJOR="$((MAJOR + 1)).0.0"
+        echo "    1) patch  $BUMP_PATCH"
+        echo "    2) minor  $BUMP_MINOR"
+        echo "    3) major  $BUMP_MAJOR"
+        echo "    or type an exact version — Enter re-releases $CURRENT"
+        read -r -p "Bump to? [1/2/3/x.y.z] " ans || { echo aborted; exit 1; }
+        case "$ans" in
+            1) VERSION="$BUMP_PATCH" ;;
+            2) VERSION="$BUMP_MINOR" ;;
+            3) VERSION="$BUMP_MAJOR" ;;
+            "") VERSION="$CURRENT" ;;
+            *) VERSION="$ans" ;;
+        esac
+    else
+        # Not semver (hand-edited plist?) — no suggestions to offer, just ask.
+        read -r -p "Bump to? [x.y.z, Enter keeps $CURRENT] " ans || { echo aborted; exit 1; }
+        if [[ -n "$ans" ]]; then VERSION="$ans"; fi
+    fi
 fi
 
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
+    || { echo "!! not a version number: '$VERSION'"; exit 1; }
+
+TAG="v$VERSION"
+ZIP=".build/AgentManager-$VERSION.zip"
+
+# 2. Now that the version is known, check the tag is free — *before* the bump
+#    commit, so a collision doesn't leave a stray commit behind.
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    echo "!! release $TAG already exists — pick a higher version"; exit 1
+fi
+
+# 3. Apply the bump (only commits if the value actually changed). Keep the
+#    compiled fallback in AppVersion.swift in lockstep with the plist, so the bare
+#    `.build/debug/am --version` matches even before the next bundle is assembled.
+if [[ "$VERSION" != "$CURRENT" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+    /usr/bin/sed -i '' -E "s/(static let fallback = \")[^\"]*(\")/\1$VERSION\2/" \
+        Sources/AgentManagerCore/AppVersion.swift
+    git add "$PLIST" Sources/AgentManagerCore/AppVersion.swift
+    if ! git diff --cached --quiet; then
+        git commit -m "Bump to $VERSION" >/dev/null
+        echo "==> bumped $PLIST to $VERSION"
+    fi
+fi
+
+# 4. Last look before anything leaves this machine.
 echo "==> release $TAG → $REPO"
 echo "    cask: $CASK"
 if [[ -z "${YES:-}" ]]; then
@@ -60,10 +103,10 @@ if [[ -z "${YES:-}" ]]; then
     read -r -p "Proceed? [y/N] " ans; [[ "$ans" == [yY]* ]] || { echo aborted; exit 1; }
 fi
 
-# 2. Build the notarized, stapled zip (runs the test suite first — see Makefile).
+# 5. Build the notarized, stapled zip (runs the test suite first — see Makefile).
 make release
 
-# 3. Publish the GitHub release. Push HEAD first so the tag gh creates resolves
+# 6. Publish the GitHub release. Push HEAD first so the tag gh creates resolves
 #    to a commit that's actually on the remote.
 git push origin HEAD
 if [[ -n "${NOTES:-}" ]]; then
@@ -72,7 +115,7 @@ else
     gh release create "$TAG" "$ZIP" --repo "$REPO" --title "Agent Manager $VERSION" --generate-notes
 fi
 
-# 4. Update the cask: version + the sha256 of the zip we literally just shipped.
+# 7. Update the cask: version + the sha256 of the zip we literally just shipped.
 SHA="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
 /usr/bin/sed -i '' -E \
     -e "s/^  version \".*\"/  version \"$VERSION\"/" \
@@ -82,18 +125,18 @@ git -C "$TAP_DIR" add Casks/agent-manager.rb
 git -C "$TAP_DIR" commit -m "agent-manager $VERSION" >/dev/null
 git -C "$TAP_DIR" push origin HEAD
 
-# 5. Refresh the installed tap clone (so `brew upgrade` sees it now) + audit.
+# 8. Refresh the installed tap clone (so `brew upgrade` sees it now) + audit.
 TAP_CLONE="$(brew --repository)/Library/Taps/marinsokol5/homebrew-tap"
 [[ -d "$TAP_CLONE" ]] && git -C "$TAP_CLONE" pull --ff-only >/dev/null 2>&1 || true
 brew audit --cask --online marinsokol5/tap/agent-manager || true
 
-# 6. Upgrade the local install to the version we just shipped. Best-effort:
+# 9. Upgrade the local install to the version we just shipped. Best-effort:
 #    the release is already out, so a machine without the brew copy installed
 #    must not turn the whole publish into a failure.
 brew upgrade --yes --cask marinsokol5/tap/agent-manager \
     || echo "!! local brew upgrade failed — run manually: brew upgrade --cask agent-manager"
 
-# 7. Restart the running app so the upgraded bundle takes over (the cask swap
+# 10. Restart the running app so the upgraded bundle takes over (the cask swap
 #    leaves the old build running from a deleted bundle). Anchor the match to
 #    the GUI executable only — the bundled `am` scheduler daemon and any
 #    in-flight ping child live under the same bundle path but restart

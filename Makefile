@@ -111,8 +111,9 @@ release:
 	@echo "==> Notarized, stapled release ready: $(RELEASE_ZIP)"
 
 # Full release: build + notarize (via `make release`), publish the GitHub
-# release, and update + push the Homebrew cask. `make publish` ships the version
-# currently in Support/Info.plist.in; `make publish V=0.1.3` bumps it first.
+# release, and update + push the Homebrew cask. `make publish` prints the version
+# currently in Support/Info.plist.in and asks what to bump it to; `make publish
+# V=0.1.3` skips the prompt and bumps straight to that.
 # See Scripts/release.sh for env overrides (REPO, TAP_DIR, NOTES, YES).
 publish:
 	@Scripts/release.sh $(V)
