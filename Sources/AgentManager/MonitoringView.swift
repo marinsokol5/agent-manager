@@ -142,15 +142,15 @@ struct MonitoringView: View {
         }
     }
 
-    /// One row per Claude account's cloud anchor routine (the experimental
-    /// cloud fallback) — shown under the two daemons only while the feature is
-    /// on or a routine still exists to report on. Clicking a row opens that
-    /// routine on claude.ai (the authoritative info/run-history view — also
-    /// the only place a routine can be deleted).
+    /// One row per Claude account's cloud anchor routine (the `routine` ping
+    /// method) — shown under the two daemons only while that method is selected
+    /// or a routine still exists to report on. Clicking a row opens that routine
+    /// on claude.ai (the authoritative info/run-history view — also the only
+    /// place a routine can be deleted).
     @ViewBuilder
     private var cloudRoutineCards: some View {
         let entries = (model.cloudFallbackState?.accounts ?? [:]).sorted(by: { $0.key < $1.key })
-        if model.cloudFallbackEnabled || !entries.isEmpty {
+        if model.claudeCloudRoutineEnabled || !entries.isEmpty {
             if entries.isEmpty {
                 HStack(spacing: 10) {
                     Image(systemName: "circle.dashed")
@@ -213,7 +213,7 @@ struct MonitoringView: View {
         .buttonStyle(.plain)
         .amCard(radius: Theme.Radius.sm)
         .help(state.triggerID.map {
-            "Routine \($0) — a one-shot on claude.ai that anchors this account's 5h window if the Mac sleeps through a ping. Click to open it (run history, delete) on claude.ai."
+            "Routine \($0) — a one-shot on claude.ai that anchors this account's 5h window at its scheduled slot, whether or not this Mac is awake. Click to open it (run history, delete) on claude.ai."
         } ?? "No routine created yet for \(accountID).")
     }
 
@@ -236,7 +236,7 @@ struct MonitoringView: View {
                         "ran \(model.clockStyle.dayTimeString(at)) from Anthropic's cloud — re-arms on the daemon's next tick")
             }
             return ("checkmark.circle.fill", Theme.success, "armed",
-                    "fires \(model.clockStyle.dayTimeString(at)) only if the Mac sleeps through the ping")
+                    "fires \(model.clockStyle.dayTimeString(at)) from Anthropic's cloud, awake Mac or not")
         }
         return ("circle.dashed", Theme.neutral, "not armed",
                 "The daemon arms it before the next scheduled ping.")
@@ -247,8 +247,8 @@ struct MonitoringView: View {
     /// Kept terse and lowercase to read as one column with the daemon cards'
     /// "no pings planned this week" / "no wakes needed yet".
     private func cloudRoutineDisabledReason(accountID: String) -> String {
-        if !model.cloudFallbackEnabled {
-            return "fallback off in Preferences"
+        if !model.claudeCloudRoutineEnabled {
+            return "Claude's ping method isn't the cloud routine"
         }
         if model.schedulerStatus?.active != true {
             return "the Scheduler is off"

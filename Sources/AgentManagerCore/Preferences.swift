@@ -121,9 +121,15 @@ public enum AppTheme: String, Codable, Sendable, CaseIterable, Identifiable {
 public struct Preferences: Codable, Sendable, Equatable {
     public var clockStyle: ClockStyle
     public var theme: AppTheme
+    /// Claude's anchoring method — including `.routine`, the claude.ai cloud
+    /// routine, which is a method rather than a separate opt-in so there is one
+    /// answer to "what anchors this account?".
     public var claudePingMethod: PingMethod
     public var codexPingMethod: PingMethod
 
+    /// Both methods are sanitized against their provider, so a `Preferences`
+    /// value can never carry a method that provider doesn't offer (only Claude
+    /// has cloud routines) — however it was built, decoded, or migrated.
     public init(
         clockStyle: ClockStyle = .twelveHour,
         theme: AppTheme = .system,
@@ -132,13 +138,18 @@ public struct Preferences: Codable, Sendable, Equatable {
     {
         self.clockStyle = clockStyle
         self.theme = theme
-        self.claudePingMethod = claudePingMethod
-        self.codexPingMethod = codexPingMethod
+        self.claudePingMethod = claudePingMethod.sanitized(for: .claude)
+        self.codexPingMethod = codexPingMethod.sanitized(for: .codex)
     }
 
-    /// Provider-wide delivery method, loaded afresh by every ping invocation so
-    /// changing Preferences affects both manual turns and future daemon children
-    /// without replanning or restarting the scheduler.
+    /// Provider-wide anchoring method, loaded afresh by every ping invocation
+    /// and by every scheduler tick, so changing Preferences affects manual
+    /// turns, future daemon children, *and* cloud-routine arming without
+    /// replanning or restarting the scheduler.
+    ///
+    /// Callers that are about to run a turn on this Mac want `.localDriver`
+    /// off the result: `.routine` is a scheduling choice, not a way to deliver
+    /// a turn here.
     public func pingMethod(for provider: Provider) -> PingMethod {
         switch provider {
         case .claude: claudePingMethod
@@ -156,10 +167,10 @@ public struct Preferences: Codable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         clockStyle = (try? c.decode(ClockStyle.self, forKey: .clockStyle)) ?? Self.default.clockStyle
         theme = (try? c.decode(AppTheme.self, forKey: .theme)) ?? Self.default.theme
-        claudePingMethod = (try? c.decode(PingMethod.self, forKey: .claudePingMethod))
-            ?? Self.default.claudePingMethod
-        codexPingMethod = (try? c.decode(PingMethod.self, forKey: .codexPingMethod))
-            ?? Self.default.codexPingMethod
+        claudePingMethod = ((try? c.decode(PingMethod.self, forKey: .claudePingMethod))
+            ?? Self.default.claudePingMethod).sanitized(for: .claude)
+        codexPingMethod = ((try? c.decode(PingMethod.self, forKey: .codexPingMethod))
+            ?? Self.default.codexPingMethod).sanitized(for: .codex)
     }
 }
 

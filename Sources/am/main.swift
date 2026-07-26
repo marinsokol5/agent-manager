@@ -95,9 +95,6 @@ USAGE:
 // - `am wake install|uninstall|enable|disable|status` — the classic sudo
 //   install path for dev/bare-binary setups; the supported surface is the
 //   app's "Wake Mac for pings" toggle (SMAppService).
-// - `am cloud status|enable|disable|primary` — the experimental cloud fallback
-//   (`primary enable|disable` toggles cloud-primary mode); the supported
-//   surface is the Preferences toggle.
 
 guard let command = arguments.first else {
     print(usage)
@@ -117,8 +114,6 @@ case "scheduler":
     await runScheduler(Array(arguments.dropFirst()))
 case "wake":
     runWake(Array(arguments.dropFirst()))
-case "cloud":
-    runCloud(Array(arguments.dropFirst()))
 case "help", "-h", "--help":
     print(usage)
 case "--version", "-v", "version":
@@ -365,7 +360,7 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 /// real expiry), and a **postflight** that verifies the window actually
 /// advanced (exit 0), proved the old window stayed open (exit 4 — re-fire at
 /// its expiry), or remains unverifiable (exit 5, scheduled around
-/// conservatively, never treated as an anchor by the cloud fallback). Manual
+/// conservatively, never reported as an anchor). Manual
 /// pings stay unconditional, but their Activity record remains anchor-unverified
 /// because they deliberately avoid the scheduler's usage-read feedback loop.
 func runPing(_ args: [String]) async {
@@ -377,8 +372,15 @@ func runPing(_ args: [String]) async {
     guard let id else { fail("usage: am ping <id> [--method terminal|headless|sdk]") }
     let methodOverride: PingMethod? = {
         guard args.contains("--method") else { return nil }
-        guard let raw = value("--method", in: args), let method = PingMethod(rawValue: raw) else {
-            fail("--method must be one of: terminal, headless, sdk")
+        // `routine` is deliberately not accepted: it schedules a claude.ai
+        // one-shot for a future minute, so there is no turn for this command to
+        // run now. Substituting terminal silently would be a lie about which
+        // method was tested.
+        guard let raw = value("--method", in: args),
+              let method = PingMethod(rawValue: raw), method != .routine
+        else {
+            fail("--method must be one of: terminal, headless, sdk"
+                + " (routine is the scheduled cloud method — pick it in Preferences → Ping method)")
         }
         return method
     }()
@@ -410,7 +412,7 @@ func runPing(_ args: [String]) async {
                 ActivityRecord(time: now, accountID: id, ok: true, anchored: false, detail: detail))
             print("⏭️  [\(id)] \(detail)")
             // A distinct code (not 0): the daemon must not read a skip as an
-            // anchored window when deciding whether to re-arm the cloud fallback.
+            // anchored window when scheduling this account's later fires.
             exit(PingOutcome.skippedStaleExitCode)
         }
     }
@@ -577,6 +579,8 @@ func runScheduler(_ args: [String]) async {
 
 func printSchedulerStatus() {
     let status = Scheduler(workspace: workspace).status()
+    let prefs = PreferencesStore(workspace: workspace).load()
+    let clockStyle = prefs.clockStyle
     let now = Date()
 
     let agent: String
@@ -596,7 +600,6 @@ func printSchedulerStatus() {
     if upcoming.isEmpty {
         print("next:   —")
     } else {
-        let clockStyle = PreferencesStore(workspace: workspace).load().clockStyle
         for entry in upcoming.prefix(8) {
             // A shifted entry shows its nominal slot too: "deferred" means the
             // planned minute sits inside a still-open window, so the fire
@@ -608,75 +611,41 @@ func printSchedulerStatus() {
     for account in status.accounts {
         print("plan:   \(account.accountID)  \(account.pingsPerWeek) pings/wk\(account.scheduled ? "" : "  (inactive)")")
     }
+    printCloudRoutineStatus(prefs: prefs)
 }
 
-// MARK: - cloud (the experimental cloud-fallback controls)
-
-/// `am cloud status|enable|disable` — undocumented controls for the
-/// experimental cloud fallback (Claude only): a claude.ai routine
-/// ("AgentManager Routine") kept armed as a one-shot five minutes after each
-/// scheduled ping, so a Mac that sleeps through a ping (closed lid on battery,
-/// where RTC wakes are firmware-blocked) still gets its window anchored — from
-/// Anthropic's cloud. `primary enable` flips that around: the routine becomes
-/// the *only* anchor for Claude accounts (armed at each planned slot, no local
-/// Claude pings), for a Mac too unreliable to ping locally; Codex is
-/// unaffected. enable/disable/primary just write `cloud-fallback.json`; the
-/// resident scheduler daemon does all the arming/disabling on its next tick.
-func runCloud(_ args: [String]) {
-    switch args.first {
-    case "enable", "disable":
-        let on = args.first == "enable"
-        do {
-            // Load-modify-save so we never clobber the `cloudPrimary` bit.
-            var config = CloudFallbackConfigStore(workspace: workspace).load()
-            config.enabled = on
-            try CloudFallbackConfigStore(workspace: workspace).save(config)
-        } catch { fail("could not write cloud-fallback.json: \(error)") }
-        AuditLog(workspace: workspace).append(
-            accountID: nil, action: on ? "cloud.enable" : "cloud.disable", ok: true, detail: "via am cloud")
-        print(on
-            ? "cloud fallback on — the scheduler daemon arms claude.ai anchor routines on its next tick"
-            : "cloud fallback off — armed routines are disabled on the daemon's next tick")
-    case "primary":
-        guard let sub = args.dropFirst().first, sub == "enable" || sub == "disable" else {
-            fail("usage: am cloud primary enable | disable")
+/// The cloud-routine tail of `am scheduler status`: what the daemon has armed on
+/// claude.ai, straight from `cloud-fallback-state.json` — the same state the
+/// app's Monitoring row shows, for a terminal with no app in front of it.
+///
+/// Printed while Claude's method *is* the routine, and also while a routine
+/// still exists to report on: switching back to a local method leaves an armed
+/// one-shot behind until the daemon's next tick disables it, and that interval
+/// is exactly when someone asks what's still out there.
+func printCloudRoutineStatus(prefs: Preferences) {
+    let state = CloudFallbackStateStore(workspace: workspace).load()
+    let on = prefs.claudePingMethod.usesCloudRoutine
+    guard on || !state.accounts.isEmpty else { return }
+    print("cloud:  claude method \(prefs.claudePingMethod.rawValue) — "
+        + (on
+            ? "the daemon arms a one-shot at each Claude slot; no local Claude pings"
+            : "any armed routine is disabled on the daemon's next tick"))
+    // Reached only with the method on: nothing tracked yet is a real answer
+    // (the engine arms per account, once the plan has a Claude fire to aim at),
+    // not the same as having no routine rows to show.
+    guard !state.accounts.isEmpty else {
+        print("cloud:  nothing armed yet — the daemon arms one on its next tick, once a plan exists")
+        return
+    }
+    for (id, account) in state.accounts.sorted(by: { $0.key < $1.key }) {
+        var bits: [String] = [account.triggerID ?? "no routine"]
+        if account.disabled {
+            bits.append("disabled")
+        } else if let at = account.armedFor {
+            bits.append("armed for \(prefs.clockStyle.dayTimeString(at))")
         }
-        let on = sub == "enable"
-        do {
-            var config = CloudFallbackConfigStore(workspace: workspace).load()
-            config.cloudPrimary = on
-            try CloudFallbackConfigStore(workspace: workspace).save(config)
-        } catch { fail("could not write cloud-fallback.json: \(error)") }
-        AuditLog(workspace: workspace).append(
-            accountID: nil, action: on ? "cloud.primary.enable" : "cloud.primary.disable",
-            ok: true, detail: "via am cloud")
-        print(on
-            ? "cloud-primary on — Claude accounts are anchored only by their routine (armed at each planned slot; no local pings). Needs cloud fallback enabled."
-            : "cloud-primary off — routines revert to fallback (armed after each local ping)")
-    case "status", nil:
-        let config = CloudFallbackConfigStore(workspace: workspace).load()
-        let state = CloudFallbackStateStore(workspace: workspace).load()
-        let clock = PreferencesStore(workspace: workspace).load().clockStyle
-        print("cloud fallback: \(config.enabled ? "enabled" : "disabled")")
-        if config.enabled {
-            print("mode:           \(config.cloudPrimary ? "primary (routines only — no local Claude pings)" : "fallback (routines cover missed pings)")")
-        }
-        if state.accounts.isEmpty {
-            print("routines:       none tracked yet (the daemon arms them on its next tick after a plan exists)")
-        } else {
-            for (id, s) in state.accounts.sorted(by: { $0.key < $1.key }) {
-                var bits: [String] = [s.triggerID ?? "no routine"]
-                if s.disabled {
-                    bits.append("disabled")
-                } else if let at = s.armedFor {
-                    bits.append("armed for \(clock.dayTimeString(at))")
-                }
-                if let err = s.lastError { bits.append("error: \(err)") }
-                print("  \(id): \(bits.joined(separator: " · "))")
-            }
-        }
-    default:
-        fail("usage: am cloud status | enable | disable | primary enable|disable")
+        if let error = account.lastError { bits.append("error: \(error)") }
+        print("cloud:  \(id)  \(bits.joined(separator: " · "))")
     }
 }
 

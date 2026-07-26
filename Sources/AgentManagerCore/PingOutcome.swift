@@ -3,11 +3,11 @@ import Foundation
 /// What actually happened to one scheduled ping child, as observed by the
 /// scheduler daemon from the child's exit code.
 ///
-/// Why this exists: the cloud-fallback re-arm decision must key on *"did a
+/// Why this exists: every scheduling decision downstream keys on *"did a
 /// window actually anchor"*, and exit code 0 alone can't say that — a child
-/// that skips a stale ping also exits successfully. So `am ping` reports the
-/// each outcome as a distinct code (an internal daemon↔child contract;
-/// launchd never inspects them), and the daemon maps them back here.
+/// that skips a stale ping also exits successfully. So `am ping` reports each
+/// outcome as a distinct code (an internal daemon↔child contract; launchd
+/// never inspects them), and the daemon maps them back here.
 public enum PingOutcome: String, Sendable, Equatable {
     /// The selected method completed a turn and the account's 5h window
     /// verifiably anchored.
@@ -22,7 +22,7 @@ public enum PingOutcome: String, Sendable, Equatable {
     case deferredOpenWindow
     /// A turn ran, but whether the window advanced could not be verified
     /// (usage unavailable). Schedule around the best available window
-    /// evidence, but never treat it as an anchor for cloud-fallback purposes.
+    /// evidence, but never report it as an anchor.
     case anchorUnknown
     /// The child wedged and the daemon had to kill it; whether the turn
     /// dispatched first is unknown, so treat it as *not* anchored.

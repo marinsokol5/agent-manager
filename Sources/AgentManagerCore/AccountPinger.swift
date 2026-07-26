@@ -76,14 +76,20 @@ public struct AccountPinger {
         // for SDK/headless experiments, make the comparison meaningless.
         for key in account.provider.apiKeyEnvironmentKeys { environment.removeValue(forKey: key) }
         let binary = ChildEnvironment.binary(for: account.provider, environment: environment)
-        let method = methodOverride
+        // `.localDriver` is what makes `routine` safe to store as a ping
+        // method: it schedules a cloud run, so it can't *deliver* a turn here.
+        // Anything that reaches this runner has to run on this Mac now — a
+        // Test ping, a hand-run `am ping` — so it falls back to the verified
+        // terminal driver rather than doing nothing. (The scheduler never gets
+        // here for such an account: the daemon skips its local fires entirely.)
+        let method = (methodOverride
             ?? PreferencesStore(workspace: workspace, fileManager: fileManager).load()
-                .pingMethod(for: account.provider)
+                .pingMethod(for: account.provider)).localDriver
 
         audit.append(accountID: id, action: "ping.start", ok: true, detail: method.rawValue)
         let rawResult: ClaudePingRunner.Result
         switch method {
-        case .terminal:
+        case .terminal, .routine: // `.routine` is unreachable — `localDriver` mapped it away
             switch account.provider {
             case .claude:
                 rawResult = ClaudePingRunner.run(

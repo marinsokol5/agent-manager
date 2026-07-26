@@ -108,15 +108,10 @@ public struct Workspace: Sendable {
     /// helper has no other input surface.
     public var wakeConfigFile: URL { root.appendingPathComponent("wake.json") }
 
-    /// `cloud-fallback.json` — the experimental "cloud fallback" opt-in (Claude
-    /// only): keep a claude.ai routine armed as a dead-man's switch so a ping
-    /// the sleeping Mac misses is anchored from Anthropic's cloud instead.
-    /// Written by the app toggle / `am cloud enable|disable`; read by the daemon.
-    public var cloudFallbackConfigFile: URL { root.appendingPathComponent("cloud-fallback.json") }
-
     /// `cloud-fallback-state.json` — which routine is armed per account and for
     /// when. Written only by the scheduler daemon's engine (single writer);
-    /// read by the app's Monitoring row and `am cloud status`.
+    /// read by the app's Monitoring row, the Preferences caption under the
+    /// `routine` ping method, and `am scheduler status`.
     public var cloudFallbackStateFile: URL { root.appendingPathComponent("cloud-fallback-state.json") }
 
     /// `scheduler.lock` — flock()ed by the running daemon so a hand-run

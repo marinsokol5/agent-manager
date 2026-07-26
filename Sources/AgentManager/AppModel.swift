@@ -110,15 +110,31 @@ final class AppModel {
         }
     }
 
-    /// Provider-wide ping delivery preferences. Every ping process reloads the
-    /// file at invocation time, so these take effect immediately for Test ping
-    /// and future scheduler children without touching the launchd agent.
+    /// Provider-wide anchoring preferences. Every ping process reloads the file
+    /// at invocation time, and the scheduler daemon re-reads it on its next
+    /// tick, so these take effect immediately for Test ping, future scheduler
+    /// children, *and* cloud-routine arming — without touching the launchd
+    /// agent.
     var claudePingMethod: PingMethod = .terminal {
         didSet {
             guard claudePingMethod != oldValue else { return }
             var prefs = preferencesStore.load()
             prefs.claudePingMethod = claudePingMethod
             preferencesStore.save(prefs)
+            // Crossing into (or out of) `routine` changes what anchors every
+            // scheduled Claude slot and makes the daemon arm/disable real
+            // claude.ai routines — the runbook needs that moment on the record,
+            // and the routine caption needs a fresh read of the state file.
+            if claudePingMethod.usesCloudRoutine != oldValue.usesCloudRoutine {
+                let on = claudePingMethod.usesCloudRoutine
+                AuditLog(workspace: workspace).append(
+                    accountID: nil, action: on ? "cloud.enable" : "cloud.disable",
+                    ok: true, detail: "via Claude ping method")
+                statusMessage = on
+                    ? "Claude cloud routine on — routines arm on the daemon's next tick"
+                    : "Claude cloud routine off — routines are disabled on the daemon's next tick"
+                refreshMonitoring()
+            }
         }
     }
 
@@ -258,15 +274,11 @@ final class AppModel {
     /// The self-heal is attempted at most once per app run: if re-registering
     /// doesn't fix the spawn failure, retrying in a loop won't either.
     var wakeHealAttempted = false
-    /// The experimental Claude cloud-routine opt-in switch (mirrors
-    /// `cloud-fallback.json`), flipped optimistically by
-    /// `setCloudFallbackEnabled` and reconciled on refresh.
-    var cloudFallbackEnabled = false
-    /// The Fallback / Routines only (cloud-primary) mode (`cloudPrimary` in
-    /// `cloud-fallback.json`), changed optimistically by
-    /// `setCloudPrimaryEnabled` and reconciled on refresh. Only meaningful when
-    /// `cloudFallbackEnabled`.
-    var cloudPrimaryEnabled = false
+    /// Whether scheduled Claude slots are anchored by claude.ai routines rather
+    /// than local pings — i.e. Claude's ping method *is* the cloud routine.
+    /// Derived, never stored twice: the preference is the single source of
+    /// truth the daemon reads too.
+    var claudeCloudRoutineEnabled: Bool { claudePingMethod.usesCloudRoutine }
     /// Per-account cloud routine state (`cloud-fallback-state.json`, written by
     /// the daemon's engine) for the Monitoring row and the Preferences caption.
     /// nil = not read yet.

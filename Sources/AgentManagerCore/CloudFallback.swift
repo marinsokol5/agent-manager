@@ -1,99 +1,30 @@
 import Foundation
 
-// The two on-disk files behind the experimental "cloud fallback" feature
-// (Claude only): a claude.ai routine — a scheduled cloud agent Anthropic runs —
-// armed as a dead-man's switch five minutes after each scheduled local ping.
-// A successful local ping re-arms the routine forward, so the cloud runs *only*
-// when the Mac provably couldn't ping (asleep on battery with the lid closed,
-// where RTC wakes are firmware-blocked). See `CloudFallbackPlanner` for the
-// decision rules and `CloudFallbackEngine` for the API side.
+// The runtime state behind the cloud anchor routine (Claude only): a claude.ai
+// routine — a scheduled cloud agent Anthropic runs — armed as a one-shot at
+// each scheduled Claude fire, so the window anchors whether or not this Mac is
+// awake for the minute. See `CloudFallbackPlanner` for the decision rules and
+// `CloudFallbackEngine` for the API side.
 //
-// Same split as `scheduler.json` / `scheduler-status.json`:
-// - `cloud-fallback.json` is the operator's *intent* (the Preferences toggle),
-//   written by the app / `am cloud enable|disable`, read by the daemon each tick.
-// - `cloud-fallback-state.json` is the daemon's *runtime state* (which routine
-//   is armed per account, for when) — written only by the daemon's engine, so
-//   the two writers never race one file.
-
-/// `cloud-fallback.json` — should the daemon keep cloud anchor routines armed?
-public struct CloudFallbackConfig: Codable, Sendable, Equatable {
-    public static let currentVersion = 1
-
-    public var version: Int
-    public var enabled: Bool
-    /// Promote the claude.ai routine from a dead-man's-switch *backstop* to the
-    /// *only* anchor for Claude accounts: the daemon arms it at each planned
-    /// fire (no `+lead`) and never spawns a local Claude ping — the reverse of
-    /// the fallback default, for a Mac that can't be trusted to ping reliably
-    /// (chronic sleep races). Codex accounts are unaffected (they have no cloud
-    /// routine and keep pinging locally). Meaningless unless `enabled` — a
-    /// fallback you don't run can't be the primary. Off by default.
-    public var cloudPrimary: Bool
-
-    public init(
-        version: Int = CloudFallbackConfig.currentVersion,
-        enabled: Bool = false,
-        cloudPrimary: Bool = false)
-    {
-        self.version = version
-        self.enabled = enabled
-        self.cloudPrimary = cloudPrimary
-    }
-
-    private enum CodingKeys: String, CodingKey { case version, enabled, cloudPrimary }
-
-    /// Forgiving decode so a `cloud-fallback.json` written before `cloudPrimary`
-    /// existed still loads (and keeps `enabled` on) instead of failing the
-    /// whole file and silently reverting to disabled on upgrade.
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? CloudFallbackConfig.currentVersion
-        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        cloudPrimary = try c.decodeIfPresent(Bool.self, forKey: .cloudPrimary) ?? false
-    }
-}
-
-/// Reads/writes `cloud-fallback.json`. Forgiving load (missing/corrupt →
-/// disabled — never arm cloud runs on state we can't read), atomic save.
-public struct CloudFallbackConfigStore {
-    let fileURL: URL
-    let fileManager: FileManager
-
-    public init(fileURL: URL, fileManager: FileManager = .default) {
-        self.fileURL = fileURL
-        self.fileManager = fileManager
-    }
-
-    public init(workspace: Workspace, fileManager: FileManager = .default) {
-        self.init(fileURL: workspace.cloudFallbackConfigFile, fileManager: fileManager)
-    }
-
-    public func load() -> CloudFallbackConfig {
-        guard fileManager.fileExists(atPath: fileURL.path),
-              let data = try? Data(contentsOf: fileURL),
-              let config = try? JSONDecoder().decode(CloudFallbackConfig.self, from: data)
-        else { return CloudFallbackConfig() }
-        return config
-    }
-
-    public func save(_ config: CloudFallbackConfig) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(config)
-        let dir = fileURL.deletingLastPathComponent()
-        if !fileManager.fileExists(atPath: dir.path) {
-            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-        try data.write(to: fileURL, options: [.atomic])
-    }
-}
+// *Whether* to arm one is not stored here: it's Claude's `PingMethod.routine`
+// in `preferences.json`, the same file the ping children read, so app, CLI and
+// daemon can never disagree about what anchors an account. This file is the
+// daemon's *runtime state* (which routine is armed per account, for when) —
+// written only by the daemon's engine, so the app/CLI never race it. Same split
+// as `scheduler.json` / `scheduler-status.json`.
+//
+// The `CloudFallback…` names (and the state file's) are historical: the feature
+// began as a dead-man's *fallback* armed behind a local ping. That mode is
+// retired — the routine is now one of the ping methods rather than a backstop
+// for another one — but the names stayed put so an armed routine survives the
+// upgrade instead of being orphaned by a renamed state file.
 
 /// One account's slice of `cloud-fallback-state.json`.
 ///
-/// `armedFor` is the routine's `run_once_at` — always "some local fire + the
-/// planner's lead", and always a **one-shot**: the worst a forgotten routine
-/// can ever do (app uninstalled, account removed) is fire once and
-/// auto-disable server-side. No field here is a secret.
+/// `armedFor` is the routine's `run_once_at` — always a planned fire, and
+/// always a **one-shot**: the worst a forgotten routine can ever do (app
+/// uninstalled, account removed) is fire once and auto-disable server-side.
+/// No field here is a secret.
 public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
     /// The claude.ai routine (`trig_…`) this account owns, created lazily on
     /// first arm and reused (re-armed) forever after. `nil` until then, or
@@ -104,7 +35,7 @@ public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
     public var environmentID: String?
     /// When the armed one-shot fires (UTC). `nil` = nothing armed.
     public var armedFor: Date?
-    /// The routine is known to be `enabled: false` (feature/scheduler off).
+    /// The routine is known to be `enabled: false` (method/scheduler off).
     public var disabled: Bool
     /// Last API/keychain problem, for the Monitoring row + retry backoff.
     /// Cleared on the next successful sync.

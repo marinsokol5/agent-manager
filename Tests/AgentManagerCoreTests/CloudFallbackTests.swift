@@ -1,9 +1,9 @@
 import XCTest
 @testable import AgentManagerCore
 
-/// The experimental cloud fallback, end to end minus the network: the two
-/// stores, the planner's dead-man state machine, the wire decoders (fed the
-/// real captured JSON shapes), and the engine run against a recording fake API.
+/// The cloud anchor routine, end to end minus the network: the state store, the
+/// planner's convergence rules, the wire decoders (fed the real captured JSON
+/// shapes), and the engine run against a recording fake API.
 final class CloudFallbackTests: XCTestCase {
     var tmp: URL!
     let fm = FileManager.default
@@ -30,39 +30,6 @@ final class CloudFallbackTests: XCTestCase {
     }
 
     // MARK: - Stores
-
-    func testConfigStoreRoundTripsAndFailsSafe() throws {
-        let ws = makeWorkspace()
-        let store = CloudFallbackConfigStore(workspace: ws)
-        XCTAssertFalse(store.load().enabled) // missing file → disabled
-
-        try store.save(CloudFallbackConfig(enabled: true))
-        XCTAssertTrue(store.load().enabled)
-
-        try Data("not json".utf8).write(to: ws.cloudFallbackConfigFile)
-        XCTAssertFalse(store.load().enabled) // corrupt → disabled, never throws
-    }
-
-    func testConfigRoundTripsCloudPrimary() throws {
-        let ws = makeWorkspace()
-        let store = CloudFallbackConfigStore(workspace: ws)
-        try store.save(CloudFallbackConfig(enabled: true, cloudPrimary: true))
-        let loaded = store.load()
-        XCTAssertTrue(loaded.enabled)
-        XCTAssertTrue(loaded.cloudPrimary)
-    }
-
-    func testConfigDecodesMissingCloudPrimaryToFalseKeepingEnabled() throws {
-        // A `cloud-fallback.json` written before `cloudPrimary` existed must
-        // still load with `enabled` intact — decoding must not fail the whole
-        // file (which would silently revert an upgrading user to disabled).
-        let ws = makeWorkspace()
-        try fm.createDirectory(at: ws.root, withIntermediateDirectories: true)
-        try Data(#"{"version": 1, "enabled": true}"#.utf8).write(to: ws.cloudFallbackConfigFile)
-        let loaded = CloudFallbackConfigStore(workspace: ws).load()
-        XCTAssertTrue(loaded.enabled)
-        XCTAssertFalse(loaded.cloudPrimary)
-    }
 
     func testStateStoreRoundTripsWithWholeSecondDates() throws {
         let ws = makeWorkspace()
@@ -92,21 +59,33 @@ final class CloudFallbackTests: XCTestCase {
         XCTAssertNil(state.accounts["a1"]?.armedFor)
     }
 
+    func testCodexCanNeverHoldTheRoutineMethod() throws {
+        // Only Claude has routines; a hand-edited file that says otherwise must
+        // not reach the daemon as "never ping this account".
+        let ws = makeWorkspace()
+        try fm.createDirectory(at: ws.root, withIntermediateDirectories: true)
+        try Data(#"{"claudePingMethod":"routine","codexPingMethod":"routine"}"#.utf8)
+            .write(to: ws.preferencesFile)
+        let prefs = PreferencesStore(workspace: ws).load()
+        XCTAssertEqual(prefs.claudePingMethod, .routine)
+        XCTAssertEqual(prefs.codexPingMethod, .terminal)
+    }
+
     // MARK: - Planner
 
-    func testPlannerArmsFirstTime() {
+    func testPlannerArmsAtTheExactPlannedFire() {
+        // The routine *is* the anchor, so it arms at the planned minute itself.
         let fire = date(2026, 7, 6, 5, 0)
         let action = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(),
-            nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(action, .arm(fire.addingTimeInterval(300)))
+            state: AccountCloudFallbackState(), nextFireAt: fire, now: date(2026, 7, 6, 4, 0))
+        XCTAssertEqual(action, .arm(fire))
     }
 
     func testPlannerIsIdempotentWhenConverged() {
         let fire = date(2026, 7, 6, 5, 0)
-        let state = AccountCloudFallbackState(triggerID: "t", armedFor: fire.addingTimeInterval(300))
+        let state = AccountCloudFallbackState(triggerID: "t", armedFor: fire)
         let action = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
+            state: state, nextFireAt: fire, now: date(2026, 7, 6, 4, 0))
         XCTAssertEqual(action, .none)
     }
 
@@ -120,100 +99,63 @@ final class CloudFallbackTests: XCTestCase {
 
         // First arm: target is floored, so it's a clean whole second.
         let armed = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(),
-            nextFireAt: jittery, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(armed, .arm(date(2026, 7, 6, 5, 5))) // (05:00:00.169 + 5m) floored → 05:05:00
+            state: AccountCloudFallbackState(), nextFireAt: jittery, now: date(2026, 7, 6, 4, 0))
+        XCTAssertEqual(armed, .arm(date(2026, 7, 6, 5, 0)))
 
         // Whole-second `armedFor` (what the store reloads) vs. the still-jittery
         // fire: must converge, not re-arm.
         let converged = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 5)),
-            nextFireAt: jittery, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
+            state: AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 0)),
+            nextFireAt: jittery, now: date(2026, 7, 6, 4, 0))
         XCTAssertEqual(converged, .none)
     }
 
-    func testPlannerWithZeroLeadArmsAtTheExactPlannedFire() {
-        // Cloud-primary mode: the routine *is* the anchor, so it arms at the
-        // planned minute itself, not 5 minutes later.
+    func testPlannerHoldsAPassedOneShotUntilItsFireLeavesTheQueue() {
+        // 05:00's one-shot has fired but the daemon hasn't reconciled it yet,
+        // so 05:00 is still the next planned fire. Nothing may move until that
+        // run is accounted for — otherwise the routine jumps ahead of a fire
+        // the daemon still believes is pending.
         let fire = date(2026, 7, 6, 5, 0)
-        let armed = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(),
-            nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0), lead: 0)
-        XCTAssertEqual(armed, .arm(fire))
-
-        // And it converges at that exact time (no perpetual re-arm).
-        let converged = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(triggerID: "t", armedFor: fire),
-            nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0), lead: 0)
-        XCTAssertEqual(converged, .none)
-    }
-
-    func testPlannerAdvancesAfterAnchoredLocalPing() {
-        // 05:00 fired and anchored; the queue moved on to 10:00 — the pending
-        // 05:05 backstop must be re-armed forward (cancelled) right away.
-        let fired = date(2026, 7, 6, 5, 0)
-        let next = date(2026, 7, 6, 10, 0)
-        let state = AccountCloudFallbackState(triggerID: "t", armedFor: fired.addingTimeInterval(300))
-        let action = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: next, lastAnchoredFireAt: fired, now: date(2026, 7, 6, 5, 1))
-        XCTAssertEqual(action, .arm(next.addingTimeInterval(300)))
-    }
-
-    func testPlannerHoldsBackstopWhileLocalOutcomeUnresolved() {
-        // 05:00's local ping did NOT anchor (failed, or a restart lost the
-        // outcome). Until 05:05 passes, the backstop must not move forward.
-        let fired = date(2026, 7, 6, 5, 0)
-        let next = date(2026, 7, 6, 10, 0)
-        let state = AccountCloudFallbackState(triggerID: "t", armedFor: fired.addingTimeInterval(300))
-        let held = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: next, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 5, 1))
-        XCTAssertEqual(held, .none)
-
-        // Once the armed moment passed, the cloud ran it — advance.
-        let advanced = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: next, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 5, 6))
-        XCTAssertEqual(advanced, .arm(next.addingTimeInterval(300)))
-    }
-
-    func testPlannerMovesEarlierOnRepaint() {
-        let state = AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 10, 5))
-        let action = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: date(2026, 7, 6, 7, 0),
-            lastAnchoredFireAt: nil, now: date(2026, 7, 6, 6, 0))
-        XCTAssertEqual(action, .arm(date(2026, 7, 6, 7, 5)))
-    }
-
-    func testPlannerFollowsRepaintThatMovedTheFireLater() {
-        // Armed 05:05 backing a 05:00 fire that a repaint just pushed to
-        // 08:00. The covered fire is still in the future yet no longer
-        // planned, so it can never resolve — the backstop follows the plan
-        // instead of guaranteeing a pointless cloud run at 05:05.
-        let state = AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 5))
-        let action = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: date(2026, 7, 6, 8, 0),
-            lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(action, .arm(date(2026, 7, 6, 8, 5)))
-
-        // Same shape, but the covered fire's moment already passed with no
-        // anchor observed — that's the failed-ping dead-man case: hold.
-        let held = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: date(2026, 7, 6, 8, 0),
-            lastAnchoredFireAt: nil, now: date(2026, 7, 6, 5, 1))
-        XCTAssertEqual(held, .none)
-    }
-
-    func testPlannerDisablesWhenNothingToBackUp() {
-        let armed = AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 5))
+        let state = AccountCloudFallbackState(triggerID: "t", armedFor: fire)
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: armed, nextFireAt: nil, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)),
+            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, now: date(2026, 7, 6, 5, 1)),
+            .none)
+
+        // Reconciled: the queue moved on, so the routine follows it.
+        let next = date(2026, 7, 6, 10, 0)
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(state: state, nextFireAt: next, now: date(2026, 7, 6, 5, 1)),
+            .arm(next))
+    }
+
+    func testPlannerFollowsRepaintsInBothDirections() {
+        let state = AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 10, 0))
+        // Pulled earlier.
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: state, nextFireAt: date(2026, 7, 6, 7, 0), now: date(2026, 7, 6, 6, 0)),
+            .arm(date(2026, 7, 6, 7, 0)))
+        // Pushed later — the armed moment is still in the future, so no run was
+        // stranded by moving it.
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: state, nextFireAt: date(2026, 7, 6, 13, 0), now: date(2026, 7, 6, 6, 0)),
+            .arm(date(2026, 7, 6, 13, 0)))
+    }
+
+    func testPlannerDisablesWhenThereIsNothingToAnchor() {
+        let armed = AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 0))
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(state: armed, nextFireAt: nil, now: date(2026, 7, 6, 4, 0)),
             .disable)
-        // Nothing live → nothing to do (steady state while the feature is off).
+        // Nothing live → nothing to do (steady state while the method is off).
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: AccountCloudFallbackState(), nextFireAt: nil, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)),
+            CloudFallbackPlanner.plan(
+                state: AccountCloudFallbackState(), nextFireAt: nil, now: date(2026, 7, 6, 4, 0)),
             .none)
         let disabled = AccountCloudFallbackState(triggerID: "t", disabled: true)
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: disabled, nextFireAt: nil, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)),
+            CloudFallbackPlanner.plan(state: disabled, nextFireAt: nil, now: date(2026, 7, 6, 4, 0)),
             .none)
     }
 
@@ -221,8 +163,8 @@ final class CloudFallbackTests: XCTestCase {
         let fire = date(2026, 7, 6, 5, 0)
         let state = AccountCloudFallbackState(triggerID: "t", disabled: true)
         let action = CloudFallbackPlanner.plan(
-            state: state, nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(action, .arm(fire.addingTimeInterval(300)))
+            state: state, nextFireAt: fire, now: date(2026, 7, 6, 4, 0))
+        XCTAssertEqual(action, .arm(fire))
     }
 
     func testPlannerBacksOffAfterError() {
@@ -231,32 +173,11 @@ final class CloudFallbackTests: XCTestCase {
         state.lastError = "boom"
         state.lastErrorAt = date(2026, 7, 6, 4, 0)
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 2)),
+            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, now: date(2026, 7, 6, 4, 2)),
             .none)
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 6)),
-            .arm(fire.addingTimeInterval(300)))
-    }
-
-    func testIsCovered() {
-        let fire = date(2026, 7, 6, 5, 0)
-        let armed = AccountCloudFallbackState(triggerID: "t", armedFor: fire.addingTimeInterval(300))
-
-        // The backstop moment passed → the cloud ran it.
-        XCTAssertTrue(CloudFallbackPlanner.isCovered(fireAt: fire, state: armed, now: date(2026, 7, 6, 5, 6)))
-        // Not yet — the local ping should still run.
-        XCTAssertFalse(CloudFallbackPlanner.isCovered(fireAt: fire, state: armed, now: date(2026, 7, 6, 5, 1)))
-        // Armed for a *different* fire.
-        XCTAssertFalse(CloudFallbackPlanner.isCovered(fireAt: date(2026, 7, 6, 10, 0), state: armed, now: date(2026, 7, 6, 10, 1)))
-
-        // A sync error means we can't trust `armedFor` — never skip on it.
-        var errored = armed
-        errored.lastError = "boom"
-        XCTAssertFalse(CloudFallbackPlanner.isCovered(fireAt: fire, state: errored, now: date(2026, 7, 6, 5, 6)))
-
-        var disabled = armed
-        disabled.disabled = true
-        XCTAssertFalse(CloudFallbackPlanner.isCovered(fireAt: fire, state: disabled, now: date(2026, 7, 6, 5, 6)))
+            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, now: date(2026, 7, 6, 4, 6)),
+            .arm(fire))
     }
 
     // MARK: - Wire decoders (shapes captured live 2026-07-04)
@@ -369,7 +290,7 @@ final class CloudFallbackTests: XCTestCase {
         let fire = date(2026, 7, 6, 5, 0)
 
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+            accountID: "a1", nextFireAt: fire, now: date(2026, 7, 6, 4, 0)))
 
         // Nothing pinned locally → list first (adopt-or-create), find nothing
         // of ours, then discover/create the environment and create.
@@ -379,7 +300,7 @@ final class CloudFallbackTests: XCTestCase {
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_new")
         XCTAssertEqual(state?.environmentID, "env_new")
-        XCTAssertEqual(state?.armedFor, fire.addingTimeInterval(300))
+        XCTAssertEqual(state?.armedFor, fire)
         XCTAssertNil(state?.lastError)
     }
 
@@ -392,18 +313,18 @@ final class CloudFallbackTests: XCTestCase {
         // Existing routine armed for 05:05; 05:00 anchored locally → advance to 10:05.
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 5))
+            triggerID: "trig_1", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            lastAnchoredFireAt: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
+            now: date(2026, 7, 6, 5, 1)))
 
         XCTAssertEqual(api.calls, ["update"]) // cached env, no create
         XCTAssertEqual(api.patches.first?.id, "trig_1")
-        XCTAssertEqual(api.patches.first?.patch.runOnceAt, date(2026, 7, 6, 10, 5))
+        XCTAssertEqual(api.patches.first?.patch.runOnceAt, date(2026, 7, 6, 10, 0))
         XCTAssertEqual(api.patches.first?.patch.enabled, true)
-        XCTAssertEqual(CloudFallbackStateStore(workspace: ws).load().accounts["a1"]?.armedFor, date(2026, 7, 6, 10, 5))
+        XCTAssertEqual(CloudFallbackStateStore(workspace: ws).load().accounts["a1"]?.armedFor, date(2026, 7, 6, 10, 0))
     }
 
     func testEngineRecreatesWhenRoutineDeletedOnWeb() async throws {
@@ -414,18 +335,18 @@ final class CloudFallbackTests: XCTestCase {
 
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 5))
+            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            lastAnchoredFireAt: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
+            now: date(2026, 7, 6, 5, 1)))
 
         // 404 → look for an adoptable sibling first; none → create.
         XCTAssertEqual(api.calls, ["updateFail", "list", "create"])
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_new")
-        XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 5))
+        XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 0))
         XCTAssertNil(state?.lastError)
     }
 
@@ -444,15 +365,15 @@ final class CloudFallbackTests: XCTestCase {
         let fire = date(2026, 7, 6, 5, 0)
 
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+            accountID: "a1", nextFireAt: fire, now: date(2026, 7, 6, 4, 0)))
 
         XCTAssertEqual(api.calls, ["list", "update"]) // no create, no env discovery
         XCTAssertEqual(api.patches.first?.id, "trig_old")
-        XCTAssertEqual(api.patches.first?.patch.runOnceAt, fire.addingTimeInterval(300))
+        XCTAssertEqual(api.patches.first?.patch.runOnceAt, fire)
         XCTAssertEqual(api.patches.first?.patch.enabled, true)
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_old")
-        XCTAssertEqual(state?.armedFor, fire.addingTimeInterval(300))
+        XCTAssertEqual(state?.armedFor, fire)
         XCTAssertNil(state?.lastError)
     }
 
@@ -471,7 +392,7 @@ final class CloudFallbackTests: XCTestCase {
         let fire = date(2026, 7, 6, 5, 0)
 
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: fire, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+            accountID: "a1", nextFireAt: fire, now: date(2026, 7, 6, 4, 0)))
 
         XCTAssertEqual(api.calls, ["list", "update", "update"])
         XCTAssertEqual(api.patches[0].id, "trig_live")
@@ -493,33 +414,33 @@ final class CloudFallbackTests: XCTestCase {
 
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 5))
+            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            lastAnchoredFireAt: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
+            now: date(2026, 7, 6, 5, 1)))
 
         XCTAssertEqual(api.calls, ["updateFail", "list", "update"])
         XCTAssertEqual(api.patches.first?.id, "trig_sibling")
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_sibling")
-        XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 5))
+        XCTAssertEqual(state?.armedFor, date(2026, 7, 6, 10, 0))
         XCTAssertNil(state?.lastError)
     }
 
-    func testEngineDisablesWhenNothingToBackUp() async throws {
+    func testEngineDisablesWhenNothingToAnchor() async throws {
         let ws = makeWorkspace()
         let api = FakeAPI()
         let engine = try makeEngine(ws, api: api)
 
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 5))
+            triggerID: "trig_1", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: nil, lastAnchoredFireAt: nil, now: date(2026, 7, 6, 4, 0)))
+            accountID: "a1", nextFireAt: nil, now: date(2026, 7, 6, 4, 0)))
 
         XCTAssertEqual(api.calls, ["update"])
         XCTAssertEqual(api.patches.first?.patch.enabled, false)
@@ -543,7 +464,7 @@ final class CloudFallbackTests: XCTestCase {
 
         let now = date(2026, 7, 6, 4, 0)
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: date(2026, 7, 6, 5, 0), lastAnchoredFireAt: nil, now: now))
+            accountID: "a1", nextFireAt: date(2026, 7, 6, 5, 0), now: now))
 
         XCTAssertTrue(api.calls.isEmpty)
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
@@ -552,7 +473,7 @@ final class CloudFallbackTests: XCTestCase {
 
         // Within the backoff window the planner holds — no second attempt.
         await engine.sync(CloudFallbackSyncRequest(
-            accountID: "a1", nextFireAt: date(2026, 7, 6, 5, 0), lastAnchoredFireAt: nil,
+            accountID: "a1", nextFireAt: date(2026, 7, 6, 5, 0),
             now: now.addingTimeInterval(60)))
         XCTAssertTrue(api.calls.isEmpty)
     }

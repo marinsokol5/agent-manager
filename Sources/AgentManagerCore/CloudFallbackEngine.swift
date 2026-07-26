@@ -1,31 +1,22 @@
 import Foundation
 
-/// One sync request from the scheduler daemon: "this account's next local fire
-/// is at `nextFireAt` (nil = nothing to back up — disable); the most recent
-/// local fire whose old backstop is resolved was `lastAnchoredFireAt`. The
-/// property keeps its original name for source compatibility, but resolution
-/// now also includes a slot already covered by a verified-open window.
+/// One sync request from the scheduler daemon: "this account's next planned
+/// fire is at `nextFireAt`" — `nil` meaning there is nothing to anchor, which
+/// is the disable signal (the ping method isn't `routine`, the scheduler is
+/// off, or the account dropped out of the plan).
 public struct CloudFallbackSyncRequest: Sendable, Equatable {
     public var accountID: String
     public var nextFireAt: Date?
-    public var lastAnchoredFireAt: Date?
     public var now: Date
-    /// The planner's arm lead for this account: `CloudFallbackPlanner.lead` in
-    /// fallback mode, `0` in cloud-primary mode (arm at the exact planned fire).
-    public var leadSeconds: TimeInterval
 
     public init(
         accountID: String,
         nextFireAt: Date?,
-        lastAnchoredFireAt: Date?,
-        now: Date,
-        leadSeconds: TimeInterval = CloudFallbackPlanner.lead)
+        now: Date)
     {
         self.accountID = accountID
         self.nextFireAt = nextFireAt
-        self.lastAnchoredFireAt = lastAnchoredFireAt
         self.now = now
-        self.leadSeconds = leadSeconds
     }
 }
 
@@ -37,9 +28,10 @@ public typealias CloudFallbackSyncer = @Sendable (CloudFallbackSyncRequest) asyn
 /// Executes `CloudFallbackPlanner` decisions against the claude.ai routines
 /// API: keeps the account's one-shot "AgentManager Routine" as the *single*
 /// routine we ever put in the customer's list — re-arming its `run_once_at`
-/// forward after anchored local pings, disabling it when the feature (or the
-/// scheduler) turns off, and, when no routine is pinned locally, re-adopting
-/// an existing one by name before ever creating (see `adoptOrCreateRoutine`).
+/// forward as the plan advances, disabling it when the `routine` ping method
+/// (or the scheduler) turns off, and, when no routine is pinned locally,
+/// re-adopting an existing one by name before ever creating (see
+/// `adoptOrCreateRoutine`).
 /// Owns `cloud-fallback-state.json` — the daemon only reads it.
 ///
 /// Deliberate omissions, both load-bearing:
@@ -109,8 +101,8 @@ public struct CloudFallbackEngine: Sendable {
     public static let routinePrompt = """
         Good morning! Reply with one short good-morning sentence and do nothing \
         else — no tools, no thinking, no questions. This routine is Agent \
-        Manager's cloud anchor ping: it runs only when your Mac slept through a \
-        scheduled local ping, and its one turn keeps this account's 5-hour \
+        Manager's cloud anchor ping: it runs at one scheduled moment, whether or \
+        not your Mac is awake, and its one turn keeps this account's 5-hour \
         usage window anchored to your workday.
         """
 
@@ -171,9 +163,7 @@ public struct CloudFallbackEngine: Sendable {
         let action = CloudFallbackPlanner.plan(
             state: account,
             nextFireAt: request.nextFireAt,
-            lastAnchoredFireAt: request.lastAnchoredFireAt,
-            now: request.now,
-            lead: request.leadSeconds)
+            now: request.now)
         guard action != .none else { return }
 
         let updated = await execute(action, accountID: request.accountID, current: account, now: request.now)
@@ -211,7 +201,7 @@ public struct CloudFallbackEngine: Sendable {
                     state.disabled = true
                     state.armedFor = nil
                     audit.append(accountID: accountID, action: "routine.disable", ok: true,
-                                 detail: "cloud fallback off — \(triggerID) disabled")
+                                 detail: "nothing to anchor — \(triggerID) disabled")
                 } catch TriggerAPIError.notFound {
                     // Deleted on the web — even better than disabled.
                     state.triggerID = nil

@@ -2,10 +2,12 @@ import AgentManagerCore
 import AppKit
 import SwiftUI
 
-/// The **Preferences** screen. Hosts the set-once "Wake Mac for pings" opt-in
-/// (it lives here rather than next to the Scheduler toggle because you flip it
-/// once and forget it — ongoing health shows on the Monitoring screen), the
-/// menu-bar display mode, the theme, and the clock style.
+/// The **Preferences** screen. Hosts the per-provider ping method (including
+/// Claude's cloud routine — see `pingMethodSection`), the set-once "Wake Mac
+/// for pings" opt-in (it lives here rather than next to the Scheduler toggle
+/// because you flip it once and forget it — ongoing health shows on the
+/// Monitoring screen), the menu-bar display mode, the theme, and the clock
+/// style.
 struct PreferencesView: View {
     @Bindable var model: AppModel
     @State private var pingMethodProvider: Provider = .claude
@@ -14,8 +16,8 @@ struct PreferencesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
-                wakeSection
                 pingMethodSection
+                wakeSection
                 menuBarSection
                 themeSection
                 timeFormatSection
@@ -75,17 +77,20 @@ struct PreferencesView: View {
     private var wakeSection: some View {
         section(
             title: "Scheduled pings",
-            subtitle: "Wake this Mac for local pings, or configure a Claude cloud routine for scheduled Claude windows.")
+            subtitle: "Whether this Mac wakes itself for the pings it runs locally.")
         {
             WakeToggleCard(model: model)
-            ClaudeCloudRoutineCard(model: model)
         }
     }
 
+    /// The one "what anchors this account?" question. The three local drivers
+    /// and Claude's cloud routine sit in the same list on purpose: they are
+    /// alternatives, not a feature plus a mode — picking the routine means the
+    /// scheduler stops running local Claude turns entirely.
     private var pingMethodSection: some View {
         section(
-            title: "Local ping method",
-            subtitle: "Used by Test ping and scheduled pings that run on this Mac. Choose separately per provider; scheduled runs still verify anchoring.")
+            title: "Ping method",
+            subtitle: "How each provider's 5-hour window gets anchored. Scheduled runs always verify anchoring; Test ping always runs a local turn.")
         {
             Picker("Provider", selection: $pingMethodProvider) {
                 Text("Claude").tag(Provider.claude)
@@ -117,7 +122,9 @@ struct PreferencesView: View {
         -> some View
     {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(PingMethod.allCases) { method in
+            // Only Claude offers `.routine` — `available(for:)` is what keeps
+            // the Codex list from showing a method it has no routines for.
+            ForEach(PingMethod.available(for: provider)) { method in
                 let setupCommand = method == .sdk
                     ? SDKPingRunner.setupCommand(provider: provider, workspace: model.workspace)
                     : nil
@@ -128,10 +135,39 @@ struct PreferencesView: View {
                         for: provider,
                         setupCommand: setupCommand),
                     copyCommand: setupCommand,
+                    // Live routine state (armed for when, sync errors, why
+                    // nothing will arm) reads as part of the choice, so it
+                    // hangs off the selected card instead of a separate row.
+                    statusCaption: method == .routine && selection == .routine
+                        ? cloudRoutineCaption
+                        : nil,
                     isSelected: selection == method,
                     action: { select(method) })
             }
         }
+    }
+
+    /// What the armed routine is actually doing, straight from the daemon's
+    /// `cloud-fallback-state.json` — or the reason nothing will arm yet, in the
+    /// order the daemon decides it (account → scheduler → plan).
+    private var cloudRoutineCaption: (text: String, tint: Color) {
+        guard model.accounts.contains(where: { $0.provider.supportsCloudAnchorRoutines && $0.status == .connected }) else {
+            return ("No connected Claude account — nothing to anchor.", Theme.warning)
+        }
+        guard model.schedulerActive else {
+            return ("Waiting for the Scheduler — turn it on to arm.", Theme.warning)
+        }
+        // Sorted by account id, not dictionary order: with two Claude accounts
+        // erroring, an unordered pick would flip the caption between refreshes.
+        let entries = (model.cloudFallbackState?.accounts ?? [:]).sorted(by: { $0.key < $1.key })
+        if let bad = entries.compactMap({ $0.value.lastError }).first {
+            return ("Sync problem: \(bad) — see Monitoring.", Theme.warning)
+        }
+        if let next = entries.compactMap({ $0.value.armedFor }).filter({ $0 > Date() }).sorted().first {
+            return ("Armed — claude.ai anchors the next Claude slot at \(model.clockStyle.dayTimeString(next)).",
+                    Theme.success)
+        }
+        return ("Arms a one-shot at each scheduled Claude slot on the daemon's next tick.", Theme.success)
     }
 
     /// Shared section chrome: a semibold title, a secondary subtitle, and a
@@ -200,6 +236,8 @@ private extension PingMethod {
         case .terminal: "Controlled terminal"
         case .headless: "Programmatic CLI"
         case .sdk: "SDK"
+        // The list is already scoped to a provider, so no "Claude" prefix.
+        case .routine: "Cloud routine"
         }
     }
 
@@ -208,6 +246,7 @@ private extension PingMethod {
         case .terminal: "terminal"
         case .headless: "chevron.left.forwardslash.chevron.right"
         case .sdk: "shippingbox"
+        case .routine: "cloud.fill"
         }
     }
 
@@ -222,6 +261,8 @@ private extension PingMethod {
         case .sdk:
             let sdk = provider == .claude ? "Claude Agent SDK" : "Codex SDK"
             return "Install the \(sdk) once: \(setupCommand ?? "")"
+        case .routine:
+            return "A one-shot claude.ai routine anchors every scheduled slot from Anthropic's cloud. No local ping runs, so a sleeping Mac still anchors."
         }
     }
 }
@@ -306,134 +347,20 @@ private struct WakeToggleCard: View {
     }
 }
 
-/// The experimental Claude cloud-routine switch, styled like `WakeToggleCard`
-/// and kept with the other scheduled-ping controls. Its mode selector makes
-/// the scheduling boundary explicit: fallback supplements local scheduled
-/// turns, while Routines only replaces those turns without changing Test ping.
-/// The caption reports what's armed (from `cloud-fallback-state.json`), the
-/// last sync error, or why nothing will arm.
-private struct ClaudeCloudRoutineCard: View {
-    @Bindable var model: AppModel
-
-    var body: some View {
-        let caption = self.caption
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                Image(systemName: "cloud.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(model.cloudFallbackEnabled ? Color.white : Color.secondary)
-                    .frame(width: 26, height: 26)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7)
-                            .fill(model.cloudFallbackEnabled ? Theme.accent : Color.primary.opacity(0.07)))
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text("Claude cloud routine")
-                            .font(.system(size: 13.5, weight: .semibold))
-                        Text("CLAUDE")
-                            .font(.system(size: 9, weight: .bold))
-                            .tracking(0.5)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(Theme.accent.opacity(0.15)))
-                            .foregroundStyle(Theme.accent)
-                        Text("EXPERIMENTAL")
-                            .font(.system(size: 9, weight: .bold))
-                            .tracking(0.5)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(Theme.warning.opacity(0.15)))
-                            .foregroundStyle(Theme.warning)
-                    }
-                    Text("Adds a one-shot claude.ai routine to scheduled Claude slots. Use it as a fallback for missed local pings, or let routines handle scheduled pings entirely.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(caption.text)
-                        .font(.system(size: 12))
-                        .foregroundStyle(caption.tint)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-                Toggle("Claude cloud routine", isOn: Binding(
-                    get: { model.cloudFallbackEnabled },
-                    set: { model.setCloudFallbackEnabled($0) }))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-            }
-            if model.cloudFallbackEnabled {
-                Divider().padding(.leading, 38)
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Scheduled Claude mode")
-                        .font(.system(size: 12.5, weight: .semibold))
-                    Picker("Scheduled Claude mode", selection: Binding(
-                        get: { model.cloudPrimaryEnabled },
-                        set: { model.setCloudPrimaryEnabled($0) })) {
-                        Text("Fallback").tag(false)
-                        Text("Routines only").tag(true)
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 260, alignment: .leading)
-                    Text(modeDescription)
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.leading, 38)
-            }
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 11)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 11).fill(Color.primary.opacity(0.02)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 11)
-                .strokeBorder(model.cloudFallbackEnabled ? Theme.accent.opacity(0.6) : Color.primary.opacity(0.08),
-                              lineWidth: model.cloudFallbackEnabled ? 1.5 : 1))
-    }
-
-    private var caption: (text: String, tint: Color) {
-        guard model.cloudFallbackEnabled else {
-            return ("Off — scheduled Claude pings use the local method only.", Color.secondary)
-        }
-        guard model.accounts.contains(where: { $0.provider.supportsCloudAnchorRoutines && $0.status == .connected }) else {
-            return ("No connected Claude account — nothing to cover.", Theme.warning)
-        }
-        guard model.schedulerActive else {
-            return ("Waiting for the Scheduler — turn it on to arm.", Theme.warning)
-        }
-        let entries = model.cloudFallbackState?.accounts ?? [:]
-        if let bad = entries.values.compactMap(\.lastError).first {
-            return ("Sync problem: \(bad) — see Monitoring.", Theme.warning)
-        }
-        let armed = entries.values.compactMap(\.armedFor).filter { $0 > Date() }.sorted()
-        if model.cloudPrimaryEnabled {
-            if let next = armed.first {
-                return ("Routines only — cloud handles the next scheduled Claude slot at \(model.clockStyle.dayTimeString(next)); Test ping stays local.", Theme.success)
-            }
-            return ("Routines only — cloud handles scheduled Claude slots; Test ping stays local.", Theme.success)
-        }
-        if let next = armed.first {
-            return ("Fallback — covers the local ping at \(model.clockStyle.dayTimeString(next.addingTimeInterval(-CloudFallbackPlanner.lead))); runs only if the Mac misses it.", Theme.success)
-        }
-        return ("Fallback — targets five minutes after each scheduled local Claude ping.", Theme.success)
-    }
-
-    private var modeDescription: String {
-        if model.cloudPrimaryEnabled {
-            return "Cloud handles scheduled Claude slots instead of local pings. Test ping still uses the selected local method."
-        }
-        return "Scheduled Claude pings use the selected local method. The cloud routine runs only when the Mac misses one."
-    }
-}
-
 /// A selectable, radio-style card used across the Preferences sections.
+///
+/// `statusCaption` exists for the one option that is more than a preference —
+/// Claude's cloud routine, which has live state behind it. Keeping it on the
+/// shared card is what lets that option sit in the same list as the local
+/// drivers instead of needing a card of its own.
 private struct PreferenceRadioCard: View {
     let systemImage: String
     let title: String
     let subtitle: String
     let copyCommand: String?
+    /// Live state for this option, shown under the subtitle — what's armed, or
+    /// what stands in the way. Callers pass nil when there's nothing to say.
+    let statusCaption: (text: String, tint: Color)?
     let isSelected: Bool
     let action: () -> Void
 
@@ -445,6 +372,7 @@ private struct PreferenceRadioCard: View {
         title: String,
         subtitle: String,
         copyCommand: String? = nil,
+        statusCaption: (text: String, tint: Color)? = nil,
         isSelected: Bool,
         action: @escaping () -> Void)
     {
@@ -452,6 +380,7 @@ private struct PreferenceRadioCard: View {
         self.title = title
         self.subtitle = subtitle
         self.copyCommand = copyCommand
+        self.statusCaption = statusCaption
         self.isSelected = isSelected
         self.action = action
     }
@@ -474,6 +403,12 @@ private struct PreferenceRadioCard: View {
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                        if let statusCaption {
+                            Text(statusCaption.text)
+                                .font(.system(size: 12))
+                                .foregroundStyle(statusCaption.tint)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     Spacer(minLength: 8)
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")

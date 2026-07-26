@@ -95,8 +95,8 @@ struct MonitoringLogEntry: Identifiable, Sendable {
 
     /// Bucket a dotted audit action by its first segment. `token.refresh` sits
     /// with Usage (it's the delegated refresh the usage fetch rides on);
-    /// `wake.*` and `routine.*` sit with Scheduler (the wake helper and cloud
-    /// fallback exist only to serve scheduled pings). Everything else —
+    /// `wake.*` and `routine.*` sit with Scheduler (the wake helper and the
+    /// cloud routine exist only to serve scheduled pings). Everything else —
     /// `login.*`, `account.*`, `config.*`, `home.*`, `symlink.*`, `verify` —
     /// is account lifecycle, i.e. Setup.
     static func classify(action: String) -> Category {
@@ -110,7 +110,7 @@ struct MonitoringLogEntry: Identifiable, Sendable {
     }
 
     /// Bucket an HTTP row by its URL path: trigger/environment calls are the
-    /// cloud fallback's routine management (Scheduler); every other exchange
+    /// cloud routine's management (Scheduler); every other exchange
     /// the app makes is a usage read.
     static func classify(httpPath path: String) -> Category {
         if path.contains("/code/triggers") || path.contains("/environment_providers") {

@@ -247,67 +247,6 @@ extension AppModel {
         }
     }
 
-    /// The experimental Claude cloud-routine switch. Only writes
-    /// `cloud-fallback.json` — the resident daemon does everything else on its
-    /// next tick: arming one claude.ai routine per Claude account (on), or
-    /// disabling them (off). No launchd, no prompt, nothing to install; the
-    /// worst an abandoned routine can do is fire once (it's always a one-shot).
-    func setCloudFallbackEnabled(_ on: Bool) {
-        guard on != cloudFallbackEnabled else { return }
-        cloudFallbackEnabled = on
-        let ws = workspace
-        Task {
-            let message = await Task.detached(priority: .userInitiated) { () -> String in
-                do {
-                    // Load-modify-save so we never clobber the `cloudPrimary` bit.
-                    var config = CloudFallbackConfigStore(workspace: ws).load()
-                    config.enabled = on
-                    try CloudFallbackConfigStore(workspace: ws).save(config)
-                } catch {
-                    return "cloud fallback toggle failed: \(error)"
-                }
-                AuditLog(workspace: ws).append(
-                    accountID: nil, action: on ? "cloud.enable" : "cloud.disable",
-                    ok: true, detail: "via app toggle")
-                return on
-                    ? "Claude cloud routine on — routines arm on the daemon's next tick"
-                    : "Claude cloud routine off — routines are disabled on the daemon's next tick"
-            }.value
-            statusMessage = message
-            refreshMonitoring()
-        }
-    }
-
-    /// The Fallback / Routines only mode selector. Routines only promotes the
-    /// routine from backstop to the *sole* anchor for scheduled Claude slots. Only
-    /// writes `cloud-fallback.json` (load-modify-save, preserving `enabled`);
-    /// the daemon arms at the exact planned fire and stops spawning local
-    /// Claude pings on its next tick. No-op unless fallback is on.
-    func setCloudPrimaryEnabled(_ on: Bool) {
-        guard on != cloudPrimaryEnabled else { return }
-        cloudPrimaryEnabled = on
-        let ws = workspace
-        Task {
-            let message = await Task.detached(priority: .userInitiated) { () -> String in
-                do {
-                    var config = CloudFallbackConfigStore(workspace: ws).load()
-                    config.cloudPrimary = on
-                    try CloudFallbackConfigStore(workspace: ws).save(config)
-                } catch {
-                    return "cloud-primary toggle failed: \(error)"
-                }
-                AuditLog(workspace: ws).append(
-                    accountID: nil, action: on ? "cloud.primary.enable" : "cloud.primary.disable",
-                    ok: true, detail: "via app toggle")
-                return on
-                    ? "Routines only — cloud handles scheduled Claude slots; Test ping still uses the local method"
-                    : "Fallback mode — cloud routine covers missed local Claude pings"
-            }.value
-            statusMessage = message
-            refreshMonitoring()
-        }
-    }
-
     /// While the wake helper awaits its one-time System Settings approval,
     /// re-check every few seconds so the UI flips to "armed" on its own —
     /// SMAppService posts no notification when the user clicks Allow. The task
@@ -350,7 +289,7 @@ extension AppModel {
                        registration: WakeHelperAppService.Registration,
                        schedReg: SchedulerAppService.Registration,
                        wakeProcess: WakeHelperSetup.ProcessState,
-                       cloudEnabled: Bool, cloudPrimary: Bool, cloudState: CloudFallbackState,
+                       cloudState: CloudFallbackState,
                        recent: [ActivityRecord], logs: [MonitoringLogEntry]) in
                 let scheduler = Scheduler(workspace: ws)
                 // Heal a daemon running a binary older than the one launchd
@@ -364,7 +303,6 @@ extension AppModel {
                 let wakeProcess = wakeSetup.processState()
                 let registration = WakeHelperAppService.registration()
                 let schedReg = SchedulerAppService.registration()
-                let cloudConfig = CloudFallbackConfigStore(workspace: ws).load()
                 let cloudState = CloudFallbackStateStore(workspace: ws).load()
                 // Monitoring shows everything from the last 48 hours (the UI says
                 // so); the limit is only a guard against a pathological file.
@@ -373,7 +311,7 @@ extension AppModel {
                 let audit = AuditLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let network = NetworkLog(workspace: ws).readRecent(limit: 2000, since: cutoff)
                 let logs = MonitoringLogEntry.merge(activity: activity, audit: audit, network: network)
-                return (scheduler.status(), wake, registration, schedReg, wakeProcess, cloudConfig.enabled, cloudConfig.cloudPrimary, cloudState, activity, logs)
+                return (scheduler.status(), wake, registration, schedReg, wakeProcess, cloudState, activity, logs)
             }.value
             let wasAwaitingWakeApproval = self.wakeRegistration == .requiresApproval
             let wasAwaitingSchedApproval = self.schedulerRegistration == .requiresApproval
@@ -384,8 +322,6 @@ extension AppModel {
             self.wakeEnabled = result.wake.enabled
             self.wakeRegistration = result.registration
             self.wakeProcessState = result.wakeProcess
-            self.cloudFallbackEnabled = result.cloudEnabled
-            self.cloudPrimaryEnabled = result.cloudPrimary
             self.cloudFallbackState = result.cloudState
             if wasAwaitingWakeApproval && result.registration == .enabled {
                 self.statusMessage = "wake helper approved — active"

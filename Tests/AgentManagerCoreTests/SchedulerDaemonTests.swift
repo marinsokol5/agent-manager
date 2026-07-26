@@ -63,6 +63,27 @@ final class SchedulerDaemonTests: XCTestCase {
         return ws
     }
 
+    /// Select Claude's `routine` ping method: scheduled Claude slots are
+    /// anchored by a claude.ai one-shot and the daemon spawns no local Claude
+    /// ping at all. This is the single switch behind every cloud-routine
+    /// behaviour below — it lives in `preferences.json` next to the other
+    /// methods, not in a feature file of its own.
+    func useCloudRoutineMethod(_ ws: Workspace) {
+        PreferencesStore(workspace: ws).save(Preferences(claudePingMethod: .routine))
+    }
+
+    /// Pretend the engine already armed this account's one-shot. The routine is
+    /// armed *at* its fire, so `armedFor` is a planned fire time.
+    func seedArmedRoutine(
+        _ ws: Workspace, id: String = "a1", armedFor: Date, lastError: String? = nil)
+    {
+        var seed = CloudFallbackState()
+        seed.accounts[id] = AccountCloudFallbackState(
+            triggerID: "trig_1", environmentID: "env_1", armedFor: armedFor,
+            lastError: lastError, lastErrorAt: lastError == nil ? nil : armedFor)
+        CloudFallbackStateStore(workspace: ws).save(seed)
+    }
+
     func makeDaemon(
         _ ws: Workspace,
         clock: TestClock,
@@ -273,7 +294,7 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(recorder.requests.count, 1)
     }
 
-    // MARK: - cloud fallback integration
+    // MARK: - cloud routine ping method
 
     final class SyncRecorder: @unchecked Sendable {
         private let lock = NSLock()
@@ -282,17 +303,14 @@ final class SchedulerDaemonTests: XCTestCase {
         var requests: [CloudFallbackSyncRequest] { lock.lock(); defer { lock.unlock() }; return recorded }
     }
 
-    func testCloudCoveredFireSkipsTheLocalPing() async throws {
-        // The Mac slept from before 05:00 until 05:06 — past the fire's 05:05
-        // cloud backstop, still inside the 15-minute grace. The routine already
-        // anchored the window from Anthropic's side; a local ping would be a
-        // redundant burned turn.
+    func testPassedRoutineFireResolvesTheSlotWithoutPinging() async throws {
+        // The routine armed for the 05:00 slot has fired (it's 05:06). The
+        // window is anchored from Anthropic's side, so the slot resolves with
+        // no local turn — and the next fire is pushed past the window that run
+        // opened (05:00 + 5h + margin).
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        useCloudRoutineMethod(ws)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
 
         let clock = TestClock(date(2026, 7, 6, 5, 6))
         let recorder = PingRecorder()
@@ -306,23 +324,18 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertTrue(records[0].anchored) // the cloud anchored it
         XCTAssertTrue(records[0].detail.contains("cloud routine"), records[0].detail)
 
-        // The covered fire counts as anchored, so the post-drain sync may
-        // advance the routine to the next fire — which the cloud anchor
-        // *defers*: the routine's known 05:05 armed moment makes the window
-        // expire at 10:05; detection time must not add artificial drift. So
-        // the nominal 10:00 re-ping would be a guaranteed phantom. It fires
-        // at 10:06 (expiry + margin), and the backstop follows it.
-        XCTAssertEqual(syncs.requests.last?.lastAnchoredFireAt, date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 6))
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 1))
     }
 
-    func testCloudPrimarySuppressesLocalClaudePingAndArmsAtExactFire() async throws {
-        // Cloud-primary on, no routine confirmed for this fire yet: the daemon
-        // must NOT spawn a local Claude ping (the mode's whole point), and it
-        // arms the routine at the exact planned fire (lead 0), not +5m.
+    func testRoutineMethodSuppressesTheLocalPingAndArmsAtTheExactFire() async throws {
+        // The 05:00 slot is due and no routine is confirmed for it yet (never
+        // armed, or its arm is erroring). The daemon must NOT fall back to a
+        // local Claude ping — that flaky turn is the thing this method exists
+        // to avoid — and it arms the next routine at the planned minute itself.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(
-            CloudFallbackConfig(enabled: true, cloudPrimary: true))
+        useCloudRoutineMethod(ws)
 
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30)) // 05:00 slot, due, within grace
         let recorder = PingRecorder()
@@ -334,17 +347,16 @@ final class SchedulerDaemonTests: XCTestCase {
         let records = ActivityLog(workspace: ws).readRecent(limit: 10)
         XCTAssertEqual(records.count, 1)
         XCTAssertFalse(records[0].anchored) // nothing anchored from our side
-        XCTAssertTrue(records[0].detail.contains("cloud-primary"), records[0].detail)
+        XCTAssertTrue(records[0].detail.contains("cloud routine method"), records[0].detail)
 
-        // The post-drain sync arms with lead 0 → the next fire is armed at its
-        // exact planned minute (10:00), not 10:05.
-        XCTAssertEqual(syncs.requests.last?.leadSeconds, 0)
+        // Armed at the planned minute (10:00) — the routine is the anchor, so
+        // there is no lead to leave room for a local turn.
         XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 0))
     }
 
-    func testCloudPrimaryLeavesCodexPingingLocally() async throws {
-        // Codex has no cloud routine, so cloud-primary must not touch it — it
-        // keeps firing local pings exactly as before.
+    func testRoutineMethodLeavesCodexPingingLocally() async throws {
+        // Codex has no cloud routines, so Claude's method must not touch it —
+        // it keeps firing local pings exactly as before.
         let ws = Workspace(root: tmp.appendingPathComponent("ws-codex", isDirectory: true))
         let store = AccountStore(workspace: ws)
         try store.insert(Account(
@@ -354,8 +366,7 @@ final class SchedulerDaemonTests: XCTestCase {
         sched.set(weekday: 0, hours: [8, 9, 10, 11])
         try ScheduleStore(workspace: ws).save(sched)
         try SchedulerConfigStore(workspace: ws).save(SchedulerConfig(active: true))
-        try CloudFallbackConfigStore(workspace: ws).save(
-            CloudFallbackConfig(enabled: true, cloudPrimary: true))
+        useCloudRoutineMethod(ws)
 
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
         let recorder = PingRecorder()
@@ -366,15 +377,12 @@ final class SchedulerDaemonTests: XCTestCase {
     }
 
     func testCloudUsageResetTightensACloudFireDetectedHoursLate() async throws {
-        // The Mac comes back two hours after the 05:05 one-shot. Detection
+        // The Mac comes back two hours after the 05:00 one-shot. Detection
         // time + window would pretend the window lasts until noon and swallow
         // the useful 10:00 re-anchor; exact usage says it really resets 10:05.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        useCloudRoutineMethod(ws)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
 
         let clock = TestClock(date(2026, 7, 6, 7, 0))
         let recorder = PingRecorder()
@@ -399,15 +407,12 @@ final class SchedulerDaemonTests: XCTestCase {
     }
 
     func testCloudFireWithoutUsageStillUsesItsArmedTimeNotDetectionTime() async throws {
-        // The Mac notices the 05:05 one-shot two hours late and the read-only
+        // The Mac notices the 05:00 one-shot two hours late and the read-only
         // usage probe fails. The event time is still known from `armedFor`:
         // falling back to 07:00 + 5h would waste the useful 10:00 boundary.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        useCloudRoutineMethod(ws)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
 
         let clock = TestClock(date(2026, 7, 6, 7, 0))
         let recorder = PingRecorder()
@@ -418,21 +423,18 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertTrue(recorder.requests.isEmpty)
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.windowStates?["a1"]?.evidence, .conservative)
-        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 5))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 6))
+        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
     func testLaterExactWindowSupersedesCloudArmedTimeFallback() async throws {
         // While the Mac slept, another real use anchored at 07:00 after the
-        // 05:05 cloud event. Its exact 12:00 reset is current ground truth and
-        // must not be shortened back to the cloud estimate of 10:05.
+        // 05:00 cloud event. Its exact 12:00 reset is current ground truth and
+        // must not be shortened back to the cloud estimate of 10:00.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        useCloudRoutineMethod(ws)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
 
         let clock = TestClock(date(2026, 7, 6, 7, 0))
         let exact = UsageReading(
@@ -452,20 +454,17 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 12, 0))
     }
 
-    func testCloudBackstopPassingWhileLocalFireIsDeferredDoesNotConsumeTheSlot() async throws {
-        // Runtime evidence moves the 05:00 local fire to 05:11, but its old
-        // cloud backstop is still armed for 05:05. That cloud turn runs inside
-        // the already-open window, so it is itself a phantom: resolve/re-arm
-        // the obsolete backstop, but keep the 05:00 nominal slot pending.
+    func testPassedRoutineInsideAnOpenWindowDoesNotConsumeTheSlot() async throws {
+        // Runtime evidence says the window is open until 05:10, so the 05:00
+        // fire is deferred to 05:11 — but the routine already ran at 05:00,
+        // inside that window. That run is itself a phantom: resolve it (so the
+        // engine can re-arm forward) while keeping the 05:00 slot pending.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
+        useCloudRoutineMethod(ws)
         seedUsage(
             ws, id: "a1", resetsAt: date(2026, 7, 6, 5, 10),
             fetchedAt: date(2026, 7, 6, 4, 50))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
 
         let clock = TestClock(date(2026, 7, 6, 5, 6))
         let recorder = PingRecorder()
@@ -479,7 +478,6 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(syncs.requests.last?.lastAnchoredFireAt, date(2026, 7, 6, 5, 0))
         XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 5, 11))
 
         let records = ActivityLog(workspace: ws).readRecent(limit: 10)
@@ -488,48 +486,63 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertTrue(records[0].detail.contains("already-open"), records[0].detail)
     }
 
-    func testCloudBackstopNotDueYetStillPingsLocally() async throws {
-        // Awake at 05:00:30 with a backstop armed for 05:05: the local ping
-        // runs as normal — covering only kicks in once the armed moment passed.
+    func testPassedRoutineAfterAnErroredArmStillBecomesTheAnchor() async throws {
+        // Tick 1: the routine's state carries a sync error, so its armed 05:00
+        // moment can't be trusted — the slot is consumed without a local ping
+        // (the method's rule) and watermarked. Tick 2: the error cleared, and
+        // the passed one-shot must still be reconciled onto that already
+        // watermarked slot instead of being missed.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
+        useCloudRoutineMethod(ws)
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0), lastError: "boom")
 
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+        _ = await daemon.tick()
+
+        XCTAssertTrue(recorder.requests.isEmpty)
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"],
+            date(2026, 7, 6, 5, 0))
+        XCTAssertNil(SchedulerStatusStore(workspace: ws).load()?.lastResolvedFire?["a1"])
+
+        // The next successful engine sync clears the error.
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
+        clock.now = date(2026, 7, 6, 5, 6)
+        _ = await daemon.tick()
+
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
+        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1))
+        XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).contains { $0.anchored })
+    }
+
+    func testLocalMethodPingsNormallyAndDisarmsALingeringRoutine() async throws {
+        // The other side of the switch: with a local driver selected, a routine
+        // left armed by a previous run must not suppress or cover anything —
+        // the local ping fires, and the sync carries the disable signal (nil
+        // `nextFireAt`) that stands the leftover routine down.
+        let ws = try seedWorkspace() // no preferences file → terminal
+        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
+
+        let clock = TestClock(date(2026, 7, 6, 5, 6))
         let recorder = PingRecorder()
         let syncs = SyncRecorder()
         let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
         _ = await daemon.tick()
 
-        XCTAssertEqual(recorder.requests.count, 1)
-        // The anchored outcome flows into the sync so the engine can re-arm.
-        XCTAssertEqual(syncs.requests.last?.lastAnchoredFireAt, date(2026, 7, 6, 5, 0))
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 0))])
+        XCTAssertEqual(syncs.requests.count, 1)
+        XCTAssertEqual(syncs.requests[0].accountID, "a1")
+        XCTAssertNil(syncs.requests[0].nextFireAt)
     }
 
-    func testFailedPingWithholdsAnchorSignal() async throws {
-        let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
-        let recorder = PingRecorder()
-        let syncs = SyncRecorder()
-        let daemon = makeDaemon(
-            ws, clock: clock, recorder: recorder, outcome: .failed,
-            cloudSyncer: { syncs.append($0) })
-        _ = await daemon.tick()
-
-        XCTAssertEqual(recorder.requests.count, 1)
-        // No anchor observed → the engine's planner will hold the backstop.
-        XCTAssertNil(syncs.requests.last?.lastAnchoredFireAt)
-        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 0))
-    }
-
-    func testFeatureOffSendsDisableSignalForClaudeAccounts() async throws {
-        // cloud-fallback.json absent (= disabled): every Claude account still
-        // gets a sync with a nil nextFireAt, which is the disable signal — how
-        // a routine armed before the toggle flipped off gets cleaned up.
+    func testLocalMethodSendsDisableSignalForClaudeAccounts() async throws {
+        // Nothing armed, method not `routine`: every Claude account still gets
+        // a sync with a nil nextFireAt, which is the disable signal — how a
+        // routine armed before the method changed gets cleaned up.
         let ws = try seedWorkspace()
         let clock = TestClock(date(2026, 7, 6, 4, 0))
         let recorder = PingRecorder()
@@ -967,38 +980,28 @@ final class SchedulerDaemonTests: XCTestCase {
             [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 2, 30))])
     }
 
-    func testAnchorUnknownDefersConservativelyButWithholdsCloudSignal() async throws {
+    func testAnchorUnknownDefersConservativelyAroundTheUnverifiedTurn() async throws {
         // A turn ran but couldn't be verified (exit 5): schedule around it as
-        // if it anchored (defer the successor), yet never hand the cloud
-        // fallback an anchor it would stand its backstop down for.
+        // if it anchored (defer the successor) without ever reporting an anchor.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
         let recorder = PingRecorder()
-        let syncs = SyncRecorder()
         let daemon = makeDaemon(
-            ws, clock: clock, recorder: recorder, outcome: .anchorUnknown,
-            cloudSyncer: { syncs.append($0) })
+            ws, clock: clock, recorder: recorder, outcome: .anchorUnknown)
         _ = await daemon.tick()
 
         XCTAssertEqual(recorder.requests.count, 1)
-        XCTAssertNil(syncs.requests.last?.lastAnchoredFireAt)
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1, 30))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
-    func testPostflightPhantomRemainsPendingAndCancelsItsRedundantCloudBackstop() async throws {
+    func testPostflightPhantomRemainsPendingAndResolvesItsCloudFire() async throws {
         // A fresh exact reading can prove that an exit-5 turn was a phantom
         // even when preflight missed it. The nominal slot must remain pending
-        // for the real reset, while its 05:05 backstop moves out of the same
-        // already-open window.
+        // for the real reset, and the fire is booked as cloud-resolved so a
+        // routine covering it could never be reconciled onto it twice.
         let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
 
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
         let recorder = PingRecorder()
@@ -1029,43 +1032,11 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
 
         XCTAssertEqual(recorder.requests.count, 1)
-        XCTAssertEqual(syncs.requests.last?.lastAnchoredFireAt, date(2026, 7, 6, 5, 0))
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
         XCTAssertNil(status?.lastHandled["a1"])
         XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
-    }
-
-    func testCloudBackstopAfterUnknownLocalOutcomeBecomesTheConservativeAnchor() async throws {
-        // The local child ran but could not prove an anchor, so its 05:05
-        // backstop deliberately remains armed. When that one-shot passes, the
-        // 05:00 nominal slot is already watermarked; reconciliation must still
-        // move the conservative expiry to the cloud event instead of missing it.
-        let ws = try seedWorkspace()
-        try CloudFallbackConfigStore(workspace: ws).save(CloudFallbackConfig(enabled: true))
-        var seed = CloudFallbackState()
-        seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_1", armedFor: date(2026, 7, 6, 5, 5))
-        CloudFallbackStateStore(workspace: ws).save(seed)
-
-        let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
-        let recorder = PingRecorder()
-        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, outcome: .anchorUnknown)
-        _ = await daemon.tick()
-        XCTAssertEqual(
-            SchedulerStatusStore(workspace: ws).load()?.windowStates?["a1"]?.expiresAt,
-            date(2026, 7, 6, 10, 0, 30))
-
-        clock.now = date(2026, 7, 6, 5, 6)
-        _ = await daemon.tick()
-
-        let status = SchedulerStatusStore(workspace: ws).load()
-        XCTAssertEqual(status?.lastHandled["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 5))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 6))
-        XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).contains { $0.anchored })
     }
 
     func testLaggingPostflightReadingCannotEraseConservativeUnknownGuard() async throws {

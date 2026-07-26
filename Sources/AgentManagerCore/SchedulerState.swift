@@ -136,11 +136,10 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
     /// re-firing a phantom into a window it just anchored. Optional so status
     /// files written before this field decode unchanged.
     public var windowStates: [String: AccountWindowState]?
-    /// Per account, the latest effective local-fire time whose cloud backstop
-    /// is resolved: a verified local anchor, a passed cloud one-shot, or a slot
-    /// already covered by a known window. Persisting this prevents a daemon
-    /// restart between local resolution and API re-arm from letting the old
-    /// one-shot fire redundantly.
+    /// Per account, the latest fire whose cloud-routine run is accounted for:
+    /// a passed one-shot the daemon reconciled, a verified local anchor, or a
+    /// slot already covered by a known window. Persisting it stops a daemon
+    /// restart from reconciling the same cloud run onto a second slot.
     public var lastResolvedFire: [String: Date]?
 
     public init(

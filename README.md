@@ -84,12 +84,11 @@ nobody's around.
 
 **Lid closed *on battery*?** That's the one case no software can wake on Mac, so
 Claude Code accounts can use Anthropic's cloud compute to start the token window.
-Turn on **Claude cloud routine** in Preferences and choose **Fallback** to keep a
-tiny one-shot routine — "AgentManager Routine", visible at
-claude.ai/code/routines — armed 5 minutes after each scheduled local ping. A
-local ping moves it forward before it fires; a ping the sleeping Mac misses lets
-Anthropic's cloud run it instead. **Routines only** makes the cloud routine handle
-scheduled Claude slots entirely; Test ping still uses the selected local method.
+Pick **Cloud routine** as Claude's ping method in Preferences: a tiny one-shot
+routine — "AgentManager Routine", visible at claude.ai/code/routines — is armed
+at each scheduled Claude slot and anchors the window from Anthropic's cloud, so
+no local ping runs at all and a sleeping Mac still anchors. Codex keeps pinging
+locally, and Test ping still runs a real local turn.
 
 ## CLI reference
 
@@ -114,7 +113,7 @@ Everything else is doable only in the app, the CLI handles only running-related 
   or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
   (`api.anthropic.com`, `chatgpt.com`): the usage reads the real CLI already
-  makes, plus — only if you turn the experimental Claude cloud routine on — managing
+  makes, plus — only if you pick Claude's cloud routine ping method — managing
   the anchor routine in your own claude.ai account. No backend, no analytics.
 - **One quiet background agent.** Scheduled pings come from a single resident
   launchd agent with an in-process queue — flipping the scheduler on and off
@@ -140,7 +139,7 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `schedule.json` | your work hours and window length |
 | `scheduler.json` / `scheduler-status.json` | the scheduler switch + the background agent's heartbeat and upcoming pings |
 | `wake.json` | the "Wake Mac for pings" opt-in |
-| `cloud-fallback.json` / `cloud-fallback-state.json` | the cloud-fallback opt-in + which claude.ai routine is armed per account |
+| `cloud-fallback-state.json` | which claude.ai routine is armed per account, and for when |
 | `usage.json` | last-known usage reading per account |
 | `preferences.json` | display preferences plus separate Claude/Codex ping methods |
 | `sdk-ping/` | SDK helper scripts and user-installed SDK dependencies (only when SDK pings are used) |

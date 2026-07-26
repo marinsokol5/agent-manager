@@ -73,8 +73,8 @@ public enum RuntimeAnchorPolicy {
     /// So the tail slot of every block measures a little short once deferred,
     /// and re-testing the planner's own floor against the shifted time would
     /// drop it *every time* — silently forfeiting the last budget slice of the
-    /// day (and, in cloud-primary mode, leaving that window with neither a
-    /// local ping nor an armed routine).
+    /// day (and, under the `routine` ping method, leaving that window with
+    /// neither a local ping nor an armed routine).
     ///
     /// Forgiving a few minutes keeps the planner's decision stable under that
     /// jitter while still dropping genuine shortfalls, which are tens of
@@ -129,7 +129,7 @@ public enum RuntimeAnchorPolicy {
         /// (advance the nominal watermark, log once) instead of deferring them
         /// into a pointless anchor. Like shifted runnable entries, these carry
         /// the effective boundary in `fireAt` and nominal identity in
-        /// `plannedAt`, so cloud-backstop resolution follows the right time.
+        /// `plannedAt`, so cloud-routine resolution follows the right time.
         public var covered: [QueueEntry]
 
         public init(entries: [QueueEntry] = [], covered: [QueueEntry] = []) {
@@ -215,10 +215,10 @@ public enum RuntimeAnchorPolicy {
                 // nominally-due entry is *resolved* (watermarked + logged);
                 // a future one just sits out this rebuild.
                 if planned <= now {
-                    // Preserve both identities here too: cloud fallback may
+                    // Preserve both identities here too: the cloud routine may
                     // already be armed from a previously published effective
                     // time, so resolving only the nominal time could fail to
-                    // cancel that later, now-pointless backstop.
+                    // move that later, now-pointless one-shot.
                     var coveredEntry = entry
                     coveredEntry.plannedAt = planned
                     coveredEntry.fireAt = effective

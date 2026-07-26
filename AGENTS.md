@@ -108,10 +108,11 @@ design follows from them.
 4. **Local-only. No backend, no telemetry, no analytics.** Network calls go
    only to the *official* provider endpoints (`api.anthropic.com`,
    `chatgpt.com`), mirroring the real CLI's requests. Two kinds exist:
-   read-only usage fetches, and — only while the experimental **cloud
-   fallback** toggle is on — first-party management of the user's own claude.ai
-   anchor routines (`/v1/code/triggers` via `TriggerClient`). Those trigger
-   calls are the sole writes, they configure state in the *user's own* account,
+   read-only usage fetches, and — only while Claude's **`routine` ping method**
+   is selected — first-party management of the user's own claude.ai anchor
+   routines (`/v1/code/triggers` via `TriggerClient`), plus the disable call that
+   stands a routine down when it isn't. Those trigger calls are the sole
+   writes, they configure state in the *user's own* account,
    and they are always fail-soft (local scheduling never depends on them).
    Don't add phone-home, crash reporting, or third-party endpoints.
 5. **No shell string execution.** Spawn subprocesses with `Process` +
@@ -170,27 +171,29 @@ design follows from them.
 - `wake.json` — the "Wake Mac for pings" opt-in (app toggle / `am wake
   enable`). Read by the root wake helper; flipping it is the helper's entire
   runtime control surface.
-- `cloud-fallback.json` — the experimental cloud-fallback opt-in (`enabled`,
-  Preferences toggle / `am cloud enable`) plus the nested cloud-**primary**
-  opt-in (`cloudPrimary`, the "Fallback / Routines only" mode selector / `am cloud primary
-  enable`; only meaningful when `enabled`). Read by the scheduler daemon each
-  tick.
 - `cloud-fallback-state.json` — which claude.ai anchor routine is armed per
   account and for when. Written **only** by the daemon's `CloudFallbackEngine`
-  (single writer); the app/CLI just read it for display.
+  (single writer); the app/CLI just read it for display. (Whether to arm one is
+  *not* here — it's Claude's `routine` ping method in `preferences.json`. The
+  file name is historical: the routine began as a dead-man's fallback behind a
+  local ping, and kept its name so an armed routine survived that redesign.)
 - `scheduler-status.json` — the scheduler daemon's heartbeat + upcoming-queue
   snapshot, optional `inFlight` attempt checkpoint (kept separate from the
   handled watermark so a deferred child cannot lose its slot), per-account
   `windowStates` (the best-known real window expiry that runtime deferral
-  schedules around), and `lastResolvedFire` (the latest local-fire time whose
-  cloud backstop may safely move forward), rewritten every tick (plus
-  `scheduler.lock`, its flock file).
+  schedules around), and `lastResolvedFire` (the latest fire whose cloud-routine
+  run is accounted for, so it can't be reconciled twice), rewritten every tick
+  (plus `scheduler.lock`, its flock file).
 - `usage.json`, `usage-ratelimit.json` — cached readings / 429 backoff.
 - `keychain-grants.json` — which Keychain services the `/usr/bin/security` read
   path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
   any of them stay silent (see `KeychainGrantStore`).
 - `preferences.json` — display preferences plus the provider-wide Claude and
-  Codex ping methods (`terminal` / `headless` / `sdk`), shared by app + CLI.
+  Codex ping methods, shared by app + CLI *and the scheduler daemon*. Three
+  local drivers (`terminal` / `headless` / `sdk`) plus, for Claude only,
+  `routine`: the claude.ai cloud routine, which is a ping method rather than a
+  separate feature because it answers the same question — what anchors this
+  account. Picking it stops local Claude pings entirely.
 - `sdk-ping/` — the Node/Python helper scripts materialized by the installed
   binary when an SDK ping runs. SDK dependencies are user-installed here; the
   app never runs npm/pip or contacts a package registry.
@@ -239,22 +242,28 @@ Work the chain in this order:
    restarts; `lastHandled` is the per-account watermark of the last resolved
    fire (fired *or* deliberately dropped), while `inFlight` identifies a child
    whose outcome is not resolved yet; `upcoming` is what it planned next.
-   `am scheduler status` pretty-prints it.
+   `am scheduler status` pretty-prints it — and, on its `cloud:` lines, the
+   armed one-shot per account from `cloud-fallback-state.json` (step 4's
+   ground truth for what the routine was going to do).
 2. **Did each fire happen, skip, or fail?** `audit.log.jsonl`, keyed by the
    dotted `action` field: `scheduler.start` marks a daemon (re)launch; each
    attempt is `ping.start` → `ping` (with `ok` and a one-line `detail`);
    deliberate drops are `ping.skip`, whose detail says why — `"stale ping
    (due 34m ago)"`, `"N stale pings (slept through…)"`, `"cloud routine
-   covered this fire"`, or `"open window leaves no usable budget slice"`.
+   covered this fire"`, `"cloud routine method — no local ping"` (the slot
+   passed with the routine unconfirmed: unanchored by design, never a flaky
+   local turn), or `"open window leaves no usable budget slice"`.
    A fire that ran *minutes past its planned minute on purpose* logs
    `ping.defer` first (from the daemon when it shifts the queue past a
    known-open window, or from the child's preflight when it catches one at
    fire time) — deferral is the fix for phantom pings, not a malfunction: a
-   turn fired into a still-open window anchors nothing. Cloud-fallback arming
+   turn fired into a still-open window anchors nothing. Cloud-routine arming
    appears as `routine.create` / `routine.adopt` / `routine.arm` /
-   `routine.disable` — and since `cloud-fallback-state.json` only holds the
-   *current* arming, the last `routine.arm` with `ok: true` before the night is
-   what tells you what was armed going in. Caveat: a
+   `routine.disable` (and `cloud.enable` / `cloud.disable` when the Claude ping
+   method crossed into or out of `routine`) — and since
+   `cloud-fallback-state.json` only holds the *current* arming, the last
+   `routine.arm` with `ok: true` before the night is what tells you what was
+   armed going in. Caveat: a
    plain "stale ping" skip does *not* rule out cloud coverage — the daemon
    can only log `"cloud routine covered…"` when it can reach the routines
    API at tick time (an expired token there means it reports a bare stale
@@ -291,8 +300,7 @@ Exit codes, when reading daemon ↔ child traces: `am ping` exits 0 = anchored
 stale-skip, 4 = deferred (preflight or postflight proved the window was already
 open — the daemon re-fires just past its expiry), 5 = anchor unverified (a turn
 ran but usage couldn't confirm the window moved; scheduled around
-conservatively, never
-treated as an anchor by the cloud fallback) — see `PingOutcome`; the daemon
+conservatively, never reported as an anchor) — see `PingOutcome`; the daemon
 reads any unknown code as failed. The daemon's best-known window expiry per
 account travels as `windowStates` in `scheduler-status.json`, fed by usage
 readings (`resets_at` is exact) and observed/scheduled anchor events
@@ -362,11 +370,16 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   `.notFound` → one `register()` per app run (`scheduler.reregister` in the
   audit log) — a real state change, so it can't re-notify an approved agent.
 - **Terminal is the verified anchoring method.** Controlled-terminal pings over
-  a PTY remain the default and the only method verified to anchor the rolling
-  window. Preferences exposes provider-wide experimental `headless` (`claude
-  -p` / `codex exec`) and `sdk` methods for re-testing provider behavior; `am
-  ping <id> --method terminal|headless|sdk` supplies a one-off override. Never
-  equate method/process success with anchoring: scheduled children still bracket
+  a PTY remain the default and the only *local* method verified to anchor the
+  rolling window. Preferences exposes provider-wide experimental `headless`
+  (`claude -p` / `codex exec`) and `sdk` methods for re-testing provider
+  behavior, plus Claude's `routine` (see the cloud-routine gotcha below); `am
+  ping <id> --method terminal|headless|sdk` supplies a one-off override —
+  `routine` is deliberately rejected there, because it schedules a future cloud
+  run rather than delivering a turn now. For the same reason anything that must
+  run a turn locally under that preference (Test ping, a hand-run `am ping`)
+  falls back to `PingMethod.localDriver`, i.e. terminal. Never equate
+  method/process success with anchoring: scheduled children still bracket
   every method with usage reads, and only `AnchorVerification` may report a moved
   window. SDK helpers are materialized in `<workspace>/sdk-ping`; users install
   `@anthropic-ai/claude-agent-sdk` / `openai-codex` themselves, and Agent Manager
@@ -395,44 +408,42 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   bridges it with a timed `caffeinate -i -t` whenever the next fire is ≤90 s
   out, until the ping child's own PID-bound assertion takes over. Don't widen
   the helper's lead past the bridge window or the Mac re-sleeps in the gap.
-- **Cloud fallback is a one-shot dead-man's switch.** The one case the wake
+- **The cloud routine is a ping method, not a safety net.** The case the wake
   helper can't cover — closed lid on battery, where the firmware suppresses RTC
-  wakes — is handled by the experimental cloud fallback (Claude only): the
-  daemon keeps a claude.ai routine ("AgentManager Routine") armed at
-  `next fire + 5 min`; a locally-anchored ping re-arms it forward, so
-  Anthropic's cloud runs it only when the Mac provably couldn't. Its
-  invariants: **always `run_once_at`, never cron** (an orphaned routine fires
-  at most once, then auto-disables server-side); **the daemon is the only API
-  writer** (app/CLI only flip `cloud-fallback.json`); **create is adopt-first**
-  — the routine list is the customer's, and `triggerID` lives only in local
-  state (losable to an uninstall/reinstall, a dev-variant workspace, a
-  re-added account slug), so whenever no routine is pinned the engine
-  re-adopts an existing "AgentManager Routine" by name (list → patch), pauses
-  any enabled strays, and creates only when the account has zero of ours —
-  this instance never grows the list past one; **delete is web-only** —
-  the API exposes DELETE solely to cookie-authenticated web sessions, which we
-  never touch, so "off" means `enabled: false`; **never trigger the delegated
-  token refresh from the engine** — a `/status` refresh anchors a window, the
-  very thing pings schedule (the token is fresh right after a ping anyway,
-  because the real CLI just ran); and the anchor signal is `am ping`'s exit
-  code (0 anchored / 2 failed / 3 stale-skip — a skip must never read as an
-  anchor). Everything is fail-soft: any API error just logs, backs off, and
+  wakes, or any Mac with chronic sleep races — is handled by picking `routine`
+  as Claude's ping method (Claude only). The daemon then keeps a
+  claude.ai routine ("AgentManager Routine") armed at the **exact planned
+  fire** and **never spawns a local Claude ping**; Codex is untouched (no
+  routines → it keeps pinging locally). `reconcilePassedCloudFire` resolves
+  each fire the routine covered (real anchor vs. phantom still decided by usage
+  evidence), and a drain-loop guard consumes any Claude entry the routine
+  hasn't confirmed yet — that one window goes **unanchored by design** (logged
+  `skipped: cloud routine method …`) rather than falling back to the flaky
+  local turn the method exists to avoid. Its invariants: **always
+  `run_once_at`, never cron** (an orphaned routine fires at most once, then
+  auto-disables server-side); **the daemon is the only API writer** (the app
+  only writes the preference; the CLI doesn't write it at all — `am scheduler
+  status` just reports what's armed); **create is adopt-first** — the routine
+  list is the customer's, and `triggerID` lives only in local state (losable to an
+  uninstall/reinstall, a dev-variant workspace, a re-added account slug), so
+  whenever no routine is pinned the engine re-adopts an existing "AgentManager
+  Routine" by name (list → patch), pauses any enabled strays, and creates only
+  when the account has zero of ours — this instance never grows the list past
+  one; **delete is web-only** — the API exposes DELETE solely to
+  cookie-authenticated web sessions, which we never touch, so "off" means
+  `enabled: false`; and **never trigger the delegated token refresh from the
+  engine** — a `/status` refresh anchors a window, the very thing pings
+  schedule (the token is fresh right after a ping anyway, because the real CLI
+  just ran). Everything is fail-soft: any API error just logs, backs off, and
   leaves local scheduling untouched.
-- **Cloud-primary mode inverts the backstop.** With `cloudPrimary` on (the
-  "Routines only" mode, only honored while `enabled`), the routine stops
-  being a dead-man's switch and becomes the *sole* anchor for Claude accounts:
-  the daemon arms it at the **exact planned fire** (`cloudLead == 0`, not
-  `+5 min`) and **never spawns a local Claude ping** — for a Mac too unreliable
-  to ping locally (chronic sleep races). Mechanically it's the same code path
-  with `lead = 0`: `reconcilePassedCloudFire` resolves each Claude fire the
-  routine covered (real anchor vs. phantom still decided by usage evidence),
-  and a drain-loop guard skips any Claude entry the routine hasn't confirmed
-  yet — that one window goes **unanchored by design** (logged
-  `skipped: cloud-primary …`) rather than falling back to the flaky local turn.
-  Codex is untouched (no cloud routine → keeps pinging locally). The lead is
-  threaded end to end (`CloudFallbackSyncRequest.leadSeconds` →
-  `CloudFallbackPlanner.plan(lead:)`), so arm target, convergence check, and
-  `armedFor - lead` covered-fire math all stay consistent.
+
+  There used to be a second, *fallback* mode: the routine armed at
+  `fire + 5 min` as a dead-man's switch behind a local ping. It is retired —
+  two anchors for one slot made "what anchors this account?" a question with
+  two answers, and the planner had to hold an armed one-shot until its fire
+  resolved. With the routine armed *at* the fire, the planner is pure
+  convergence (arm the next fire, disable when there is none), so don't
+  reintroduce a lead without reintroducing that hold.
 - **Missing menu-bar item after running a dev *and* a packaged build.** If the
   status item doesn't appear even though the app is running and `menuBarMode`
   isn't `.hidden`, suspect a stale ControlCenter record, not the code. Running a

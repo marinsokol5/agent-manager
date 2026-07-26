@@ -99,21 +99,20 @@ public actor SchedulerDaemon {
     /// Minute-geometry compilation is cached with the stamped config. Ticks
     /// only resolve these weekly fields to concrete dates and watermarks.
     private var weeklyEntries: [String: [CalEntry]] = [:]
-    /// Every known account's provider (connected or not) — the cloud-fallback
+    /// Every known account's provider (connected or not) — the cloud-routine
     /// sync must also reach routines of accounts that just *disconnected*.
     private var providersByID: [String: Provider] = [:]
-    /// The experimental cloud-fallback opt-in (`cloud-fallback.json`).
-    private var cloudFallbackEnabled = false
-    /// Cloud-primary mode (`cloudPrimary` in `cloud-fallback.json`, only ever
-    /// true when `cloudFallbackEnabled` is too): the claude.ai routine is the
-    /// *sole* anchor for Claude accounts — armed at the exact planned fire
-    /// (`cloudLead == 0`), and local Claude pings are never spawned. Codex is
-    /// unaffected. Reloaded with the other config stamps.
-    private var cloudPrimaryEnabled = false
-    /// Effective local-fire times whose cloud backstops are resolved: a
-    /// verified local anchor, a passed one-shot, or an entry already covered
-    /// by a known-open window. Persisted because losing this between the local
-    /// decision and the routines API re-arm would let an obsolete one-shot run.
+    /// Claude's ping method is the cloud routine (`preferences.json` →
+    /// `claudePingMethod: routine`): the claude.ai one-shot is the *sole* anchor
+    /// for Claude accounts — armed at the exact planned fire — and local Claude
+    /// pings are never spawned. Codex is unaffected (no routines → it keeps
+    /// pinging locally). Reloaded with the other config stamps, from the same
+    /// file the ping children read.
+    private var cloudRoutineEnabled = false
+    /// Fire times whose cloud routine run is accounted for: a passed one-shot,
+    /// a verified local anchor, or an entry already covered by a known-open
+    /// window. Persisted because losing it between the local decision and the
+    /// routines API re-arm would let the daemon reconcile the same run twice.
     private var lastResolvedFire: [String: Date] = [:]
     /// Best-known real expiry of each account's rolling window — the evidence
     /// `RuntimeAnchorPolicy` bends the queue around, so a fixed-time entry
@@ -233,7 +232,7 @@ public actor SchedulerDaemon {
     /// process then exits and the KeepAlive agent relaunches it on the new
     /// code, so users never have to restart the daemon by hand after an
     /// upgrade. The relaunch is double-fire safe by construction — watermarks
-    /// persist in the status file, including runtime window/backstop state.
+    /// persist in the status file, including runtime window/routine state.
     public func runForever() async {
         audit.append(accountID: nil, action: "scheduler.start", ok: true, detail: "pid \(pid)")
         while true {
@@ -251,7 +250,7 @@ public actor SchedulerDaemon {
 
         // One read per tick: which cloud routines are armed (for the
         // covered-fire check below). The engine is the file's only writer.
-        let cloudStates = cloudFallbackEnabled
+        let cloudStates = cloudRoutineEnabled
             ? CloudFallbackStateStore(workspace: workspace, fileManager: fileManager).load()
             : CloudFallbackState()
 
@@ -284,20 +283,20 @@ public actor SchedulerDaemon {
                 dropped.append(head)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
-            } else if cloudPrimaryEnabled
+            } else if cloudRoutineEnabled
                 && providersByID[head.accountID]?.supportsCloudAnchorRoutines == true
             {
-                // Cloud-primary: this account is anchored solely by its
-                // claude.ai routine, never a local ping.
+                // The `routine` ping method: this account is anchored solely by
+                // its claude.ai routine, never a local ping.
                 // `reconcilePassedCloudFire` already resolved (and logged) any
                 // fire the routine covered, so reaching a *due* entry here means
                 // the routine isn't confirmed for this fire — not yet armed, or
                 // its arm is erroring. We consume the slot without pinging: this
                 // one window goes unanchored by design rather than fall back to
-                // the flaky local turn the mode exists to avoid; the post-drain
+                // the flaky local turn the method exists to avoid; the post-drain
                 // sync re-arms the routine forward for the next fire.
                 markHandled(head)
-                logCloudPrimarySkip(head)
+                logUnconfirmedRoutineSkip(head)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
             } else {
@@ -329,13 +328,13 @@ public actor SchedulerDaemon {
                     // nominal slot pending so it re-fires at the real expiry.
                     noteAnchorEvidence(head.accountID, since: fireStarted)
                     if windowWasAlreadyOpen(head.accountID, at: fireStarted) {
-                        resolveRedundantBackstopIfProven(for: head)
+                        resolveCloudFireIfWindowOpen(for: head)
                     } else {
                         markHandled(head)
                     }
                 case .timedOut:
                     // The child may have dispatched before wedging. Hold later
-                    // local fires conservatively, but never cancel its backstop.
+                    // local fires conservatively, but never call this a resolved fire.
                     markHandled(head)
                     noteAnchorEvidence(head.accountID, since: fireStarted)
                 case .deferredOpenWindow:
@@ -344,7 +343,7 @@ public actor SchedulerDaemon {
                     // never advanced, so the rebuild re-emits this entry — now
                     // deferred by that evidence — instead of writing it off.
                     noteDeferredOutcomeEvidence(head.accountID)
-                    resolveRedundantBackstopIfProven(for: head)
+                    resolveCloudFireIfWindowOpen(for: head)
                 case .failed, .skippedStale:
                     markHandled(head)
                 }
@@ -396,24 +395,22 @@ public actor SchedulerDaemon {
     }
 
     /// Reconcile each Claude account's cloud anchor routine with the plan:
-    /// keep a one-shot armed at `next fire + lead` while the feature and the
-    /// scheduler are on; drive it to disabled otherwise (a nil `nextFireAt` is
-    /// the disable signal — that also covers accounts that just disconnected).
-    /// Steady state is a no-op (the engine's planner returns `.none`), so this
-    /// only talks to the API when something actually changed.
+    /// keep a one-shot armed at the next planned fire while the `routine` ping
+    /// method and the scheduler are on; drive it to disabled otherwise (a nil
+    /// `nextFireAt` is the disable signal — that also covers accounts that just
+    /// disconnected). Steady state is a no-op (the engine's planner returns
+    /// `.none`), so this only talks to the API when something actually changed.
     private func syncCloudFallback(upcoming: [QueueEntry]) async {
         for (id, provider) in providersByID.sorted(by: { $0.key < $1.key })
             where provider.supportsCloudAnchorRoutines
         {
-            let nextFire: Date? = (cloudFallbackEnabled && active && accountIDs.contains(id))
+            let nextFire: Date? = (cloudRoutineEnabled && active && accountIDs.contains(id))
                 ? upcoming.first(where: { $0.accountID == id })?.fireAt
                 : nil
             await cloudSyncer(CloudFallbackSyncRequest(
                 accountID: id,
                 nextFireAt: nextFire,
-                lastAnchoredFireAt: lastResolvedFire[id],
-                now: now(),
-                leadSeconds: cloudLead))
+                now: now()))
         }
     }
 
@@ -427,12 +424,13 @@ public actor SchedulerDaemon {
             time: now(), accountID: entry.accountID, ok: true, anchored: true, detail: detail))
     }
 
-    /// Cloud-primary mode consumed a Claude slot without a local ping because
-    /// its routine wasn't confirmed for this fire (not yet armed, or its arm is
-    /// erroring). `anchored: false` — nothing anchored from our side this time;
-    /// once the routine arms, `reconcilePassedCloudFire` covers later fires.
-    private func logCloudPrimarySkip(_ entry: QueueEntry) {
-        let detail = "skipped: cloud-primary — no local ping; routine anchors this account"
+    /// The `routine` ping method consumed a Claude slot without a local ping
+    /// because its routine wasn't confirmed for this fire (not yet armed, or
+    /// its arm is erroring). `anchored: false` — nothing anchored from our side
+    /// this time; once the routine arms, `reconcilePassedCloudFire` covers
+    /// later fires.
+    private func logUnconfirmedRoutineSkip(_ entry: QueueEntry) {
+        let detail = "skipped: cloud routine method — no local ping; the routine anchors this account"
         audit.append(accountID: entry.accountID, action: "ping.skip", ok: true, detail: detail)
         activity.append(ActivityRecord(
             time: now(), accountID: entry.accountID, ok: true, anchored: false, detail: detail))
@@ -493,7 +491,7 @@ public actor SchedulerDaemon {
             workspace.scheduleFile,
             workspace.accountsFile,
             workspace.schedulerConfigFile,
-            workspace.cloudFallbackConfigFile,
+            workspace.preferencesFile,
         ].map(stamp)
         guard fresh != stamps else { return }
         stamps = fresh
@@ -520,19 +518,12 @@ public actor SchedulerDaemon {
         let knownAccountIDs = Set(providersByID.keys)
         windowStates = windowStates.filter { knownAccountIDs.contains($0.key) }
         lastResolvedFire = lastResolvedFire.filter { knownAccountIDs.contains($0.key) }
-        let cloudConfig = CloudFallbackConfigStore(workspace: workspace, fileManager: fileManager).load()
-        cloudFallbackEnabled = cloudConfig.enabled
-        cloudPrimaryEnabled = cloudConfig.enabled && cloudConfig.cloudPrimary
-    }
-
-    /// The routine arm lead for this daemon's mode: `0` in cloud-primary (arm
-    /// the routine at the exact planned fire, the account's only anchor), the
-    /// planner's `lead` otherwise (armed as a backstop after the local ping).
-    /// Threaded to `syncCloudFallback` and to every place the daemon reasons
-    /// about a routine's covered fire (`armedFor - lead`) so the two stay
-    /// consistent.
-    private var cloudLead: TimeInterval {
-        cloudPrimaryEnabled ? 0 : CloudFallbackPlanner.lead
+        // The one Claude-side question this daemon asks of `preferences.json`:
+        // is the cloud routine Claude's ping method? Same file the ping children
+        // read their driver from, so the daemon can never disagree with them
+        // about what anchors an account.
+        cloudRoutineEnabled = PreferencesStore(workspace: workspace, fileManager: fileManager)
+            .load().pingMethod(for: .claude).usesCloudRoutine
     }
 
     // MARK: - queue
@@ -653,14 +644,14 @@ public actor SchedulerDaemon {
         return adjusted
     }
 
-    /// Reconcile one passed cloud one-shot even when the corresponding local
-    /// entry is not due because runtime state shifted it later. `armedFor -
-    /// lead` is the effective local fire that the one-shot backed; match that
+    /// Reconcile one passed cloud one-shot even when the corresponding queue
+    /// entry is not due because runtime state shifted it later. The routine is
+    /// armed *at* its fire, so `armedFor` is the fire it ran — match that
     /// against either today's effective queue or the entry's nominal identity.
     /// Returning after one mutation forces the caller to rebuild before it
     /// considers another account.
     private func reconcilePassedCloudFire(_ cloudStates: CloudFallbackState) async -> Bool {
-        guard cloudFallbackEnabled else { return false }
+        guard cloudRoutineEnabled else { return false }
 
         let nominal = rebuildQueue()
         let adjusted = adjustNominalQueue(nominal)
@@ -674,16 +665,17 @@ public actor SchedulerDaemon {
                   now() >= armedFor
             else { continue }
 
-            let coveredFire = armedFor.addingTimeInterval(-cloudLead)
-            if let resolved = lastResolvedFire[id], resolved >= coveredFire { continue }
+            // The routine is armed *at* its fire, so `armedFor` is both the
+            // moment it ran and the fire it covered — one value, one name.
+            if let resolved = lastResolvedFire[id], resolved >= armedFor { continue }
 
             let sameInstant: (Date, Date) -> Bool = {
                 abs($0.timeIntervalSince($1)) < 1
             }
             let entry = adjusted.entries.first {
-                $0.accountID == id && sameInstant($0.fireAt, coveredFire)
+                $0.accountID == id && sameInstant($0.fireAt, armedFor)
             } ?? nominal.first {
-                $0.accountID == id && sameInstant($0.nominalFireAt, coveredFire)
+                $0.accountID == id && sameInstant($0.nominalFireAt, armedFor)
             }
 
             // `resets_at` is the only exact cloud-anchor timestamp available.
@@ -700,24 +692,24 @@ public actor SchedulerDaemon {
             }
 
             if windowWasAlreadyOpen(id, at: armedFor) {
-                // The one-shot itself was a phantom. Resolve that obsolete
-                // backstop so the engine can move it forward. If its local
-                // entry is still pending, leave that entry for the real expiry.
+                // The one-shot itself was a phantom. Resolve that pointless
+                // run so the engine can move the routine forward. If its queue
+                // entry is still pending, leave it for the real expiry.
                 logCloudPhantom(accountID: id)
-                markCloudFireResolved(id, fireAt: coveredFire)
+                markCloudFireResolved(id, fireAt: armedFor)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
                 return true
             }
 
-            // The slot may already be watermarked because its local child
-            // failed or returned anchor-unknown. The unresolved backstop still
-            // ran and can be the event that truly anchored the account, so
-            // account for it even without a pending queue entry.
+            // The slot may already be watermarked — this account's method may
+            // have changed, or the fire was consumed with the routine still
+            // unconfirmed. The one-shot ran regardless and can be the event
+            // that truly anchored, so account for it with no pending entry.
             if let entry { markHandled(entry) }
-            logCloudCoveredSkip(QueueEntry(fireAt: coveredFire, accountID: id))
+            logCloudCoveredSkip(QueueEntry(fireAt: armedFor, accountID: id))
             noteCloudAnchorEvidence(id, armedFor: armedFor)
-            markCloudFireResolved(id, fireAt: coveredFire)
+            markCloudFireResolved(id, fireAt: armedFor)
             let checkpoint = adjustedQueue()
             writeStatus(upcoming: checkpoint.entries, current: nil)
             return true
@@ -771,13 +763,14 @@ public actor SchedulerDaemon {
         lastHandled[entry.accountID] = entry.nominalFireAt
     }
 
-    /// A deferred/phantom local turn should also cancel its old +5m cloud
-    /// backstop when exact reset evidence proves that backstop would land in
-    /// the same already-open window. Otherwise leave it armed: it may still be
-    /// the event that anchors after a reset occurring before the +5m mark.
-    private func resolveRedundantBackstopIfProven(for entry: QueueEntry) {
-        let backstopAt = entry.fireAt.addingTimeInterval(cloudLead)
-        if windowWasAlreadyOpen(entry.accountID, at: backstopAt) {
+    /// A deferred/phantom local turn also settles this fire's cloud routine
+    /// when exact reset evidence proves a run at that minute would land inside
+    /// an already-open window — nothing left for the reconciler to attribute.
+    /// Otherwise leave the fire unresolved: the routine may still be the event
+    /// that anchors. (Reachable only across a method switch — while `routine`
+    /// is Claude's method no local Claude turn runs at all.)
+    private func resolveCloudFireIfWindowOpen(for entry: QueueEntry) {
+        if windowWasAlreadyOpen(entry.accountID, at: entry.fireAt) {
             markCloudFireResolved(entry.accountID, fireAt: entry.fireAt)
         }
     }
@@ -1135,8 +1128,8 @@ public actor SchedulerDaemon {
             }
             if !process.isRunning { process.waitUntilExit() }
             // A wedged child we had to kill may or may not have dispatched its
-            // turn first — report `.timedOut`, which the cloud fallback treats
-            // as "not anchored" (the safe reading).
+            // turn first — report `.timedOut`, which the daemon treats as
+            // "not anchored" (the safe reading).
             return timedOut ? .timedOut : PingOutcome.fromExitCode(process.terminationStatus)
         }
     }
