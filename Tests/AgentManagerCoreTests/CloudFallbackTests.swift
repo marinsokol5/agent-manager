@@ -89,43 +89,81 @@ final class CloudFallbackTests: XCTestCase {
         XCTAssertEqual(action, .none)
     }
 
-    func testPlannerConvergesDespiteSubSecondFireJitter() {
-        // The re-arm churn bug: a deferred/unverified fire inherits sub-second
-        // jitter from usage `resets_at`, but `armedFor` round-trips through the
-        // state store at whole-second granularity (`.iso8601`). The arm target
-        // is floored to the second so convergence holds instead of re-arming
-        // (re-`PATCH`ing the routine) on every tick.
-        let jittery = date(2026, 7, 6, 5, 0).addingTimeInterval(0.169) // 05:00:00.169
-
-        // First arm: target is floored, so it's a clean whole second.
-        let armed = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(), nextFireAt: jittery, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(armed, .arm(date(2026, 7, 6, 5, 0)))
-
-        // Whole-second `armedFor` (what the store reloads) vs. the still-jittery
-        // fire: must converge, not re-arm.
-        let converged = CloudFallbackPlanner.plan(
-            state: AccountCloudFallbackState(triggerID: "t", armedFor: date(2026, 7, 6, 5, 0)),
-            nextFireAt: jittery, now: date(2026, 7, 6, 4, 0))
-        XCTAssertEqual(converged, .none)
+    func testPlannerArmsOnWholeMinutes() {
+        // `run_once_at` schedules by the minute, and a target derived from a
+        // reset carries that reset's fractional seconds. Round *up*, so the fire
+        // can never land back inside the window it was deferred past.
+        let deferred = date(2026, 7, 6, 10, 32).addingTimeInterval(0.848)
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: AccountCloudFallbackState(), nextFireAt: deferred, now: date(2026, 7, 6, 9, 0)),
+            .arm(date(2026, 7, 6, 10, 33)))
     }
 
-    func testPlannerHoldsAPassedOneShotUntilItsFireLeavesTheQueue() {
-        // 05:00's one-shot has fired but the daemon hasn't reconciled it yet,
-        // so 05:00 is still the next planned fire. Nothing may move until that
-        // run is accounted for — otherwise the routine jumps ahead of a fire
-        // the daemon still believes is pending.
+    func testPlannerDoesNotRearmForJitterWithinOneAnchorBucket() {
+        // The re-arm churn bug, with the real values: the same live window read
+        // as `10:29:59.576` and then `10:30:00.848`, which — plus the refire
+        // margin — moved the target across a whole-minute boundary and re-armed
+        // a routine that would have anchored identically either way. Both land
+        // in the 10:30 anchor bucket, so there is nothing to do.
+        let armed = date(2026, 7, 6, 10, 32)
+        for jitter in [-0.424, 0.848, 60.0, 420.0] {
+            let desired = armed.addingTimeInterval(jitter)
+            XCTAssertEqual(
+                CloudFallbackPlanner.plan(
+                    state: AccountCloudFallbackState(triggerID: "t", armedFor: armed),
+                    nextFireAt: desired, now: date(2026, 7, 6, 9, 0)),
+                .none,
+                "jitter of \(jitter)s stayed inside the bucket and must not re-arm")
+        }
+        // Crossing into the next bucket really does change the anchor.
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: AccountCloudFallbackState(triggerID: "t", armedFor: armed),
+                nextFireAt: date(2026, 7, 6, 10, 41), now: date(2026, 7, 6, 9, 0)),
+            .arm(date(2026, 7, 6, 10, 41)))
+    }
+
+    func testPlannerHoldsAPassedOneShotThroughTheDispatchGap() {
+        // The cancellation bug. claude.ai dispatches a one-shot tens of seconds
+        // late, and `run_once_at` is the server's only handle on that pending
+        // run — so moving it during the gap deletes the run. Five seconds after
+        // the armed minute, with the next fire already five hours out, the
+        // planner must still refuse to move.
         let fire = date(2026, 7, 6, 5, 0)
+        let next = date(2026, 7, 6, 10, 0)
         let state = AccountCloudFallbackState(triggerID: "t", armedFor: fire)
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: state, nextFireAt: fire, now: date(2026, 7, 6, 5, 1)),
+            CloudFallbackPlanner.plan(
+                state: state, nextFireAt: next, now: fire.addingTimeInterval(5)),
             .none)
 
-        // Reconciled: the queue moved on, so the routine follows it.
-        let next = date(2026, 7, 6, 10, 0)
+        // Resolved by the daemon → the run is accounted for, so follow the queue.
         XCTAssertEqual(
-            CloudFallbackPlanner.plan(state: state, nextFireAt: next, now: date(2026, 7, 6, 5, 1)),
+            CloudFallbackPlanner.plan(
+                state: state, nextFireAt: next, resolvedFire: fire,
+                now: fire.addingTimeInterval(5)),
             .arm(next))
+
+        // Never resolved at all: the settle deadline releases the hold anyway,
+        // so a stuck reconciler cannot freeze the routine forever.
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: state, nextFireAt: next,
+                now: fire.addingTimeInterval(CloudFallbackPlanner.dispatchSettle + 1)),
+            .arm(next))
+    }
+
+    func testPlannerStillDisablesDuringTheDispatchGap() {
+        // The hold protects a pending run from being *moved*, not from being
+        // switched off: turning the method (or the scheduler) off is the user
+        // asking for exactly that.
+        let fire = date(2026, 7, 6, 5, 0)
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: AccountCloudFallbackState(triggerID: "t", armedFor: fire),
+                nextFireAt: nil, now: fire.addingTimeInterval(5)),
+            .disable)
     }
 
     func testPlannerFollowsRepaintsInBothDirections() {
@@ -195,6 +233,32 @@ final class CloudFallbackTests: XCTestCase {
         XCTAssertEqual(trigger.runOnceAt, date(2026, 7, 5, 7, 0))
         XCTAssertEqual(trigger.nextRunAt, date(2026, 7, 5, 7, 0))
         XCTAssertNil(trigger.endedReason) // empty string reads as "still live"
+    }
+
+    func testDecodesLastFiredAtFromARearmResponse() throws {
+        // Captured from the re-arm that cancelled a pending run: the response
+        // came back five seconds after `run_once_at` had passed, still
+        // `enabled: true` with an empty `ended_reason`, and `last_fired_at`
+        // pointing at the *previous* night. That one field is the whole
+        // difference between "it ran" and "we just deleted it".
+        let json = """
+        {"trigger":{"id":"trig_013QWDNZ4CPvmusg2qEEeN2s","name":"AgentManager Routine",
+        "cron_expression":"","enabled":true,"ended_reason":"",
+        "last_fired_at":"2026-07-25T02:00:44.137244Z","next_run_at":"2026-07-26T10:01:00Z",
+        "persist_session":false,"run_once_at":"2026-07-26T10:01:00Z",
+        "updated_at":"2026-07-26T05:00:06.001581Z"}}
+        """
+        let trigger = try TriggerClient.decodeTriggerForTesting(Data(json.utf8))
+        XCTAssertEqual(
+            trigger.lastFiredAt?.timeIntervalSince1970 ?? 0,
+            date(2026, 7, 25, 2, 0, 44).timeIntervalSince1970 + 0.137244,
+            accuracy: 0.001)
+        XCTAssertEqual(trigger.runOnceAt, date(2026, 7, 26, 10, 1))
+        XCTAssertTrue(trigger.enabled)
+        XCTAssertNil(trigger.endedReason)
+        // The armed fire was 2026-07-26T05:00:00Z; the last run predates it, so
+        // this response proves the one-shot had not run when we moved it.
+        XCTAssertLessThan(trigger.lastFiredAt!, date(2026, 7, 26, 5, 0))
     }
 
     func testDecodesTriggerListAndFiredOneShot() throws {
@@ -269,6 +333,13 @@ final class CloudFallbackTests: XCTestCase {
                     }
                     recordPatch(id, patch)
                     return CloudTrigger(id: id, enabled: patch.enabled ?? true, runOnceAt: patch.runOnceAt)
+                },
+                getRoutine: { [self] id, _, _ in
+                    record("get")
+                    guard let found = triggers.first(where: { $0.id == id }) else {
+                        throw TriggerAPIError.notFound
+                    }
+                    return found
                 })
         }
     }
@@ -296,11 +367,14 @@ final class CloudFallbackTests: XCTestCase {
         // of ours, then discover/create the environment and create.
         XCTAssertEqual(api.calls, ["list", "listEnv", "createEnv", "create"])
         XCTAssertEqual(api.createdSpecs.first?.name, "AgentManager Routine")
-        XCTAssertEqual(api.createdSpecs.first?.model, CloudFallbackEngine.routineModel)
+        XCTAssertEqual(api.createdSpecs.first?.job.model, CloudFallbackEngine.routineModel)
+        XCTAssertEqual(api.createdSpecs.first?.job.prompt, CloudFallbackEngine.routinePrompt)
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_new")
         XCTAssertEqual(state?.environmentID, "env_new")
         XCTAssertEqual(state?.armedFor, fire)
+        // Stamped, so a later arm doesn't gratuitously rewrite the instructions.
+        XCTAssertEqual(state?.routineRevision, CloudFallbackEngine.routineRevision)
         XCTAssertNil(state?.lastError)
     }
 
@@ -310,17 +384,22 @@ final class CloudFallbackTests: XCTestCase {
         api.environments = [CloudEnvironment(id: "env_default", kind: "anthropic_cloud", name: "Default", state: "active")]
         let engine = try makeEngine(ws, api: api)
 
-        // Existing routine armed for 05:05; 05:00 anchored locally → advance to 10:05.
+        // Existing routine armed for 05:00, whose fire the daemon has already
+        // resolved → follow the queue to 10:00. (`resolvedFire` is what lifts the
+        // dispatch hold; without it the 05:00 arm would still be untouchable.)
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_1", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
+            triggerID: "trig_1", environmentID: "env_default",
+            armedFor: date(2026, 7, 6, 5, 0),
+            routineRevision: CloudFallbackEngine.routineRevision)
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            now: date(2026, 7, 6, 5, 1)))
+            resolvedFire: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
 
         XCTAssertEqual(api.calls, ["update"]) // cached env, no create
+        XCTAssertNil(api.patches.first?.patch.job) // instructions already current
         XCTAssertEqual(api.patches.first?.id, "trig_1")
         XCTAssertEqual(api.patches.first?.patch.runOnceAt, date(2026, 7, 6, 10, 0))
         XCTAssertEqual(api.patches.first?.patch.enabled, true)
@@ -335,12 +414,14 @@ final class CloudFallbackTests: XCTestCase {
 
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
+            triggerID: "trig_gone", environmentID: "env_default",
+            armedFor: date(2026, 7, 6, 5, 0),
+            routineRevision: CloudFallbackEngine.routineRevision)
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            now: date(2026, 7, 6, 5, 1)))
+            resolvedFire: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
 
         // 404 → look for an adoptable sibling first; none → create.
         XCTAssertEqual(api.calls, ["updateFail", "list", "create"])
@@ -356,6 +437,7 @@ final class CloudFallbackTests: XCTestCase {
         // existing "AgentManager Routine" by name and re-arms it in place.
         let ws = makeWorkspace()
         let api = FakeAPI()
+        api.environments = [CloudEnvironment(id: "env_default", kind: "anthropic_cloud", name: "Default", state: "active")]
         api.triggers = [
             CloudTrigger(id: "trig_user", name: "My own routine", enabled: true),
             CloudTrigger(id: "trig_old", name: "AgentManager Routine", enabled: false,
@@ -367,13 +449,18 @@ final class CloudFallbackTests: XCTestCase {
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: fire, now: date(2026, 7, 6, 4, 0)))
 
-        XCTAssertEqual(api.calls, ["list", "update"]) // no create, no env discovery
+        // No create — but the environment *is* resolved, because an adopted
+        // routine's instructions are an unknown quantity and get rewritten.
+        XCTAssertEqual(api.calls, ["list", "listEnv", "update"])
         XCTAssertEqual(api.patches.first?.id, "trig_old")
         XCTAssertEqual(api.patches.first?.patch.runOnceAt, fire)
         XCTAssertEqual(api.patches.first?.patch.enabled, true)
+        XCTAssertEqual(api.patches.first?.patch.job?.prompt, CloudFallbackEngine.routinePrompt)
+        XCTAssertEqual(api.patches.first?.patch.job?.environmentID, "env_default")
         let state = CloudFallbackStateStore(workspace: ws).load().accounts["a1"]
         XCTAssertEqual(state?.triggerID, "trig_old")
         XCTAssertEqual(state?.armedFor, fire)
+        XCTAssertEqual(state?.routineRevision, CloudFallbackEngine.routineRevision)
         XCTAssertNil(state?.lastError)
     }
 
@@ -383,6 +470,7 @@ final class CloudFallbackTests: XCTestCase {
         // the strongest cleanup the API allows (DELETE is web-only).
         let ws = makeWorkspace()
         let api = FakeAPI()
+        api.environments = [CloudEnvironment(id: "env_default", kind: "anthropic_cloud", name: "Default", state: "active")]
         api.triggers = [
             CloudTrigger(id: "trig_paused", name: "AgentManager Routine", enabled: false),
             CloudTrigger(id: "trig_live", name: "AgentManager Routine", enabled: true),
@@ -394,7 +482,7 @@ final class CloudFallbackTests: XCTestCase {
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: fire, now: date(2026, 7, 6, 4, 0)))
 
-        XCTAssertEqual(api.calls, ["list", "update", "update"])
+        XCTAssertEqual(api.calls, ["list", "listEnv", "update", "update"])
         XCTAssertEqual(api.patches[0].id, "trig_live")
         XCTAssertEqual(api.patches[0].patch.enabled, true)
         XCTAssertEqual(api.patches[1].id, "trig_stray")
@@ -414,12 +502,14 @@ final class CloudFallbackTests: XCTestCase {
 
         var seed = CloudFallbackState()
         seed.accounts["a1"] = AccountCloudFallbackState(
-            triggerID: "trig_gone", environmentID: "env_default", armedFor: date(2026, 7, 6, 5, 0))
+            triggerID: "trig_gone", environmentID: "env_default",
+            armedFor: date(2026, 7, 6, 5, 0),
+            routineRevision: CloudFallbackEngine.routineRevision)
         CloudFallbackStateStore(workspace: ws).save(seed)
 
         await engine.sync(CloudFallbackSyncRequest(
             accountID: "a1", nextFireAt: date(2026, 7, 6, 10, 0),
-            now: date(2026, 7, 6, 5, 1)))
+            resolvedFire: date(2026, 7, 6, 5, 0), now: date(2026, 7, 6, 5, 1)))
 
         XCTAssertEqual(api.calls, ["updateFail", "list", "update"])
         XCTAssertEqual(api.patches.first?.id, "trig_sibling")

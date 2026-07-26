@@ -40,6 +40,15 @@ public struct CloudTrigger: Sendable, Equatable {
     public var nextRunAt: Date?
     /// `"run_once_fired"` after a one-shot fired (the routine auto-disabled).
     public var endedReason: String?
+    /// When the routine last actually ran, server-side. **The** authority on
+    /// "did my one-shot fire?": `run_once_at` is only an intent, and the
+    /// dispatch trails it by tens of seconds, so nothing may be concluded from
+    /// the clock alone. Compared against the armed moment before a passed fire
+    /// is ever credited — see `SchedulerDaemon.routineHasRun`.
+    public var lastFiredAt: Date?
+
+    /// `endedReason` of a one-shot that has fired and stood itself down.
+    public static let runOnceFiredReason = "run_once_fired"
 
     public init(
         id: String,
@@ -47,7 +56,8 @@ public struct CloudTrigger: Sendable, Equatable {
         enabled: Bool = false,
         runOnceAt: Date? = nil,
         nextRunAt: Date? = nil,
-        endedReason: String? = nil)
+        endedReason: String? = nil,
+        lastFiredAt: Date? = nil)
     {
         self.id = id
         self.name = name
@@ -55,6 +65,7 @@ public struct CloudTrigger: Sendable, Equatable {
         self.runOnceAt = runOnceAt
         self.nextRunAt = nextRunAt
         self.endedReason = endedReason
+        self.lastFiredAt = lastFiredAt
     }
 }
 
@@ -76,21 +87,34 @@ public struct CloudEnvironment: Sendable, Equatable {
     public var isActiveCloud: Bool { kind == "anthropic_cloud" && state == "active" }
 }
 
+/// What an anchor routine *does* — the instruction payload, as opposed to when
+/// it runs. Sent whole on both create and update: `job_config` is one value to
+/// the API, so patching part of it would drop the rest (`environment_id`
+/// especially), which is why `environmentID` travels even when only the prompt
+/// changed.
+public struct RoutineJob: Sendable, Equatable {
+    public var environmentID: String
+    public var model: String
+    public var prompt: String
+
+    public init(environmentID: String, model: String, prompt: String) {
+        self.environmentID = environmentID
+        self.model = model
+        self.prompt = prompt
+    }
+}
+
 /// Everything a create needs for the minimal anchor routine. The event UUID is
 /// generated fresh per create inside the client.
 public struct AnchorRoutineSpec: Sendable, Equatable {
     public var name: String
     public var runOnceAt: Date
-    public var environmentID: String
-    public var model: String
-    public var prompt: String
+    public var job: RoutineJob
 
-    public init(name: String, runOnceAt: Date, environmentID: String, model: String, prompt: String) {
+    public init(name: String, runOnceAt: Date, job: RoutineJob) {
         self.name = name
         self.runOnceAt = runOnceAt
-        self.environmentID = environmentID
-        self.model = model
-        self.prompt = prompt
+        self.job = job
     }
 }
 
@@ -98,10 +122,17 @@ public struct AnchorRoutineSpec: Sendable, Equatable {
 public struct TriggerPatch: Sendable, Equatable {
     public var runOnceAt: Date?
     public var enabled: Bool?
+    /// Rewrite the routine's instructions/model. Normally `nil` — re-arming
+    /// only moves `run_once_at`. Set when the shipped prompt has moved on from
+    /// what a live routine still holds, so an adopted or long-lived routine
+    /// doesn't keep describing behavior the app no longer has (see
+    /// `CloudFallbackEngine.routineRevision`).
+    public var job: RoutineJob?
 
-    public init(runOnceAt: Date? = nil, enabled: Bool? = nil) {
+    public init(runOnceAt: Date? = nil, enabled: Bool? = nil, job: RoutineJob? = nil) {
         self.runOnceAt = runOnceAt
         self.enabled = enabled
+        self.job = job
     }
 }
 
@@ -171,26 +202,7 @@ public enum TriggerClient {
             "name": spec.name,
             "run_once_at": rfc3339(spec.runOnceAt),
             "enabled": true,
-            "job_config": [
-                "ccr": [
-                    "environment_id": spec.environmentID,
-                    "session_context": [
-                        "model": spec.model,
-                        // The preset keeps the stored config minimal; omitting
-                        // it makes the server expand the full default tool list.
-                        "allowed_tools": ["preset:default"],
-                    ],
-                    "events": [[
-                        "data": [
-                            "uuid": UUID().uuidString.lowercased(),
-                            "session_id": "",
-                            "type": "user",
-                            "parent_tool_use_id": NSNull(),
-                            "message": ["content": spec.prompt, "role": "user"],
-                        ],
-                    ]],
-                ],
-            ],
+            "job_config": jobConfig(spec.job),
         ]
         let data = try await send("POST", url: triggersURL, auth: auth, beta: triggersBeta,
                                   body: body, accountID: accountID, log: log)
@@ -198,7 +210,8 @@ public enum TriggerClient {
     }
 
     /// Partial update: re-arm (`run_once_at`, which also re-enables a fired
-    /// one-shot when paired with `enabled: true`) or pause (`enabled: false`).
+    /// one-shot when paired with `enabled: true`), pause (`enabled: false`), or
+    /// rewrite the instructions (`job`, sent as a complete `job_config`).
     public static func updateTrigger(
         id: String, patch: TriggerPatch, auth: Auth, accountID: String, log: NetworkLog? = nil)
         async throws -> CloudTrigger
@@ -206,9 +219,35 @@ public enum TriggerClient {
         var body: [String: Any] = [:]
         if let runOnceAt = patch.runOnceAt { body["run_once_at"] = rfc3339(runOnceAt) }
         if let enabled = patch.enabled { body["enabled"] = enabled }
+        if let job = patch.job { body["job_config"] = jobConfig(job) }
         let data = try await send("POST", url: triggersURL.appendingPathComponent(id), auth: auth,
                                   beta: triggersBeta, body: body, accountID: accountID, log: log)
         return try decodeTrigger(data)
+    }
+
+    /// The `job_config` value, built the same way for create and update so an
+    /// instruction rewrite can never send a half-populated `ccr` block.
+    private static func jobConfig(_ job: RoutineJob) -> [String: Any] {
+        [
+            "ccr": [
+                "environment_id": job.environmentID,
+                "session_context": [
+                    "model": job.model,
+                    // The preset keeps the stored config minimal; omitting
+                    // it makes the server expand the full default tool list.
+                    "allowed_tools": ["preset:default"],
+                ],
+                "events": [[
+                    "data": [
+                        "uuid": UUID().uuidString.lowercased(),
+                        "session_id": "",
+                        "type": "user",
+                        "parent_tool_use_id": NSNull(),
+                        "message": ["content": job.prompt, "role": "user"],
+                    ],
+                ]],
+            ],
+        ]
     }
 
     public static func listEnvironments(
@@ -318,7 +357,8 @@ public enum TriggerClient {
             enabled: dict["enabled"] as? Bool ?? false,
             runOnceAt: (dict["run_once_at"] as? String).flatMap(parseISO8601),
             nextRunAt: (dict["next_run_at"] as? String).flatMap(parseISO8601),
-            endedReason: (dict["ended_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+            endedReason: (dict["ended_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            lastFiredAt: (dict["last_fired_at"] as? String).flatMap(parseISO8601))
     }
 
     private static func decodeEnvironment(_ dict: [String: Any]) -> CloudEnvironment? {

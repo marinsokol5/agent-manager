@@ -55,32 +55,82 @@ public struct AccountWindowState: Codable, Sendable, Equatable {
 /// The pure decision core the scheduler daemon runs every tick: merge window
 /// evidence, and bend the nominal queue around known-open windows.
 public enum RuntimeAnchorPolicy {
-    /// How far past a known expiry a deferred fire lands. One minute absorbs
-    /// clock skew against the server's `resets_at` without giving up any
-    /// meaningful budget. The acceptance invariant of this whole feature:
-    /// whenever a live reset is known, no automated turn starts before
-    /// `reset + margin`.
-    public static let margin: TimeInterval = 60
+    /// The provider quantizes a rolling window's **start** down to this
+    /// granularity. Observed, not documented: every `five_hour.resets_at` this
+    /// app has ever recorded lands on a 10-minute mark (:00/:10/:20/:30/:40/:50)
+    /// — ~120 distinct boundaries over three weeks of `network.jsonl`, with no
+    /// exception. A turn at 05:35 anchors the window 05:30–10:30.
+    ///
+    /// Two consequences the rest of this policy depends on:
+    ///
+    /// - A window's expiry lands on the same grid, because the window length is
+    ///   itself a multiple of the quantum.
+    /// - The *implied* anchor of an exact expiry (`expiresAt - window`) can sit
+    ///   up to one full quantum **before** the turn that actually produced it.
+    ///   So attributing a window to a turn must compare floored values, never
+    ///   allow a small clock tolerance — that mistake reads a real anchor as a
+    ///   phantom (see `SchedulerDaemon.exactWindowPredates`).
+    ///
+    /// Everything here treats this as "*at most* this much quantization", so if
+    /// Anthropic tightens or drops the grid, flooring degrades to a no-op
+    /// instead of breaking attribution.
+    public static let anchorQuantum: TimeInterval = 10 * 60
+
+    /// Floor a date onto the provider's anchor grid — i.e. the anchor a turn at
+    /// `date` actually produces (see `anchorQuantum`). Absolute, so it is
+    /// independent of the local calendar; the epoch itself sits on the grid.
+    public static func flooredToAnchorGrid(
+        _ date: Date,
+        quantum: TimeInterval = RuntimeAnchorPolicy.anchorQuantum)
+        -> Date
+    {
+        guard quantum > 0 else { return date }
+        let t = date.timeIntervalSince1970
+        return Date(timeIntervalSince1970: (t / quantum).rounded(.down) * quantum)
+    }
+
+    /// How far past a known expiry a deferred fire lands. The acceptance
+    /// invariant of this whole feature: whenever a live reset is known, no
+    /// automated turn starts before `reset + margin`.
+    ///
+    /// The margin is **free** up to one `anchorQuantum`. A known expiry always
+    /// sits on the anchor grid, and a turn anywhere in
+    /// `[expiry, expiry + quantum)` floors back to exactly `expiry` — so it
+    /// anchors the very same window a hypothetical instant-at-expiry turn
+    /// would, and forfeits no budget at all. Two minutes therefore buys real
+    /// slack for nothing: clock skew against the provider, PTY spawn and CLI
+    /// boot for a local ping, and the tens of seconds claude.ai takes to
+    /// dispatch a `run_once_at` routine (35–45 s observed).
+    ///
+    /// It must stay *strictly* under `anchorQuantum`: one second past it and
+    /// the anchor slips into the next bucket, which really does cost 10 minutes
+    /// of every window that follows.
+    public static let margin: TimeInterval = 120
 
     /// How far *below* the planner's minimum slice a deferred fire may land and
     /// still be worth anchoring.
     ///
     /// The planner rebalances each painted block into slices at or just above
     /// `minSliceMinutes`, so a block's final slice is routinely packed to
-    /// *exactly* the floor. Meanwhile a real anchor starts at its planned
-    /// minute plus latency (PTY spawn, CLI boot, dispatch — a whole completed
-    /// turn for Codex), and this policy adds `margin` on top before refiring.
-    /// So the tail slot of every block measures a little short once deferred,
-    /// and re-testing the planner's own floor against the shifted time would
-    /// drop it *every time* — silently forfeiting the last budget slice of the
-    /// day (and, under the `routine` ping method, leaving that window with
-    /// neither a local ping nor an armed routine).
+    /// *exactly* the floor. Meanwhile this policy refires a colliding entry at
+    /// `expiry + margin`, and a conservative (non-`usage`) bound can overstate
+    /// the real expiry by up to one `anchorQuantum` — the provider floors the
+    /// anchor down, but a bound derived from an observed *event* can only floor
+    /// the moment we noticed it. So the tail slot of every block measures a
+    /// little short once deferred, and re-testing the planner's own floor
+    /// against the shifted time would drop it *every time* — silently
+    /// forfeiting the last budget slice of the day (and, under the `routine`
+    /// ping method, leaving that window with neither a local ping nor an armed
+    /// routine).
     ///
-    /// Forgiving a few minutes keeps the planner's decision stable under that
-    /// jitter while still dropping genuine shortfalls, which are tens of
-    /// minutes — a window that outlives its planned fire by an hour leaves far
-    /// more than this missing.
-    public static let maxSliceShortfall: TimeInterval = 5 * 60
+    /// So the budget is exactly the worst *legitimate* shift — one quantum of
+    /// conservative overstatement plus one refire margin. That keeps the
+    /// planner's decision stable under jitter while still dropping genuine
+    /// shortfalls, which are tens of minutes: a window that outlives its
+    /// planned fire by an hour leaves far more than this missing.
+    public static var maxSliceShortfall: TimeInterval {
+        RuntimeAnchorPolicy.anchorQuantum + RuntimeAnchorPolicy.margin
+    }
 
     /// Whether an expiry can describe a window that is live at `now`.
     /// Besides being in the future, it cannot be more than one full rolling

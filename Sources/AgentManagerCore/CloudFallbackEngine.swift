@@ -7,15 +7,21 @@ import Foundation
 public struct CloudFallbackSyncRequest: Sendable, Equatable {
     public var accountID: String
     public var nextFireAt: Date?
+    /// The latest fire whose cloud run the daemon has accounted for. Passed
+    /// through to `CloudFallbackPlanner.plan`, where it gates the hold that
+    /// keeps a just-passed one-shot from being cancelled mid-dispatch.
+    public var resolvedFire: Date?
     public var now: Date
 
     public init(
         accountID: String,
         nextFireAt: Date?,
+        resolvedFire: Date? = nil,
         now: Date)
     {
         self.accountID = accountID
         self.nextFireAt = nextFireAt
+        self.resolvedFire = resolvedFire
         self.now = now
     }
 }
@@ -54,19 +60,25 @@ public struct CloudFallbackEngine: Sendable {
         public var listRoutines: @Sendable (TriggerClient.Auth, String) async throws -> [CloudTrigger]
         public var createRoutine: @Sendable (AnchorRoutineSpec, TriggerClient.Auth, String) async throws -> CloudTrigger
         public var updateRoutine: @Sendable (String, TriggerPatch, TriggerClient.Auth, String) async throws -> CloudTrigger
+        /// Read one routine back — the `last_fired_at` probe behind
+        /// `CloudRunConfirmer`. Read-only, and the only call this engine makes
+        /// that isn't reconciling state.
+        public var getRoutine: @Sendable (String, TriggerClient.Auth, String) async throws -> CloudTrigger
 
         public init(
             listEnvironments: @escaping @Sendable (TriggerClient.Auth, String) async throws -> [CloudEnvironment],
             createEnvironment: @escaping @Sendable (TriggerClient.Auth, String) async throws -> CloudEnvironment,
             listRoutines: @escaping @Sendable (TriggerClient.Auth, String) async throws -> [CloudTrigger],
             createRoutine: @escaping @Sendable (AnchorRoutineSpec, TriggerClient.Auth, String) async throws -> CloudTrigger,
-            updateRoutine: @escaping @Sendable (String, TriggerPatch, TriggerClient.Auth, String) async throws -> CloudTrigger)
+            updateRoutine: @escaping @Sendable (String, TriggerPatch, TriggerClient.Auth, String) async throws -> CloudTrigger,
+            getRoutine: @escaping @Sendable (String, TriggerClient.Auth, String) async throws -> CloudTrigger)
         {
             self.listEnvironments = listEnvironments
             self.createEnvironment = createEnvironment
             self.listRoutines = listRoutines
             self.createRoutine = createRoutine
             self.updateRoutine = updateRoutine
+            self.getRoutine = getRoutine
         }
 
         public static func live(log: NetworkLog?) -> API {
@@ -88,12 +100,27 @@ public struct CloudFallbackEngine: Sendable {
                 },
                 updateRoutine: { triggerID, patch, auth, id in
                     try await TriggerClient.updateTrigger(id: triggerID, patch: patch, auth: auth, accountID: id, log: log)
+                },
+                getRoutine: { triggerID, auth, id in
+                    try await TriggerClient.getTrigger(id: triggerID, auth: auth, accountID: id, log: log)
                 })
         }
     }
 
     /// Named so the customer recognizes it on claude.ai/code/routines.
     public static let routineName = "AgentManager Routine"
+    /// Generation of the instructions below. **Bump this whenever
+    /// `routinePrompt` or `routineModel` changes**: re-arming a routine only
+    /// moves `run_once_at`, so this integer — stored per account in
+    /// `cloud-fallback-state.json` — is the only thing that makes a live routine
+    /// catch up with a shipped wording change. It costs nothing when unchanged,
+    /// and rides along on the next arm when it differs, so no extra request.
+    ///
+    /// Revision 2 retired the backstop wording. Routines created before it still
+    /// told the customer they run "only when your Mac slept through a scheduled
+    /// local ping", which stopped being true when the routine became a ping
+    /// method in its own right.
+    public static let routineRevision = 2
     /// Cheapest anchor: any billed turn anchors the shared window; Haiku
     /// minimizes what the turn costs.
     public static let routineModel = "claude-haiku-4-5-20251001"
@@ -153,6 +180,11 @@ public struct CloudFallbackEngine: Sendable {
         { request in await sync(request) }
     }
 
+    /// A `CloudRunConfirmer` bound to this engine (what the daemon holds).
+    public func confirmer() -> CloudRunConfirmer {
+        { accountID in await confirmRun(accountID) }
+    }
+
     // MARK: - Sync
 
     public func sync(_ request: CloudFallbackSyncRequest) async {
@@ -163,6 +195,7 @@ public struct CloudFallbackEngine: Sendable {
         let action = CloudFallbackPlanner.plan(
             state: account,
             nextFireAt: request.nextFireAt,
+            resolvedFire: request.resolvedFire,
             now: request.now)
         guard action != .none else { return }
 
@@ -214,12 +247,22 @@ public struct CloudFallbackEngine: Sendable {
             case let .arm(runAt):
                 if let triggerID = state.triggerID {
                     do {
+                        // Carry the instructions along whenever the live routine
+                        // is a revision behind. Free — this PATCH was happening
+                        // anyway — and it needs `environmentID`, since
+                        // `job_config` is replaced wholesale (see `RoutineJob`);
+                        // without one cached, the rewrite waits for a sync that
+                        // has resolved it.
+                        let staleInstructions = state.routineRevision != Self.routineRevision
+                        let job = staleInstructions ? state.environmentID.map(Self.job(environmentID:)) : nil
                         _ = try await api.updateRoutine(
-                            triggerID, TriggerPatch(runOnceAt: runAt, enabled: true), auth, accountID)
+                            triggerID, TriggerPatch(runOnceAt: runAt, enabled: true, job: job), auth, accountID)
                         state.armedFor = runAt
                         state.disabled = false
+                        if job != nil { state.routineRevision = Self.routineRevision }
                         audit.append(accountID: accountID, action: "routine.arm", ok: true,
-                                     detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(triggerID)")
+                                     detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(triggerID)"
+                                         + (job != nil ? " (instructions updated to revision \(Self.routineRevision))" : ""))
                     } catch TriggerAPIError.notFound {
                         // The user deleted it on claude.ai. A sibling may
                         // still exist (another install's routine) — adopt it
@@ -270,11 +313,19 @@ public struct CloudFallbackEngine: Sendable {
     {
         let ours = try await api.listRoutines(auth, accountID).filter { $0.name == Self.routineName }
         if let adopted = ours.first(where: \.enabled) ?? ours.first {
+            // Adoption is exactly the case where the routine's instructions are
+            // an unknown quantity — another install's, or a revision of ours old
+            // enough to still describe the retired backstop behavior — so bring
+            // them up to date in the very PATCH that arms it.
+            let environmentID = try await resolveEnvironment(&state, auth: auth, accountID: accountID)
             _ = try await api.updateRoutine(
-                adopted.id, TriggerPatch(runOnceAt: runAt, enabled: true), auth, accountID)
+                adopted.id,
+                TriggerPatch(runOnceAt: runAt, enabled: true, job: Self.job(environmentID: environmentID)),
+                auth, accountID)
             state.triggerID = adopted.id
             state.armedFor = runAt
             state.disabled = false
+            state.routineRevision = Self.routineRevision
             audit.append(accountID: accountID, action: "routine.adopt", ok: true,
                          detail: "adopted existing — armed for \(TriggerClient.rfc3339(runAt)) — \(adopted.id)")
             for extra in ours where extra.id != adopted.id && extra.enabled {
@@ -290,9 +341,17 @@ public struct CloudFallbackEngine: Sendable {
             state.triggerID = created.id
             state.armedFor = runAt
             state.disabled = false
+            state.routineRevision = Self.routineRevision
             audit.append(accountID: accountID, action: "routine.create", ok: true,
                          detail: "armed for \(TriggerClient.rfc3339(runAt)) — \(created.id)")
         }
+    }
+
+    /// The instruction payload every create, adopt, and catch-up arm writes —
+    /// one definition, so a live routine and a freshly created one can never
+    /// disagree about what the turn does.
+    static func job(environmentID: String) -> RoutineJob {
+        RoutineJob(environmentID: environmentID, model: routineModel, prompt: routinePrompt)
     }
 
     private func createRoutine(
@@ -303,10 +362,26 @@ public struct CloudFallbackEngine: Sendable {
             AnchorRoutineSpec(
                 name: Self.routineName,
                 runOnceAt: runAt,
-                environmentID: environmentID,
-                model: Self.routineModel,
-                prompt: Self.routinePrompt),
+                job: Self.job(environmentID: environmentID)),
             auth, accountID)
+    }
+
+    // MARK: - Confirmation
+
+    /// Read one account's pinned routine back, for `CloudRunConfirmer`.
+    ///
+    /// Fail-soft in the same way as everything else here, and for the same
+    /// reason: `nil` means "could not tell", which the daemon must never read as
+    /// "it didn't run". No routine pinned is also `nil` — there is nothing whose
+    /// run could be pending.
+    func confirmRun(_ accountID: String) async -> CloudTrigger? {
+        let state = CloudFallbackStateStore(workspace: workspace).load()
+        guard let triggerID = state.accounts[accountID]?.triggerID,
+              let account = try? AccountStore(workspace: workspace).find(accountID),
+              account.provider.supportsCloudAnchorRoutines,
+              let auth = try? authProvider(account)
+        else { return nil }
+        return try? await api.getRoutine(triggerID, auth, accountID)
     }
 
     /// The org's environment id, cached in state after the first discovery

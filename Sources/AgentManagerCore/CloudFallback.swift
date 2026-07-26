@@ -37,6 +37,13 @@ public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
     public var armedFor: Date?
     /// The routine is known to be `enabled: false` (method/scheduler off).
     public var disabled: Bool
+    /// Which generation of the routine's *instructions* the live routine holds
+    /// (`CloudFallbackEngine.routineRevision`). Re-arming only moves
+    /// `run_once_at`, so without this a routine created — or adopted — under an
+    /// older build keeps describing behavior the app no longer has, forever.
+    /// `nil` means "predates the tracking", which is exactly the case that
+    /// needs a rewrite.
+    public var routineRevision: Int?
     /// Last API/keychain problem, for the Monitoring row + retry backoff.
     /// Cleared on the next successful sync.
     public var lastError: String?
@@ -47,6 +54,7 @@ public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
         environmentID: String? = nil,
         armedFor: Date? = nil,
         disabled: Bool = false,
+        routineRevision: Int? = nil,
         lastError: String? = nil,
         lastErrorAt: Date? = nil)
     {
@@ -54,6 +62,7 @@ public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
         self.environmentID = environmentID
         self.armedFor = armedFor
         self.disabled = disabled
+        self.routineRevision = routineRevision
         self.lastError = lastError
         self.lastErrorAt = lastErrorAt
     }
@@ -64,10 +73,25 @@ public struct AccountCloudFallbackState: Codable, Sendable, Equatable {
         environmentID = try c.decodeIfPresent(String.self, forKey: .environmentID)
         armedFor = try c.decodeIfPresent(Date.self, forKey: .armedFor)
         disabled = try c.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
+        routineRevision = try c.decodeIfPresent(Int.self, forKey: .routineRevision)
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
         lastErrorAt = try c.decodeIfPresent(Date.self, forKey: .lastErrorAt)
     }
 }
+
+/// "Has this account's armed one-shot actually run?" — asked of the routines
+/// API, whose `last_fired_at` is the only authority on the question.
+///
+/// This exists because the clock is *not* an answer. claude.ai dispatches a
+/// `run_once_at` routine tens of seconds after its moment, and `run_once_at` is
+/// also the server's only handle on that pending run: moving it forward cancels
+/// the run. A daemon that assumed "the minute passed, so it ran" therefore
+/// deleted the very run it was about to credit, and logged a false anchor for
+/// it. Injected (rather than called directly) so the daemon's tests can answer
+/// the question without a network.
+///
+/// `nil` means *could not tell* — never "it didn't run".
+public typealias CloudRunConfirmer = @Sendable (String) async -> CloudTrigger?
 
 /// `cloud-fallback-state.json` — per-account routine state, keyed by account id.
 public struct CloudFallbackState: Codable, Sendable, Equatable {

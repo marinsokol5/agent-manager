@@ -9,6 +9,13 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
     let window: TimeInterval = 300 * 60
     func t(_ minutes: Double) -> Date { base.addingTimeInterval(minutes * 60) }
 
+    /// The refire margin in the minutes this file counts in. Deferral
+    /// expectations are written as `expiry + marginMin` rather than a literal, so
+    /// they keep asserting the invariant ("just past the real boundary") if the
+    /// margin is ever retuned — it is free up to one anchor quantum, so it may
+    /// well be.
+    var marginMin: Double { RuntimeAnchorPolicy.margin / 60 }
+
     func usage(_ expiresMin: Double, observedMin: Double) -> AccountWindowState {
         AccountWindowState(expiresAt: t(expiresMin), evidence: .usage, observedAt: t(observedMin))
     }
@@ -69,10 +76,10 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
     }
 
     func testCollidingEntryDefersJustPastExpiryWithNominalIdentity() {
-        // Window open until +7m: the 0m fire runs at +8m (expiry + margin).
+        // Window open until +7m: the 0m fire runs at expiry + margin.
         let queue = [QueueEntry(fireAt: t(0), accountID: "a"), QueueEntry(fireAt: t(300), accountID: "a")]
         let adjusted = adjust(queue, states: ["a": usage(7, observedMin: -10)], nowMin: -1)
-        XCTAssertEqual(adjusted.entries[0].fireAt, t(8))
+        XCTAssertEqual(adjusted.entries[0].fireAt, t(7 + marginMin))
         XCTAssertEqual(adjusted.entries[0].plannedAt, t(0))
         XCTAssertEqual(adjusted.entries[0].nominalFireAt, t(0))
         // The successor sits past the expiry: untouched.
@@ -81,28 +88,35 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
 
     func testExpiryMoreThanMarginBeforePlannedDoesNotShift() {
         let queue = [QueueEntry(fireAt: t(0), accountID: "a")]
-        let adjusted = adjust(queue, states: ["a": usage(-2, observedMin: -10)], nowMin: -1)
+        let adjusted = adjust(
+            queue, states: ["a": usage(-marginMin - 1, observedMin: -10)], nowMin: -1)
         XCTAssertEqual(adjusted.entries, queue)
     }
 
     func testExactOrNearResetBoundaryStillGetsSafetyMargin() {
         let queue = [QueueEntry(fireAt: t(0), accountID: "a")]
         let exact = adjust(queue, states: ["a": usage(0, observedMin: -10)], nowMin: -1)
-        XCTAssertEqual(exact.entries, [QueueEntry(fireAt: t(1), accountID: "a", plannedAt: t(0))])
+        XCTAssertEqual(
+            exact.entries,
+            [QueueEntry(fireAt: t(marginMin), accountID: "a", plannedAt: t(0))])
 
         let thirtySecondsBefore = adjust(
             queue, states: ["a": usage(-0.5, observedMin: -10)], nowMin: -1)
         XCTAssertEqual(
             thirtySecondsBefore.entries,
-            [QueueEntry(fireAt: t(0.5), accountID: "a", plannedAt: t(0))])
+            [QueueEntry(fireAt: t(marginMin - 0.5), accountID: "a", plannedAt: t(0))])
     }
 
     func testPlausibleLiveExpiryRejectsCorruptFutureValue() {
         XCTAssertTrue(RuntimeAnchorPolicy.isPlausibleLiveExpiry(t(299), at: t(0), window: window))
-        // The same one-minute tolerance used at the reset boundary also
-        // absorbs provider/client clock skew at the physical upper bound.
-        XCTAssertTrue(RuntimeAnchorPolicy.isPlausibleLiveExpiry(t(300.5), at: t(0), window: window))
-        XCTAssertFalse(RuntimeAnchorPolicy.isPlausibleLiveExpiry(t(302), at: t(0), window: window))
+        // The same tolerance used at the reset boundary also absorbs
+        // provider/client clock skew at the physical upper bound.
+        XCTAssertTrue(
+            RuntimeAnchorPolicy.isPlausibleLiveExpiry(
+                t(300 + marginMin), at: t(0), window: window))
+        XCTAssertFalse(
+            RuntimeAnchorPolicy.isPlausibleLiveExpiry(
+                t(300 + marginMin + 1), at: t(0), window: window))
         XCTAssertFalse(RuntimeAnchorPolicy.isPlausibleLiveExpiry(t(0), at: t(0), window: window))
     }
 
@@ -119,20 +133,24 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
         // The user anchored at -1m, so the window runs to +299m — past the
         // successor's 250m slot. Once the 0m slot is nominally due it resolves
         // as covered, while the successor (whose planned minute the same
-        // window also swallows) fires just past the expiry at +300m.
+        // window also swallows) fires just past the expiry.
         let queue = [QueueEntry(fireAt: t(0), accountID: "a"), QueueEntry(fireAt: t(250), accountID: "a")]
         let due = adjust(queue, states: ["a": usage(299, observedMin: -1)], nowMin: 1)
         XCTAssertEqual(
             due.covered,
-            [QueueEntry(fireAt: t(300), accountID: "a", plannedAt: t(0))])
-        XCTAssertEqual(due.entries, [QueueEntry(fireAt: t(300), accountID: "a", plannedAt: t(250))])
+            [QueueEntry(fireAt: t(299 + marginMin), accountID: "a", plannedAt: t(0))])
+        XCTAssertEqual(
+            due.entries,
+            [QueueEntry(fireAt: t(299 + marginMin), accountID: "a", plannedAt: t(250))])
 
         // Before its nominal minute the covered entry just sits out this
         // rebuild — evidence may still be corrected, and the planner re-emits
         // it every tick.
         let early = adjust(queue, states: ["a": usage(299, observedMin: -1)], nowMin: -0.5)
         XCTAssertTrue(early.covered.isEmpty)
-        XCTAssertEqual(early.entries, [QueueEntry(fireAt: t(300), accountID: "a", plannedAt: t(250))])
+        XCTAssertEqual(
+            early.entries,
+            [QueueEntry(fireAt: t(299 + marginMin), accountID: "a", plannedAt: t(250))])
     }
 
     func testShiftIntoOffHoursResolvesAsCoveredOnceDue() {
@@ -142,16 +160,16 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
         let adjusted = adjust(queue, states: ["a": usage(30, observedMin: -1)], nowMin: 1, painted: false)
         XCTAssertEqual(
             adjusted.covered,
-            [QueueEntry(fireAt: t(31), accountID: "a", plannedAt: t(0))])
+            [QueueEntry(fireAt: t(30 + marginMin), accountID: "a", plannedAt: t(0))])
         XCTAssertTrue(adjusted.entries.isEmpty)
     }
 
     func testDeferralResortsAcrossAccounts() {
-        // b's on-time fire at +3m overtakes a's fire deferred to +8m.
+        // b's on-time fire at +3m overtakes a's fire deferred past +7m.
         let queue = [QueueEntry(fireAt: t(0), accountID: "a"), QueueEntry(fireAt: t(3), accountID: "b")]
         let adjusted = adjust(queue, states: ["a": usage(7, observedMin: -10)], nowMin: -1)
         XCTAssertEqual(adjusted.entries.map(\.accountID), ["b", "a"])
-        XCTAssertEqual(adjusted.entries.map(\.fireAt), [t(3), t(8)])
+        XCTAssertEqual(adjusted.entries.map(\.fireAt), [t(3), t(7 + marginMin)])
     }
 
     func testShiftReachingCyclicSuccessorResolvesAtQueueSeam() {
@@ -168,7 +186,7 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
             hasPaintedWork: { _, _ in true })
         XCTAssertEqual(
             adjusted.covered,
-            [QueueEntry(fireAt: t(101), accountID: "a", plannedAt: t(0))])
+            [QueueEntry(fireAt: t(100 + marginMin), accountID: "a", plannedAt: t(0))])
         XCTAssertTrue(adjusted.entries.isEmpty)
     }
 }

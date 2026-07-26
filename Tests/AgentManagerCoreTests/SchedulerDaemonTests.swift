@@ -80,8 +80,34 @@ final class SchedulerDaemonTests: XCTestCase {
         var seed = CloudFallbackState()
         seed.accounts[id] = AccountCloudFallbackState(
             triggerID: "trig_1", environmentID: "env_1", armedFor: armedFor,
+            routineRevision: CloudFallbackEngine.routineRevision,
             lastError: lastError, lastErrorAt: lastError == nil ? nil : armedFor)
         CloudFallbackStateStore(workspace: ws).save(seed)
+    }
+
+    /// A routines-API answer saying the one-shot **did** run. Dispatch is always
+    /// late, so `firedAt` defaults to a realistic 44 s past the armed minute.
+    func firedRoutine(armedFor: Date, lateBy: TimeInterval = 44) -> CloudRunConfirmer {
+        let firedAt = armedFor.addingTimeInterval(lateBy)
+        return { _ in
+            CloudTrigger(
+                id: "trig_1", name: CloudFallbackEngine.routineName, enabled: false,
+                runOnceAt: armedFor, endedReason: CloudTrigger.runOnceFiredReason,
+                lastFiredAt: firedAt)
+        }
+    }
+
+    /// A routines-API answer saying the one-shot has **not** run: still enabled,
+    /// still armed, `last_fired_at` pointing at some earlier run. This is exactly
+    /// what claude.ai returned five seconds after the armed minute on the night
+    /// the daemon cancelled its own routine and logged an anchor anyway.
+    func unfiredRoutine(armedFor: Date, previousRun: Date? = nil) -> CloudRunConfirmer {
+        { _ in
+            CloudTrigger(
+                id: "trig_1", name: CloudFallbackEngine.routineName, enabled: true,
+                runOnceAt: armedFor, endedReason: nil,
+                lastFiredAt: previousRun ?? armedFor.addingTimeInterval(-24 * 3600))
+        }
     }
 
     func makeDaemon(
@@ -92,6 +118,7 @@ final class SchedulerDaemonTests: XCTestCase {
         outcome: PingOutcome = .anchored,
         cloudSyncer: CloudFallbackSyncer? = nil,
         cloudUsageReader: SchedulerDaemon.CloudUsageReader? = nil,
+        cloudRunConfirmer: CloudRunConfirmer? = nil,
         executablePath: String? = nil)
         -> SchedulerDaemon
     {
@@ -106,6 +133,9 @@ final class SchedulerDaemonTests: XCTestCase {
             // Likewise: never construct the live engine in tests.
             cloudSyncer: cloudSyncer ?? { _ in },
             cloudUsageReader: cloudUsageReader ?? { _ in nil },
+            // Default to "cannot tell", so no test accidentally credits a cloud
+            // run it never described.
+            cloudRunConfirmer: cloudRunConfirmer ?? { _ in nil },
             executablePath: executablePath)
     }
 
@@ -136,13 +166,13 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(recorder.requests.count, 1)
 
         // The heartbeat file carries the watermark and the next fire — which
-        // the anchor we just observed *defers*: a ping anchoring at 05:00:30
-        // holds the window open to 10:00:30, so the nominal 10:00 re-ping
-        // would land inside it (a phantom). It runs at 10:01:30 instead
-        // (expiry + the one-minute margin), keeping its nominal identity.
+        // the anchor we just observed *defers*: the provider floors that
+        // 05:00:30 anchor onto its 10-minute grid, so the window really runs to
+        // 10:00 and the nominal 10:00 re-ping would land right on the boundary.
+        // It runs at 10:02 instead (expiry + margin), keeping its nominal identity.
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastHandled["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1, 30))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
@@ -304,18 +334,21 @@ final class SchedulerDaemonTests: XCTestCase {
     }
 
     func testPassedRoutineFireResolvesTheSlotWithoutPinging() async throws {
-        // The routine armed for the 05:00 slot has fired (it's 05:06). The
-        // window is anchored from Anthropic's side, so the slot resolves with
-        // no local turn — and the next fire is pushed past the window that run
-        // opened (05:00 + 5h + margin).
+        // The routine armed for the 05:00 slot has fired, and the routines API
+        // confirms it (`last_fired_at`). It's 05:06, past the dispatch settle
+        // deadline, so the slot resolves with no local turn — and the next fire
+        // is pushed past the window that run opened (05:00 + 5h + margin).
         let ws = try seedWorkspace()
         useCloudRoutineMethod(ws)
-        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
+        let fire = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, armedFor: fire)
 
         let clock = TestClock(date(2026, 7, 6, 5, 6))
         let recorder = PingRecorder()
         let syncs = SyncRecorder()
-        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) },
+            cloudRunConfirmer: firedRoutine(armedFor: fire))
         _ = await daemon.tick()
 
         XCTAssertTrue(recorder.requests.isEmpty) // no local ping spawned
@@ -326,7 +359,169 @@ final class SchedulerDaemonTests: XCTestCase {
 
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 1))
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 2))
+        // The resolved fire travels to the planner, which is what releases its
+        // hold on the armed one-shot.
+        XCTAssertEqual(syncs.requests.last?.resolvedFire, fire)
+    }
+
+    func testPassedRoutineIsUntouchableDuringTheDispatchGap() async throws {
+        // The regression that cost a night of anchors. Five seconds past the
+        // armed minute, claude.ai has not dispatched the run yet (35–45 s is
+        // normal) — and `run_once_at` is its only handle on it, so advancing the
+        // arm here *deletes* the run. Nothing may move: the queue entry stays
+        // pending, no activity is logged, and the sync must carry the armed
+        // moment itself (never the next fire) so the planner converges to a
+        // no-op. The old code resolved this fire on the spot, logged
+        // `anchored: true` for a run that never happened, and re-armed forward.
+        let ws = try seedWorkspace()
+        useCloudRoutineMethod(ws)
+        let fire = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, armedFor: fire)
+
+        let clock = TestClock(fire.addingTimeInterval(5))
+        let recorder = PingRecorder()
+        let syncs = SyncRecorder()
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) },
+            cloudRunConfirmer: unfiredRoutine(armedFor: fire))
+        _ = await daemon.tick()
+
+        XCTAssertTrue(recorder.requests.isEmpty)
+        XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).isEmpty)
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertNil(status?.lastHandled["a1"])
+        XCTAssertNil(status?.lastResolvedFire?["a1"])
+        XCTAssertNil(status?.windowStates?["a1"]) // no invented window
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, fire)
+        XCTAssertNil(syncs.requests.last?.resolvedFire)
+        XCTAssertEqual(
+            CloudFallbackPlanner.plan(
+                state: CloudFallbackStateStore(workspace: ws).load().accounts["a1"]!,
+                nextFireAt: syncs.requests.last?.nextFireAt,
+                resolvedFire: syncs.requests.last?.resolvedFire,
+                now: clock.now),
+            .none,
+            "the sync the daemon published must not move the pending one-shot")
+    }
+
+    func testUnrunRoutineResolvesAsUnanchoredAtTheSettleDeadline() async throws {
+        // Past the settle deadline with the routines API still reporting an
+        // unfired one-shot: this window is genuinely unanchored. Say so —
+        // `anchored: false` — and record *no* window evidence. Inventing five
+        // hours of expiry here is what let one silent miss defer the rest of the
+        // day around a window that never existed.
+        let ws = try seedWorkspace()
+        useCloudRoutineMethod(ws)
+        let fire = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, armedFor: fire)
+
+        let clock = TestClock(fire.addingTimeInterval(CloudFallbackPlanner.dispatchSettle + 5))
+        let recorder = PingRecorder()
+        let syncs = SyncRecorder()
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) },
+            cloudRunConfirmer: unfiredRoutine(armedFor: fire))
+        _ = await daemon.tick()
+
+        XCTAssertTrue(recorder.requests.isEmpty) // still no flaky local fallback
+        let records = ActivityLog(workspace: ws).readRecent(limit: 10)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertFalse(records[0].anchored)
+        XCTAssertTrue(records[0].detail.contains("did not anchor"), records[0].detail)
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertEqual(status?.lastHandled["a1"], fire)
+        XCTAssertEqual(status?.lastResolvedFire?["a1"], fire)
+        XCTAssertNil(status?.windowStates?["a1"])
+        // Resolved, so the arm is free to follow the queue again.
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 10, 0))
+    }
+
+    func testUsageWithNoOpenWindowRefutesTheRunWithoutAskingTheAPI() async throws {
+        // The cheapest decisive signal, and the one the old code threw away: a
+        // reading taken after the armed moment that shows *no* five-hour window
+        // is proof nothing anchored. A nil `resets_at` is not missing data.
+        let ws = try seedWorkspace()
+        useCloudRoutineMethod(ws)
+        let fire = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, armedFor: fire)
+
+        let clock = TestClock(fire.addingTimeInterval(CloudFallbackPlanner.dispatchSettle + 5))
+        let empty = UsageReading(
+            primaryUsedPercent: 0, primaryResetsAt: nil,
+            secondaryUsedPercent: 14, secondaryResetsAt: date(2026, 7, 8, 5, 0),
+            fetchedAt: clock.now)
+        final class Probes: @unchecked Sendable {
+            let lock = NSLock()
+            private var count = 0
+            func hit() { lock.lock(); count += 1; lock.unlock() }
+            var confirmations: Int { lock.lock(); defer { lock.unlock() }; return count }
+        }
+        let probes = Probes()
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: PingRecorder(),
+            cloudUsageReader: { _ in empty },
+            cloudRunConfirmer: { _ in probes.hit(); return nil })
+        _ = await daemon.tick()
+
+        let records = ActivityLog(workspace: ws).readRecent(limit: 10)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertFalse(records[0].anchored)
+        XCTAssertEqual(probes.confirmations, 0, "usage already settled it — no API call needed")
+        XCTAssertNil(SchedulerStatusStore(workspace: ws).load()?.windowStates?["a1"])
+    }
+
+    func testRoutineFiringLateInsideItsOwnAnchorBucketIsNotAPhantom() async throws {
+        // Anchor attribution on the provider's grid. The one-shot was armed for
+        // 05:09 and the window it produced resets at 10:00 — an implied anchor of
+        // 05:00, nine minutes "before" the fire, purely because the provider
+        // floors the anchor. Same bucket, so this fire *is* what anchored it. The
+        // old clock-tolerance compare called every such fire a phantom.
+        let ws = try seedWorkspace()
+        useCloudRoutineMethod(ws)
+        let fire = date(2026, 7, 6, 5, 9)
+        seedArmedRoutine(ws, armedFor: fire)
+
+        let clock = TestClock(date(2026, 7, 6, 5, 15))
+        let exact = UsageReading(
+            primaryUsedPercent: 2, primaryResetsAt: date(2026, 7, 6, 10, 0),
+            secondaryUsedPercent: nil, secondaryResetsAt: nil, fetchedAt: clock.now)
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: PingRecorder(),
+            cloudUsageReader: { _ in exact },
+            cloudRunConfirmer: firedRoutine(armedFor: fire))
+        _ = await daemon.tick()
+
+        let records = ActivityLog(workspace: ws).readRecent(limit: 10)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records[0].anchored, records[0].detail)
+        XCTAssertFalse(records[0].detail.contains("already-open"), records[0].detail)
+    }
+
+    func testDeferralDoesNotCompoundAcrossChainedFires() async throws {
+        // The drift the conservative bound used to accumulate: each deferred fire
+        // dated its own window from the deferred minute, so the next fire was
+        // pushed past *that*, a margin at a time — 05:00 → 10:02 → 15:04 → …
+        // until it ate a whole slot. Flooring onto the anchor grid makes every
+        // hop cost exactly one margin and never more.
+        let ws = try seedWorkspace()
+        let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+
+        _ = await daemon.tick() // 05:00 slot, anchoring at 05:00:30
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.upcoming.first?.fireAt,
+            date(2026, 7, 6, 10, 2))
+
+        // Fire the deferred 10:02 slot. Its own anchor floors back to 10:00, so
+        // the window it opens ends at 15:00 — not 15:02:xx.
+        clock.now = date(2026, 7, 6, 10, 2, 30)
+        _ = await daemon.tick()
+        XCTAssertEqual(recorder.requests.count, 2)
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.windowStates?["a1"]?.expiresAt,
+            date(2026, 7, 6, 15, 0))
     }
 
     func testRoutineMethodSuppressesTheLocalPingAndArmsAtTheExactFire() async throws {
@@ -402,21 +597,27 @@ final class SchedulerDaemonTests: XCTestCase {
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.windowStates?["a1"]?.evidence, .usage)
         XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 5))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 6))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 7))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
-    func testCloudFireWithoutUsageStillUsesItsArmedTimeNotDetectionTime() async throws {
+    func testCloudFireWithoutUsageIsBoundedByWhenItActuallyRan() async throws {
         // The Mac notices the 05:00 one-shot two hours late and the read-only
-        // usage probe fails. The event time is still known from `armedFor`:
-        // falling back to 07:00 + 5h would waste the useful 10:00 boundary.
+        // usage probe fails, so the routines API is the only witness. Its
+        // `last_fired_at` gives the real run instant, floored onto the anchor
+        // grid: falling back to detection time + 5h would waste the useful 10:00
+        // boundary, and dating it from `armedFor` alone would *understate* the
+        // expiry, because dispatch is always late.
         let ws = try seedWorkspace()
         useCloudRoutineMethod(ws)
-        seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
+        let fire = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, armedFor: fire)
 
         let clock = TestClock(date(2026, 7, 6, 7, 0))
         let recorder = PingRecorder()
-        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder,
+            cloudRunConfirmer: firedRoutine(armedFor: fire))
 
         _ = await daemon.tick()
 
@@ -424,7 +625,7 @@ final class SchedulerDaemonTests: XCTestCase {
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.windowStates?["a1"]?.evidence, .conservative)
         XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
@@ -469,16 +670,18 @@ final class SchedulerDaemonTests: XCTestCase {
         let clock = TestClock(date(2026, 7, 6, 5, 6))
         let recorder = PingRecorder()
         let syncs = SyncRecorder()
-        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) },
+            cloudRunConfirmer: firedRoutine(armedFor: date(2026, 7, 6, 5, 0)))
         _ = await daemon.tick()
 
         XCTAssertTrue(recorder.requests.isEmpty)
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertNil(status?.lastHandled["a1"])
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 12))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
-        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 5, 11))
+        XCTAssertEqual(syncs.requests.last?.nextFireAt, date(2026, 7, 6, 5, 12))
 
         let records = ActivityLog(workspace: ws).readRecent(limit: 10)
         XCTAssertEqual(records.count, 1)
@@ -510,12 +713,15 @@ final class SchedulerDaemonTests: XCTestCase {
         // The next successful engine sync clears the error.
         seedArmedRoutine(ws, armedFor: date(2026, 7, 6, 5, 0))
         clock.now = date(2026, 7, 6, 5, 6)
-        _ = await daemon.tick()
+        let confirming = makeDaemon(
+            ws, clock: clock, recorder: recorder,
+            cloudRunConfirmer: firedRoutine(armedFor: date(2026, 7, 6, 5, 0)))
+        _ = await confirming.tick()
 
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
         XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).contains { $0.anchored })
     }
 
@@ -613,9 +819,9 @@ final class SchedulerDaemonTests: XCTestCase {
 
     func testCachedOpenWindowDefersDueFireToJustPastExpiry() async throws {
         // The cache proves a window open until 05:07 — the nominal 05:00 fire
-        // would be a phantom. It must wait for 05:08 (expiry + margin), keep
-        // its nominal watermark, and push the 10:00 successor past the window
-        // *it* then opens.
+        // would be a phantom. It must wait for expiry + margin, keep its nominal
+        // watermark, and push the 10:00 successor past the window *it* then
+        // opens (whose anchor the provider floors back to 05:00).
         let ws = try seedWorkspace()
         seedUsage(ws, id: "a1", resetsAt: date(2026, 7, 6, 5, 7), fetchedAt: date(2026, 7, 6, 4, 50))
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
@@ -625,7 +831,7 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
         XCTAssertTrue(recorder.requests.isEmpty)
         var status = SchedulerStatusStore(workspace: ws).load()
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 8))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 9))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
         let audit = AuditLog(workspace: ws).readRecent(limit: 10)
         XCTAssertTrue(audit.contains { $0.action == "ping.defer" }, "\(audit.map(\.action))")
@@ -634,21 +840,23 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
         XCTAssertTrue(recorder.requests.isEmpty)
 
-        clock.now = date(2026, 7, 6, 5, 8, 30)
+        clock.now = date(2026, 7, 6, 5, 9, 30)
         _ = await daemon.tick()
-        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 8))])
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 9))])
         status = SchedulerStatusStore(workspace: ws).load()
         // Watermark in nominal plan time — the 05:00 slot is consumed.
         XCTAssertEqual(status?.lastHandled["a1"], date(2026, 7, 6, 5, 0))
-        // The anchor observed at 05:08:30 defers the 10:00 successor in turn.
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 9, 30))
+        // That anchor floors to 05:00, so its window ends at 10:00 and the
+        // successor defers by the margin alone — the deferral cost nothing.
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
     func testGraceLateAnchorDefersTheChainedRePing() async throws {
-        // A fire 7 minutes late (within grace) anchors a window that outlives
-        // the nominal 10:00 re-ping — the deterministic phantom of the old
-        // fixed-time behavior. The observed anchor now defers it to 10:08.
+        // A fire 7 minutes late (within grace) still anchors within the 05:00
+        // bucket, so its window ends at 10:00 and the nominal 10:00 re-ping —
+        // the deterministic phantom of the old fixed-time behavior — only needs
+        // the margin. Lateness inside one quantum costs nothing.
         let ws = try seedWorkspace()
         let clock = TestClock(date(2026, 7, 6, 5, 7))
         let recorder = PingRecorder()
@@ -657,7 +865,7 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
         XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 0))])
         let status = SchedulerStatusStore(workspace: ws).load()
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 8))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
@@ -708,7 +916,7 @@ final class SchedulerDaemonTests: XCTestCase {
         var status = SchedulerStatusStore(workspace: ws).load()
         // The slot was un-consumed and re-queued past the proven expiry.
         XCTAssertNil(status?.lastHandled["a1"])
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 10))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
         // Nothing was skipped — no activity record for a deferral.
         XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).isEmpty)
@@ -717,10 +925,10 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
         XCTAssertEqual(recorder.requests.count, 1) // still waiting out the window
 
-        clock.now = date(2026, 7, 6, 5, 10, 30)
+        clock.now = date(2026, 7, 6, 5, 11, 30)
         _ = await daemon.tick()
         XCTAssertEqual(recorder.requests.count, 2)
-        XCTAssertEqual(recorder.requests.last, .init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 10)))
+        XCTAssertEqual(recorder.requests.last, .init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 11)))
         status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastHandled["a1"], date(2026, 7, 6, 5, 0))
     }
@@ -798,7 +1006,7 @@ final class SchedulerDaemonTests: XCTestCase {
         let recovered = SchedulerStatusStore(workspace: ws).load()
         XCTAssertNil(recovered?.lastHandled["a1"])
         XCTAssertNil(recovered?.inFlight)
-        XCTAssertEqual(recovered?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 10))
+        XCTAssertEqual(recovered?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
         XCTAssertEqual(recovered?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
     }
 
@@ -852,14 +1060,14 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await restarted.tick()
         XCTAssertTrue(recorder.requests.isEmpty)
 
-        clock.now = date(2026, 7, 6, 5, 8, 30)
+        clock.now = date(2026, 7, 6, 5, 9, 30)
         _ = await restarted.tick()
-        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 8))])
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 9))])
     }
 
     func testDeferralMeasuresStalenessFromEffectiveTime() async throws {
         // 05:17 is 17 minutes past the nominal 05:00 (stale under the old
-        // reading) but only 9 past the deferred 05:08 — the fire is *on time*
+        // reading) but only 8 past the deferred 05:09 — the fire is *on time*
         // where it now belongs, and anchors instead of dropping.
         let ws = try seedWorkspace()
         seedUsage(ws, id: "a1", resetsAt: date(2026, 7, 6, 5, 7), fetchedAt: date(2026, 7, 6, 4, 50))
@@ -870,7 +1078,7 @@ final class SchedulerDaemonTests: XCTestCase {
 
         clock.now = date(2026, 7, 6, 5, 17)
         _ = await daemon.tick()
-        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 8))])
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 9))])
         XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).isEmpty) // no stale drop
     }
 
@@ -924,7 +1132,8 @@ final class SchedulerDaemonTests: XCTestCase {
         // Painted Mon 08:00–10:00 plans 04:00 + 09:00, and the 09:00 slot's
         // slice is *exactly* the one-hour floor — the planner rebalances every
         // block that way. The 04:00 window expires right at 09:00, so the 09:00
-        // fire defers to 09:01, where only 59 painted minutes remain. Re-testing
+        // fire defers past it, leaving under the full hour of painted work.
+        // Re-testing
         // the planner's floor verbatim dropped the slot every time: as a covered
         // skip once due, and — hours earlier — as a silent disappearance from the
         // published queue, which is what the cloud routine arms from.
@@ -940,13 +1149,13 @@ final class SchedulerDaemonTests: XCTestCase {
         // and not silently replaced by next week's first slot.
         XCTAssertEqual(
             SchedulerStatusStore(workspace: ws).load()?.upcoming.first?.fireAt,
-            date(2026, 7, 6, 9, 1))
+            date(2026, 7, 6, 9, 2))
 
-        clock.now = date(2026, 7, 6, 9, 1, 10)
+        clock.now = date(2026, 7, 6, 9, 2, 10)
         _ = await daemon.tick()
         XCTAssertEqual(
             recorder.requests,
-            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 1))])
+            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 2))])
         // The watermark still advances to the nominal minute, so the weekly
         // slot is consumed exactly once.
         XCTAssertEqual(
@@ -958,8 +1167,8 @@ final class SchedulerDaemonTests: XCTestCase {
         // The general case of the above: a local ping doesn't anchor at its
         // planned minute but at planned + latency (dispatch, or a whole turn for
         // Codex), so the 04:00 window expires at 09:01:30 and the tail slice
-        // measures 57 minutes rather than 60. That drift is jitter, not a real
-        // shortfall — the slot must still fire, at 09:02:30.
+        // measures under 60 minutes. That drift is jitter, not a real
+        // shortfall — the slot must still fire, one margin past the real expiry.
         let ws = try seedWorkspace(hours: [8, 9])
         seedUsage(
             ws, id: "a1", resetsAt: date(2026, 7, 6, 9, 1, 30),
@@ -971,13 +1180,13 @@ final class SchedulerDaemonTests: XCTestCase {
         _ = await daemon.tick()
         XCTAssertEqual(
             SchedulerStatusStore(workspace: ws).load()?.upcoming.first?.fireAt,
-            date(2026, 7, 6, 9, 2, 30))
+            date(2026, 7, 6, 9, 3, 30))
 
-        clock.now = date(2026, 7, 6, 9, 2, 40)
+        clock.now = date(2026, 7, 6, 9, 3, 40)
         _ = await daemon.tick()
         XCTAssertEqual(
             recorder.requests,
-            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 2, 30))])
+            [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 9, 3, 30))])
     }
 
     func testAnchorUnknownDefersConservativelyAroundTheUnverifiedTurn() async throws {
@@ -992,7 +1201,7 @@ final class SchedulerDaemonTests: XCTestCase {
 
         XCTAssertEqual(recorder.requests.count, 1)
         let status = SchedulerStatusStore(workspace: ws).load()
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1, 30))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 10, 0))
     }
 
@@ -1035,7 +1244,7 @@ final class SchedulerDaemonTests: XCTestCase {
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.lastResolvedFire?["a1"], date(2026, 7, 6, 5, 0))
         XCTAssertNil(status?.lastHandled["a1"])
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 11))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 5, 12))
         XCTAssertEqual(status?.upcoming.first?.plannedAt, date(2026, 7, 6, 5, 0))
     }
 
@@ -1056,8 +1265,8 @@ final class SchedulerDaemonTests: XCTestCase {
 
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.windowStates?["a1"]?.evidence, .conservative)
-        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0, 30))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1, 30))
+        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
     }
 
     func testLaterLaggingUsageSnapshotCannotEraseLiveConservativeGuard() async throws {
@@ -1078,8 +1287,8 @@ final class SchedulerDaemonTests: XCTestCase {
 
         let status = SchedulerStatusStore(workspace: ws).load()
         XCTAssertEqual(status?.windowStates?["a1"]?.evidence, .conservative)
-        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0, 30))
-        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 1, 30))
+        XCTAssertEqual(status?.windowStates?["a1"]?.expiresAt, date(2026, 7, 6, 10, 0))
+        XCTAssertEqual(status?.upcoming.first?.fireAt, date(2026, 7, 6, 10, 2))
     }
 
     func testPaintedWorkOverlapUsesWallClockAcrossDSTTransitions() {

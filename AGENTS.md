@@ -250,9 +250,16 @@ Work the chain in this order:
    attempt is `ping.start` → `ping` (with `ok` and a one-line `detail`);
    deliberate drops are `ping.skip`, whose detail says why — `"stale ping
    (due 34m ago)"`, `"N stale pings (slept through…)"`, `"cloud routine
-   covered this fire"`, `"cloud routine method — no local ping"` (the slot
-   passed with the routine unconfirmed: unanchored by design, never a flaky
-   local turn), or `"open window leaves no usable budget slice"`.
+   covered this fire"`, `"cloud routine did not anchor this fire — <reason>"`
+   (the armed one-shot's settle deadline passed and no evidence says it ran:
+   that window is genuinely unanchored, and the reason names which witness said
+   so), `"cloud routine method — no local ping"` (the slot came due with no
+   routine armed for it at all: unanchored by design, never a flaky local
+   turn), or `"open window leaves no usable budget slice"`.
+   Note the ~5-minute lag on any cloud-routine resolution: a passed one-shot is
+   held untouched until `CloudFallbackPlanner.dispatchSettle`, because moving it
+   sooner would cancel the run — so a fire's `ping.skip` legitimately trails its
+   minute, and the *absence* of any line within that window is the hold working.
    A fire that ran *minutes past its planned minute on purpose* logs
    `ping.defer` first (from the daemon when it shifts the queue past a
    known-open window, or from the child's preflight when it catches one at
@@ -286,7 +293,13 @@ Work the chain in this order:
    empty usage readings (see also `usage-ratelimit.json` for the backoff).
    The captured usage *response bodies* are also the ground truth for when a
    window anchored: `resets_at − 5 h` is the anchor time — an anchor while
-   the Mac was provably asleep is the cloud routine's fingerprint.
+   the Mac was provably asleep is the cloud routine's fingerprint. Read those
+   boundaries as 10-minute buckets rather than exact instants: the provider
+   floors a window's start to the previous 10-minute mark, so `resets_at − 5 h`
+   is the bucket the anchoring turn fell in, up to 10 minutes before the turn
+   itself. A trigger response's `last_fired_at` is the only exact record of when
+   a cloud routine ran — and comparing it against the `run_once_at` in the same
+   body is how you tell a run that happened from one that was cancelled.
 5. **Sleep/wake questions.** The root wake helper never writes to the
    workspace; it logs via os.log — `log show --last 12h --predicate
    'subsystem == "com.agent-manager"'`. For ground truth on the machine
@@ -419,7 +432,16 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   evidence), and a drain-loop guard consumes any Claude entry the routine
   hasn't confirmed yet — that one window goes **unanchored by design** (logged
   `skipped: cloud routine method …`) rather than falling back to the flaky
-  local turn the method exists to avoid. Its invariants: **always
+  local turn the method exists to avoid. Its invariants: **nothing about a
+  passed one-shot may move until its run is accounted for** — claude.ai
+  dispatches `run_once_at` 35–45 s *late*, and that field is also the server's
+  only handle on the pending run, so patching it forward inside the gap deletes
+  the run; `CloudFallbackPlanner.dispatchSettle` holds the arming, the queue
+  entry, *and* the covered-fire bookkeeping until the fire resolves (see the
+  next bullet); **a fire is only ever resolved from evidence** — an exact
+  `resets_at` attributable to it, or the routines API's `last_fired_at` — never
+  from the armed minute having passed, and an unconfirmed fire resolves
+  `anchored: false` with no window state invented for it; **always
   `run_once_at`, never cron** (an orphaned routine fires at most once, then
   auto-disables server-side); **the daemon is the only API writer** (the app
   only writes the preference; the CLI doesn't write it at all — `am scheduler
@@ -440,10 +462,29 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   There used to be a second, *fallback* mode: the routine armed at
   `fire + 5 min` as a dead-man's switch behind a local ping. It is retired —
   two anchors for one slot made "what anchors this account?" a question with
-  two answers, and the planner had to hold an armed one-shot until its fire
-  resolved. With the routine armed *at* the fire, the planner is pure
-  convergence (arm the next fire, disable when there is none), so don't
-  reintroduce a lead without reintroducing that hold.
+  two answers. Retiring it removed that reason for holding an armed one-shot
+  until its fire resolved, and removing the *hold* was a bug: the five-minute
+  lead had also been what gave the cloud time to actually dispatch. Armed *at*
+  the fire, an evidence-free "the minute passed, so it ran" resolution re-armed
+  the routine ~5 s after it came due and cancelled every run on an awake Mac —
+  while logging each one as an anchor. The hold is back (`dispatchSettle`), so
+  the planner is convergence *plus* that one rule; don't remove either half.
+- **The provider quantizes anchors to 10 minutes.** A rolling window's *start* is
+  floored to the previous 10-minute mark, so every `resets_at` lands on
+  :00/:10/:20/:30/:40/:50 (~120 distinct boundaries over three weeks of
+  `network.jsonl`, no exception) — a turn at 05:35 anchors 05:30–10:30. Observed,
+  not documented, so `RuntimeAnchorPolicy.anchorQuantum` is the single place it
+  lives and everything treats it as "*at most* this much quantization", degrading
+  to a no-op if it changes. Three consequences worth knowing before touching
+  anchor math: the refire `margin` is **free** anywhere below one quantum (an
+  expiry sits on the grid, and a fire in `[expiry, expiry + quantum)` floors back
+  to exactly `expiry`), which is also why lateness inside a bucket costs nothing;
+  a *conservative* bound must be grid-floored, or each deferral overstates the
+  expiry, the next fire is pushed past that, and the error compounds hop after
+  hop until it eats a slot; and anchor attribution must compare floored values
+  (`SchedulerDaemon.exactWindowPredates`), never allow a clock tolerance —
+  flooring can put an implied anchor a full quantum before the turn that caused
+  it, and a tolerance compare reads those real anchors as phantoms.
 - **Missing menu-bar item after running a dev *and* a packaged build.** If the
   status item doesn't appear even though the app is running and `menuBarMode`
   isn't `.hidden`, suspect a stale ControlCenter record, not the code. Running a

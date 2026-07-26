@@ -83,6 +83,7 @@ public actor SchedulerDaemon {
     private let wakeBridge: @Sendable (TimeInterval) -> Void
     private let cloudSyncer: CloudFallbackSyncer
     private let cloudUsageReader: CloudUsageReader
+    private let cloudRunConfirmer: CloudRunConfirmer
     private let statusStore: SchedulerStatusStore
     private let audit: AuditLog
     private let activity: ActivityLog
@@ -174,6 +175,7 @@ public actor SchedulerDaemon {
         wakeBridge: (@Sendable (TimeInterval) -> Void)? = nil,
         cloudSyncer: CloudFallbackSyncer? = nil,
         cloudUsageReader: CloudUsageReader? = nil,
+        cloudRunConfirmer: CloudRunConfirmer? = nil,
         executablePath: String? = nil)
     {
         self.workspace = workspace
@@ -194,6 +196,8 @@ public actor SchedulerDaemon {
         self.cloudSyncer = cloudSyncer ?? CloudFallbackEngine.live(workspace: workspace).syncer()
         self.cloudUsageReader = cloudUsageReader ?? SchedulerDaemon.liveCloudUsageReader(
             workspace: workspace, fileManager: fileManager)
+        self.cloudRunConfirmer = cloudRunConfirmer
+            ?? CloudFallbackEngine.live(workspace: workspace).confirmer()
         self.statusStore = SchedulerStatusStore(workspace: workspace, fileManager: fileManager)
         self.audit = AuditLog(workspace: workspace, fileManager: fileManager)
         self.activity = ActivityLog(workspace: workspace, fileManager: fileManager)
@@ -267,14 +271,22 @@ public actor SchedulerDaemon {
             // only inside the due loop is the original cloud +5m phantom.
             if await reconcilePassedCloudFire(cloudStates) { continue }
 
+            // Recomputed each pass: reconciling a fire above releases its
+            // account, and a held account's entry must be invisible to
+            // *everything* below — resolving it, as a skip or as covered, is
+            // what lets the post-drain sync cancel the run we are waiting on.
+            let held = routinesAwaitingDispatch(cloudStates)
             let adjusted = adjustedQueue()
-            if !adjusted.covered.isEmpty {
-                resolveCovered(adjusted.covered)
+            let covered = adjusted.covered.filter { !held.contains($0.accountID) }
+            if !covered.isEmpty {
+                resolveCovered(covered)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
                 continue
             }
-            guard let head = adjusted.entries.first, head.fireAt <= now() else { break }
+            guard let head = adjusted.entries.first(where: { !held.contains($0.accountID) }),
+                  head.fireAt <= now()
+            else { break }
 
             // Grace/staleness is measured against the *effective* time — a
             // fire deferred past a known expiry is exactly on time there.
@@ -287,13 +299,14 @@ public actor SchedulerDaemon {
                 && providersByID[head.accountID]?.supportsCloudAnchorRoutines == true
             {
                 // The `routine` ping method: this account is anchored solely by
-                // its claude.ai routine, never a local ping.
-                // `reconcilePassedCloudFire` already resolved (and logged) any
-                // fire the routine covered, so reaching a *due* entry here means
-                // the routine isn't confirmed for this fire — not yet armed, or
-                // its arm is erroring. We consume the slot without pinging: this
-                // one window goes unanchored by design rather than fall back to
-                // the flaky local turn the method exists to avoid; the post-drain
+                // its claude.ai routine, never a local ping. An armed fire still
+                // settling was filtered out above, and
+                // `reconcilePassedCloudFire` has already resolved (and logged)
+                // any fire whose fate is known — so reaching a *due* entry here
+                // means no routine is armed for it at all: not yet armed, or its
+                // arm is erroring. We consume the slot without pinging: this one
+                // window goes unanchored by design rather than fall back to the
+                // flaky local turn the method exists to avoid; the post-drain
                 // sync re-arms the routine forward for the next fire.
                 markHandled(head)
                 logUnconfirmedRoutineSkip(head)
@@ -410,6 +423,12 @@ public actor SchedulerDaemon {
             await cloudSyncer(CloudFallbackSyncRequest(
                 accountID: id,
                 nextFireAt: nextFire,
+                // The planner's half of the dispatch hold. A held entry is still
+                // in `upcoming`, so `nextFire` usually *is* the armed moment and
+                // the planner converges to `.none` on its own — but fresh window
+                // evidence can shift that entry mid-settle, and then only this
+                // tells the planner not to chase it and cancel the run.
+                resolvedFire: lastResolvedFire[id],
                 now: now()))
         }
     }
@@ -442,6 +461,19 @@ public actor SchedulerDaemon {
     /// expiry.
     private func logCloudPhantom(accountID: String) {
         let detail = "cloud routine fired inside an already-open window; no new window anchored"
+        audit.append(accountID: accountID, action: "ping.skip", ok: true, detail: detail)
+        activity.append(ActivityRecord(
+            time: now(), accountID: accountID, ok: true, anchored: false, detail: detail))
+    }
+
+    /// A one-shot's fire came and went without anchoring anything — it never ran,
+    /// it ran without producing a billed turn, or nothing we can reach will say.
+    /// This window is genuinely unanchored, and `reason` is the forensic record
+    /// of how we know. `anchored: false` is the whole point: the alternative,
+    /// assuming a routine ran because its minute passed, is what made an entire
+    /// night of missed anchors read as successes in this very log.
+    private func logRoutineDidNotRun(accountID: String, reason: String) {
+        let detail = "skipped: cloud routine did not anchor this fire — \(reason)"
         audit.append(accountID: accountID, action: "ping.skip", ok: true, detail: detail)
         activity.append(ActivityRecord(
             time: now(), accountID: accountID, ok: true, anchored: false, detail: detail))
@@ -644,10 +676,59 @@ public actor SchedulerDaemon {
         return adjusted
     }
 
-    /// Reconcile one passed cloud one-shot even when the corresponding queue
-    /// entry is not due because runtime state shifted it later. The routine is
-    /// armed *at* its fire, so `armedFor` is the fire it ran — match that
-    /// against either today's effective queue or the entry's nominal identity.
+    /// This account's armed one-shot whose moment has passed and whose run is
+    /// still unaccounted for — `nil` when nothing is armed, the arm is broken,
+    /// the moment is still ahead, or the fire is already resolved.
+    ///
+    /// The routine is armed *at* its fire, so `armedFor` is both the fire it
+    /// covers and the moment it was due to run — one value, one name.
+    private func unresolvedArmedFire(
+        _ cloudStates: CloudFallbackState, _ accountID: String) -> Date?
+    {
+        let state = cloudStates.accounts[accountID] ?? AccountCloudFallbackState()
+        guard let armedFor = state.armedFor,
+              state.triggerID != nil,
+              !state.disabled,
+              state.lastError == nil,
+              now() >= armedFor
+        else { return nil }
+        if let resolved = lastResolvedFire[accountID], resolved >= armedFor { return nil }
+        return armedFor
+    }
+
+    /// Accounts whose armed one-shot passed within the last
+    /// `CloudFallbackPlanner.dispatchSettle` and is still unaccounted for.
+    ///
+    /// **Nothing about these accounts may move this tick.** Not the arming
+    /// (which would cancel the pending run outright), and not their queue entry
+    /// either: consuming it — as a local skip, or as "covered" — is what frees
+    /// the post-drain sync to re-arm the routine forward, which is the same
+    /// cancellation by a longer road. The window they are waiting on is tens of
+    /// seconds wide in practice; see `dispatchSettle` for why it is measured in
+    /// minutes anyway.
+    private func routinesAwaitingDispatch(_ cloudStates: CloudFallbackState) -> Set<String> {
+        guard cloudRoutineEnabled else { return [] }
+        var held: Set<String> = []
+        for id in accountIDs where providersByID[id]?.supportsCloudAnchorRoutines == true {
+            guard let armedFor = unresolvedArmedFire(cloudStates, id),
+                  now() < armedFor.addingTimeInterval(CloudFallbackPlanner.dispatchSettle)
+            else { continue }
+            held.insert(id)
+        }
+        return held
+    }
+
+    /// Resolve one passed cloud one-shot — even when the corresponding queue
+    /// entry is not due, because runtime state shifted it later.
+    ///
+    /// Only runs once the fire's settle deadline has passed, and only ever
+    /// concludes from *evidence*: an exact `resets_at` that can be attributed to
+    /// this fire, or the routines API's own `last_fired_at`. Never from the fact
+    /// that the armed minute is behind us — a one-shot dispatches tens of
+    /// seconds late, so "the minute passed" is worth exactly nothing, and
+    /// treating it as an anchor logged a false `anchored: true` *and* invented
+    /// five hours of window that pushed every later decision off the truth.
+    ///
     /// Returning after one mutation forces the caller to rebuild before it
     /// considers another account.
     private func reconcilePassedCloudFire(_ cloudStates: CloudFallbackState) async -> Bool {
@@ -657,17 +738,9 @@ public actor SchedulerDaemon {
         let adjusted = adjustNominalQueue(nominal)
 
         for id in accountIDs where providersByID[id]?.supportsCloudAnchorRoutines == true {
-            let state = cloudStates.accounts[id] ?? AccountCloudFallbackState()
-            guard let armedFor = state.armedFor,
-                  state.triggerID != nil,
-                  !state.disabled,
-                  state.lastError == nil,
-                  now() >= armedFor
+            guard let armedFor = unresolvedArmedFire(cloudStates, id),
+                  now() >= armedFor.addingTimeInterval(CloudFallbackPlanner.dispatchSettle)
             else { continue }
-
-            // The routine is armed *at* its fire, so `armedFor` is both the
-            // moment it ran and the fire it covered — one value, one name.
-            if let resolved = lastResolvedFire[id], resolved >= armedFor { continue }
 
             let sameInstant: (Date, Date) -> Bool = {
                 abs($0.timeIntervalSince($1)) < 1
@@ -678,43 +751,119 @@ public actor SchedulerDaemon {
                 $0.accountID == id && sameInstant($0.nominalFireAt, armedFor)
             }
 
-            // `resets_at` is the only exact cloud-anchor timestamp available.
-            // Probe once after the one-shot passes; the production reader never
-            // refreshes credentials, because `/status` itself can anchor.
-            if let reading = await cloudUsageReader(id),
-               let resets = reading.primaryResetsAt,
-               resets <= now().addingTimeInterval(
-                   windowSeconds + RuntimeAnchorPolicy.margin)
-            {
-                let candidate = AccountWindowState(
-                    expiresAt: resets, evidence: .usage, observedAt: reading.fetchedAt)
-                windowStates[id] = RuntimeAnchorPolicy.merged(windowStates[id], candidate)
-            }
-
-            if windowWasAlreadyOpen(id, at: armedFor) {
-                // The one-shot itself was a phantom. Resolve that pointless
-                // run so the engine can move the routine forward. If its queue
-                // entry is still pending, leave it for the real expiry.
+            switch await cloudFireEvidence(id, armedFor: armedFor) {
+            case .phantom:
+                // The one-shot ran inside a window that was already open, so it
+                // anchored nothing. Resolve that pointless run so the engine can
+                // move the routine forward. If its queue entry is still pending,
+                // leave it for the real expiry.
                 logCloudPhantom(accountID: id)
                 markCloudFireResolved(id, fireAt: armedFor)
-                let checkpoint = adjustedQueue()
-                writeStatus(upcoming: checkpoint.entries, current: nil)
-                return true
+
+            case let .anchored(ranAt):
+                // The slot may already be watermarked — this account's method
+                // may have changed, or the fire was consumed while the routine
+                // was still unconfirmed. The run happened regardless and is the
+                // event that anchored, so account for it with no pending entry.
+                if let entry { markHandled(entry) }
+                logCloudCoveredSkip(QueueEntry(fireAt: armedFor, accountID: id))
+                noteCloudAnchorEvidence(id, armedFor: armedFor, ranAt: ranAt)
+                markCloudFireResolved(id, fireAt: armedFor)
+
+            case let .didNotAnchor(reason):
+                // Consume the slot and say so. Deliberately no window evidence:
+                // this account has *nothing* anchored, and inventing a bound
+                // here is what let one silent miss defer the whole day after it.
+                if let entry { markHandled(entry) }
+                logRoutineDidNotRun(accountID: id, reason: reason)
+                markCloudFireResolved(id, fireAt: armedFor)
             }
 
-            // The slot may already be watermarked — this account's method may
-            // have changed, or the fire was consumed with the routine still
-            // unconfirmed. The one-shot ran regardless and can be the event
-            // that truly anchored, so account for it with no pending entry.
-            if let entry { markHandled(entry) }
-            logCloudCoveredSkip(QueueEntry(fireAt: armedFor, accountID: id))
-            noteCloudAnchorEvidence(id, armedFor: armedFor)
-            markCloudFireResolved(id, fireAt: armedFor)
             let checkpoint = adjustedQueue()
             writeStatus(upcoming: checkpoint.entries, current: nil)
             return true
         }
         return false
+    }
+
+    /// What actually became of a passed one-shot.
+    private enum CloudFireEvidence {
+        /// A window is anchored, covering this fire and no earlier one; `ranAt`
+        /// is the best-known moment the turn happened (for deriving a
+        /// conservative bound when exact usage evidence isn't available).
+        ///
+        /// Deliberately *not* "the routine definitely produced it": on the usage
+        /// path a later user or CLI turn inside the same span is
+        /// indistinguishable, and would be credited here. That ambiguity is
+        /// harmless — the window is real either way, so every scheduling
+        /// decision downstream is identical — and resolving it would cost an API
+        /// call per fire to learn nothing actionable.
+        case anchored(ranAt: Date)
+        /// The run happened but landed inside an already-open window.
+        case phantom
+        /// Nothing anchored — the routine did not run, or ran without producing
+        /// a billed turn. Carries the log-worthy reason.
+        case didNotAnchor(reason: String)
+    }
+
+    /// Decide a passed one-shot's fate, cheapest decisive signal first.
+    ///
+    /// A usage reading taken after the armed moment settles it outright: its
+    /// `resets_at` is exact, so it says both *whether* a window is live and
+    /// *which* turn anchored it. Notably, no live five-hour window at all is not
+    /// missing information — it is proof that nothing anchored, and the one case
+    /// this used to read as "the run must have happened."
+    ///
+    /// Only when no such reading is available does this ask the routines API,
+    /// whose `last_fired_at` is the authority on whether the run happened at all.
+    private func cloudFireEvidence(_ accountID: String, armedFor: Date) async -> CloudFireEvidence {
+        // One probe per fire, at the deadline — the shared usage cache is the
+        // preferred source and this reader refreshes it. The production reader
+        // never refreshes credentials, because `/status` itself can anchor.
+        let reading = await cloudUsageReader(accountID)
+        if let reading, reading.fetchedAt >= armedFor {
+            guard let resets = reading.primaryResetsAt,
+                  RuntimeAnchorPolicy.isPlausibleLiveExpiry(
+                      resets, at: now(), window: windowSeconds)
+            else {
+                return .didNotAnchor(
+                    reason: "no five-hour window is open — the routine did not anchor this fire")
+            }
+            let candidate = AccountWindowState(
+                expiresAt: resets, evidence: .usage, observedAt: reading.fetchedAt)
+            windowStates[accountID] = RuntimeAnchorPolicy.merged(windowStates[accountID], candidate)
+            return windowWasAlreadyOpen(accountID, at: armedFor)
+                ? .phantom
+                : .anchored(ranAt: now())
+        }
+
+        guard let trigger = await cloudRunConfirmer(accountID) else {
+            return .didNotAnchor(
+                reason: "could not confirm the routine ran (usage and routines API both unavailable)")
+        }
+        guard SchedulerDaemon.routineHasRun(trigger, since: armedFor) else {
+            return .didNotAnchor(reason: "claude.ai never ran the routine for this fire")
+        }
+        // It ran, but nothing exact describes the window it made. Fall back to
+        // the conservative bound, dated from when it actually ran.
+        return windowWasAlreadyOpen(accountID, at: armedFor)
+            ? .phantom
+            : .anchored(ranAt: trigger.lastFiredAt ?? now())
+    }
+
+    /// Did this routine's armed one-shot actually run?
+    ///
+    /// `last_fired_at` is the authority. A one-shot that ran also stands itself
+    /// down server-side (`ended_reason: "run_once_fired"`), which covers a
+    /// response that omits the stamp — and cannot be a *stale* signal, because
+    /// re-arming clears it. The margin absorbs clock skew between the provider's
+    /// stamp and our own `armedFor`; dispatch is only ever late, never early, so
+    /// the tolerance is there for skew alone.
+    private static func routineHasRun(_ trigger: CloudTrigger, since armedFor: Date) -> Bool {
+        if let fired = trigger.lastFiredAt {
+            return fired >= armedFor.addingTimeInterval(-RuntimeAnchorPolicy.margin)
+        }
+        return trigger.endedReason == CloudTrigger.runOnceFiredReason
     }
 
     /// Did the best-known window begin before this cloud event? If so, a turn
@@ -728,27 +877,34 @@ public actor SchedulerDaemon {
             state, eventAt: eventAt, window: windowSeconds)
     }
 
-    /// Whether exact reset evidence proves this window began materially before
-    /// `eventAt`. A one-minute attribution tolerance avoids calling the event a
-    /// phantom merely because the provider rounded `resets_at` or its clock is
-    /// a few seconds behind ours.
+    /// Whether exact reset evidence proves this window began in an *earlier*
+    /// anchor bucket than `eventAt` — i.e. `eventAt` cannot be what produced it.
+    ///
+    /// The comparison happens on the provider's anchor grid
+    /// (`RuntimeAnchorPolicy.anchorQuantum`), not against a clock tolerance. A
+    /// turn at `eventAt` produces the window `floor(eventAt) + window`, so this
+    /// evidence describes that very turn exactly when
+    /// `expiresAt - window == floor(eventAt)`, and describes an older window only
+    /// when it is *less*. The tolerance version of this test was wrong in a way
+    /// no slack could fix: flooring can put the implied anchor up to a full
+    /// quantum before the turn that caused it, so any fire landing more than the
+    /// tolerance past a 10-minute mark read as a phantom while having anchored
+    /// perfectly well.
     private static func exactWindowPredates(
         _ state: AccountWindowState,
         eventAt: Date,
-        window: TimeInterval,
-        clockTolerance: TimeInterval = RuntimeAnchorPolicy.margin)
+        window: TimeInterval)
         -> Bool
     {
         guard state.evidence == .usage,
               state.expiresAt > eventAt,
-              state.expiresAt <= eventAt.addingTimeInterval(window + clockTolerance)
+              state.expiresAt <= eventAt.addingTimeInterval(window + RuntimeAnchorPolicy.margin)
         else { return false }
         // A reading obtained no later than the event is direct proof that its
-        // window was already open; no timestamp derivation or clock tolerance
-        // is needed for that case.
+        // window was already open; no attribution is needed for that case.
         if state.observedAt <= eventAt { return true }
         let impliedAnchor = state.expiresAt.addingTimeInterval(-window)
-        return impliedAnchor < eventAt.addingTimeInterval(-clockTolerance)
+        return impliedAnchor < RuntimeAnchorPolicy.flooredToAnchorGrid(eventAt)
     }
 
     private func markCloudFireResolved(_ accountID: String, fireAt: Date) {
@@ -826,7 +982,14 @@ public actor SchedulerDaemon {
 
     private func noteConservativeAnchor(_ accountID: String, since observed: Date) {
         let candidate = AccountWindowState(
-            expiresAt: observed.addingTimeInterval(windowSeconds),
+            // The provider floors an anchor onto its grid, and flooring is
+            // monotonic — so the *floored* observation is still a valid upper
+            // bound on the expiry, just a truthful one. Bounding from the raw
+            // moment instead overstated every conservative expiry by up to a
+            // quantum, and since each overstatement deferred the next fire past
+            // it, the error compounded hop after hop until it ate a whole slot.
+            expiresAt: RuntimeAnchorPolicy.flooredToAnchorGrid(observed)
+                .addingTimeInterval(windowSeconds),
             evidence: .conservative,
             observedAt: observed)
         // This path is chosen only after a possibly-anchoring event whose
@@ -837,13 +1000,14 @@ public actor SchedulerDaemon {
         windowStates[accountID] = candidate
     }
 
-    /// Record a passed cloud one-shot. Its scheduled `armedFor` boundary is
-    /// known even when the Mac notices it hours later, so falling back to
-    /// detection-time + window would gratuitously push the next anchor hours
-    /// late. Exact usage still wins when available; otherwise use
-    /// `armedFor + window` and let the standard one-minute fire margin absorb
-    /// routine dispatch/clock jitter.
-    private func noteCloudAnchorEvidence(_ accountID: String, armedFor: Date) {
+    /// Record a *confirmed* cloud one-shot. Exact usage wins when available;
+    /// otherwise the bound is derived from `ranAt` — the moment the routine
+    /// actually ran (`last_fired_at`), floored onto the anchor grid, which is
+    /// precisely the window the provider gave it. Using `armedFor` instead would
+    /// have been a lower bound, not an upper one, since dispatch is always late:
+    /// a run that slipped into the next bucket would have had its expiry
+    /// understated and the following fire scheduled inside a still-open window.
+    private func noteCloudAnchorEvidence(_ accountID: String, armedFor: Date, ranAt: Date) {
         foldUsageEvidence(force: true)
         if let state = windowStates[accountID],
            state.evidence == .usage
@@ -859,7 +1023,8 @@ public actor SchedulerDaemon {
             if describesCloudBoundary || describesCurrentWindow { return }
         }
         windowStates[accountID] = AccountWindowState(
-            expiresAt: armedFor.addingTimeInterval(windowSeconds),
+            expiresAt: RuntimeAnchorPolicy.flooredToAnchorGrid(max(ranAt, armedFor))
+                .addingTimeInterval(windowSeconds),
             evidence: .conservative,
             observedAt: now())
     }
