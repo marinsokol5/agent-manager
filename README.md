@@ -65,30 +65,11 @@ individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 Instead of starting your subscription's 5-hour usage window on your first request, start it at a fixed time beforehand, to maximize the number of tokens available when working.
 
 Paint your working hours in the app, flip the **Scheduler active**
-switch, and Agent Manager fires a small ping to open each account's window just
+switch, and Agent Manager fires a small ping (programmatic, sdk, controlled terminal or Claude routine) to open each account's window just
 before you start, so that you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
 
 ![Planner screen: working hours painted on a weekly grid, the ping schedule, and the daily token-window timeline](screenshots/planner.png)
-
-Controlled terminal is the default and only verified-anchoring method. For
-provider A/B testing, **Preferences → Local ping method** can instead use `claude -p` /
-`codex exec` or the official SDKs, separately for Claude and Codex. Scheduled
-pings verify the post-turn usage window regardless of method, so a programmatic
-turn that burns tokens without opening the 5-hour window is never reported as an
-anchor. SDK dependencies are user-installed; Agent Manager never installs them.
-
-**Lid closed or Mac sleeping?** Flip **Wake Mac for pings** in Preferences: a tiny helper arms a hardware wake ~45
-seconds before each ping, the ping runs, and the Mac goes back to sleep if
-nobody's around.
-
-**Lid closed *on battery*?** That's the one case no software can wake on Mac, so
-Claude Code accounts can use Anthropic's cloud compute to start the token window.
-Pick **Cloud routine** as Claude's ping method in Preferences: a tiny one-shot
-routine — "AgentManager Routine", visible at claude.ai/code/routines — is armed
-at each scheduled Claude slot and anchors the window from Anthropic's cloud, so
-no local ping runs at all and a sleeping Mac still anchors. Codex keeps pinging
-locally, and Test ping still runs a real local turn.
 
 ## CLI reference
 
@@ -96,7 +77,6 @@ locally, and Test ping still runs a real local turn.
 am list                   list accounts with status + provider
 am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
 am usage [<id>]           capacity for connected accounts (--week, --provider, --sort)
-am ping <id>              run a ping (--method terminal|headless|sdk overrides once)
 ```
 
 Everything else is doable only in the app, the CLI handles only running-related actions.
