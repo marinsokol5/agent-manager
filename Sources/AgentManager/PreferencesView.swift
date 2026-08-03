@@ -253,11 +253,11 @@ private extension PingMethod {
     func displaySubtitle(for provider: Provider, setupCommand: String?) -> String {
         switch self {
         case .terminal:
-            return "Drives the real interactive TUI — the verified-anchoring default."
+            return "Drives the real interactive TUI — the first method verified to anchor."
         case .headless:
             return provider == .claude
-                ? "claude -p — a lighter, non-interactive turn with structured output."
-                : "codex exec — a lighter, non-interactive turn with structured output."
+                ? "claude -p — the default: a lighter, non-interactive turn with structured output and nothing extra to install."
+                : "codex exec — the default: a lighter, non-interactive turn with structured output and nothing extra to install."
         case .sdk:
             let sdk = provider == .claude ? "Claude Agent SDK" : "Codex SDK"
             return "Install the \(sdk) once: \(setupCommand ?? "")"

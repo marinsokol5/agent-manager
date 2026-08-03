@@ -3,11 +3,16 @@ import Foundation
 /// How an account's rolling window gets anchored — one question, one list.
 ///
 /// Three of these are *local drivers*: different ways this Mac delivers the
-/// tiny turn. `terminal` remains the safe default because the interactive
-/// subscription path is the only local method verified to move providers'
-/// rolling windows; `headless` and `sdk` are deliberately selectable
-/// experiments, and scheduled pings still use post-turn usage evidence, never
-/// process success alone, to claim an anchor.
+/// tiny turn. `headless` is what a fresh install starts on
+/// (`Preferences.default`) — it needs nothing installed beyond the provider's
+/// own CLI, and it reads a documented structured result instead of scraping a
+/// TUI, so it is the least likely to break under either provider. `terminal`
+/// drives the real interactive path — the first method verified to move a
+/// rolling window, still what installs made before that default keep, and the
+/// fallback wherever a stored choice can't be honored (see `sanitized` and
+/// `localDriver`). `sdk` is the outlier that needs a user-installed dependency.
+/// Whichever runs, scheduled pings claim an anchor only from post-turn usage
+/// evidence, never from process success.
 ///
 /// `routine` is the odd one out, and it belongs in the same list precisely
 /// because it answers the same question — the turn just runs on Anthropic's
@@ -19,11 +24,12 @@ import Foundation
 /// (`Provider.supportsCloudAnchorRoutines`), and it never delivers a turn
 /// *here*: anything that must run now — Test ping, a hand-run `am ping` —
 /// uses `localDriver` instead.
+/// Declaration order is display order — the default first (see `available`).
 public enum PingMethod: String, Codable, Sendable, CaseIterable, Identifiable {
-    /// Drive the provider's real interactive TUI over a PTY.
-    case terminal
     /// Run `claude -p` / `codex exec` and consume their structured output.
     case headless
+    /// Drive the provider's real interactive TUI over a PTY.
+    case terminal
     /// Drive the official provider SDK through a workspace helper script.
     case sdk
     /// Let a one-shot claude.ai routine anchor each scheduled slot from
@@ -37,23 +43,31 @@ public enum PingMethod: String, Codable, Sendable, CaseIterable, Identifiable {
         self != .routine || provider.supportsCloudAnchorRoutines
     }
 
-    /// The methods to offer for `provider`, in display order (local drivers
-    /// first, the cloud routine last).
+    /// The methods to offer for `provider`, in display order: the default
+    /// local driver first, then the other local drivers, the cloud routine
+    /// last.
     public static func available(for provider: Provider) -> [PingMethod] {
         allCases.filter { $0.isAvailable(for: provider) }
     }
 
-    /// Coerce a method the provider doesn't offer back to the verified default.
+    /// Coerce a method the provider doesn't offer back to the verified driver.
     /// A hand-edited `preferences.json` can name `routine` for a provider that
     /// has no routines; this is what keeps that from reaching the daemon as
-    /// "never ping this account, and nothing anchors it either".
+    /// "never ping this account, and nothing anchors it either". It lands on
+    /// `terminal`, not on the fresh-install default: a value we can't honor
+    /// says nothing about which method this install wants, so it gets the one
+    /// verified to anchor.
     public func sanitized(for provider: Provider) -> PingMethod {
         isAvailable(for: provider) ? self : .terminal
     }
 
     /// The driver to use when a turn has to run on *this* Mac. `.routine`
     /// schedules a cloud run — it cannot deliver a turn now — so local turns
-    /// under that preference fall back to the verified terminal driver.
+    /// under that preference fall back to the verified terminal driver. That
+    /// fallback deliberately doesn't follow the fresh-install default: what
+    /// reaches it is a Test ping or a hand-run `am ping`, i.e. someone checking
+    /// that a turn *works*, which is the one place to spend the interactive
+    /// path this account isn't otherwise using.
     public var localDriver: PingMethod {
         self == .routine ? .terminal : self
     }

@@ -115,7 +115,7 @@ final class AppModel {
     /// tick, so these take effect immediately for Test ping, future scheduler
     /// children, *and* cloud-routine arming — without touching the launchd
     /// agent.
-    var claudePingMethod: PingMethod = .terminal {
+    var claudePingMethod: PingMethod = Preferences.default.claudePingMethod {
         didSet {
             guard claudePingMethod != oldValue else { return }
             var prefs = preferencesStore.load()
@@ -138,7 +138,7 @@ final class AppModel {
         }
     }
 
-    var codexPingMethod: PingMethod = .terminal {
+    var codexPingMethod: PingMethod = Preferences.default.codexPingMethod {
         didSet {
             guard codexPingMethod != oldValue else { return }
             var prefs = preferencesStore.load()

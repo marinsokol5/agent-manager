@@ -367,25 +367,32 @@ final class ParsingTests: XCTestCase {
         let store = PreferencesStore(fileURL: url)
         defer { try? fm.removeItem(at: url) }
 
-        // Missing file → defaults (12-hour, system theme, terminal pings).
+        // Missing file, nothing saying otherwise → fresh-install defaults
+        // (12-hour, system theme, programmatic pings).
         XCTAssertEqual(store.load().clockStyle, .twelveHour)
         XCTAssertEqual(store.load().theme, .system)
-        XCTAssertEqual(store.load().claudePingMethod, .terminal)
-        XCTAssertEqual(store.load().codexPingMethod, .terminal)
+        XCTAssertEqual(store.load().claudePingMethod, .headless)
+        XCTAssertEqual(store.load().codexPingMethod, .headless)
 
         let changed = Preferences(
             clockStyle: .twentyFourHour,
             theme: .dark,
-            claudePingMethod: .headless,
+            claudePingMethod: .terminal,
             codexPingMethod: .sdk)
         store.save(changed)
         XCTAssertEqual(store.load(), changed)
-        XCTAssertEqual(changed.pingMethod(for: .claude), .headless)
+        XCTAssertEqual(changed.pingMethod(for: .claude), .terminal)
         XCTAssertEqual(changed.pingMethod(for: .codex), .sdk)
 
-        // A file predating theme/ping methods → every missing field gets its own default.
+        // A file predating theme/ping methods → every missing field gets its
+        // own default, and the methods get the *legacy* one: the file proves an
+        // install that was already anchoring over the terminal.
         try? #"{"clockStyle":"twentyFourHour"}"#.data(using: .utf8)!.write(to: url)
-        XCTAssertEqual(store.load(), Preferences(clockStyle: .twentyFourHour, theme: .system))
+        XCTAssertEqual(
+            store.load(),
+            Preferences(
+                clockStyle: .twentyFourHour, theme: .system,
+                claudePingMethod: .terminal, codexPingMethod: .terminal))
 
         // Unknown method values also fall back independently, preserving a valid sibling.
         try? #"{"claudePingMethod":"future","codexPingMethod":"sdk"}"#
@@ -393,9 +400,40 @@ final class ParsingTests: XCTestCase {
         XCTAssertEqual(store.load().claudePingMethod, .terminal)
         XCTAssertEqual(store.load().codexPingMethod, .sdk)
 
-        // Corrupt file → defaults, never throws.
+        // Corrupt file → conservative defaults, never throws, never clobbered.
         try? "{ not json".data(using: .utf8)!.write(to: url)
-        XCTAssertEqual(store.load(), .default)
+        XCTAssertEqual(store.load(), .legacyDefault)
+        XCTAssertEqual(try? String(contentsOf: url, encoding: .utf8), "{ not json")
+    }
+
+    /// The programmatic default is for *new* installs only: a workspace that
+    /// already holds accounts keeps the terminal driver its pings were set up
+    /// on. Both answers are seeded to disk on the first read, so adding the
+    /// first account can never flip a fresh install onto the legacy default.
+    func testPreferencesDefaultsSplitFreshInstallFromExistingWorkspace() throws {
+        func workspace() throws -> Workspace {
+            let root = fm.temporaryDirectory.appendingPathComponent("am-prefs-ws-\(UUID().uuidString)")
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+            return Workspace(root: root)
+        }
+
+        // Never held an account → the fresh-install default.
+        let fresh = try workspace()
+        XCTAssertEqual(PreferencesStore(workspace: fresh).load(), .default)
+        XCTAssertTrue(fm.fileExists(atPath: fresh.preferencesFile.path), "first read seeds the answer")
+
+        // …and it stays put once the user adds one.
+        try Data("[]".utf8).write(to: fresh.accountsFile)
+        XCTAssertEqual(PreferencesStore(workspace: fresh).load(), .default)
+
+        // An inventory with no preferences file → an install that predates the
+        // programmatic default, so nothing about its anchoring changes.
+        let existing = try workspace()
+        try Data("[]".utf8).write(to: existing.accountsFile)
+        XCTAssertEqual(PreferencesStore(workspace: existing).load(), .legacyDefault)
+        XCTAssertEqual(PreferencesStore(workspace: existing).load().claudePingMethod, .terminal)
+        XCTAssertEqual(PreferencesStore(workspace: existing).load().codexPingMethod, .terminal)
     }
 
     // MARK: helpers

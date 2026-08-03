@@ -190,10 +190,12 @@ design follows from them.
   any of them stay silent (see `KeychainGrantStore`).
 - `preferences.json` — display preferences plus the provider-wide Claude and
   Codex ping methods, shared by app + CLI *and the scheduler daemon*. Three
-  local drivers (`terminal` / `headless` / `sdk`) plus, for Claude only,
+  local drivers (`headless` / `terminal` / `sdk`) plus, for Claude only,
   `routine`: the claude.ai cloud routine, which is a ping method rather than a
   separate feature because it answers the same question — what anchors this
-  account. Picking it stops local Claude pings entirely.
+  account. Picking it stops local Claude pings entirely. The file is written on
+  first read if it's missing, because that read is also where "which default
+  applies" is decided — see the ping-method gotcha.
 - `sdk-ping/` — the Node/Python helper scripts materialized by the installed
   binary when an SDK ping runs. SDK dependencies are user-installed here; the
   app never runs npm/pip or contacts a package registry.
@@ -382,16 +384,31 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   monitoring refresh: active + registration reading `.notRegistered`/
   `.notFound` → one `register()` per app run (`scheduler.reregister` in the
   audit log) — a real state change, so it can't re-notify an approved agent.
-- **Terminal is the verified anchoring method.** Controlled-terminal pings over
-  a PTY remain the default and the only *local* method verified to anchor the
-  rolling window. Preferences exposes provider-wide experimental `headless`
-  (`claude -p` / `codex exec`) and `sdk` methods for re-testing provider
-  behavior, plus Claude's `routine` (see the cloud-routine gotcha below); `am
-  ping <id> --method terminal|headless|sdk` supplies a one-off override —
-  `routine` is deliberately rejected there, because it schedules a future cloud
-  run rather than delivering a turn now. For the same reason anything that must
-  run a turn locally under that preference (Test ping, a hand-run `am ping`)
-  falls back to `PingMethod.localDriver`, i.e. terminal. Never equate
+- **`headless` is the default; `terminal` is the verified one — and which you
+  get is decided once, per install.** New installs anchor with the programmatic
+  CLI (`claude -p` / `codex exec`): it completes a real billed turn with nothing
+  to install beyond the provider's own binary, and it reads a structured result
+  instead of a TUI's screen output, so it's the method least likely to break
+  under us. Controlled-terminal pings over a PTY are the *first* method verified
+  to anchor a rolling window, and remain what every install predating that
+  default keeps — an upgrade never moves a working install onto a different
+  anchoring method. That split lives in exactly one place, `PreferencesStore.load`:
+  no `preferences.json` + no `accounts.json` ⇒ `Preferences.default`
+  (programmatic); no `preferences.json` + an inventory ⇒ `Preferences.legacyDefault`
+  (terminal). It **seeds the answer to disk on that first read** — the marker
+  appears when the user adds their first account, so an unseeded new install
+  would silently flip to the legacy default the moment it became real. (The app
+  loads preferences at launch, long before any account exists. The one read that
+  doesn't seed is a root one, under `sudo am wake …`: a root-owned
+  `preferences.json` would make every later save silently fail.) Everywhere a
+  *stored* choice can't be honored still lands on `terminal`, not on the default
+  — `PingMethod.sanitized` (`routine` named for Codex) and `PingMethod.localDriver`
+  (anything that must run a turn here under `routine`: Test ping, a hand-run `am
+  ping`) — because an unhonorable value says nothing about what this install
+  wants, and those paths are exactly where someone is checking that a turn
+  works. `am ping <id> --method headless|terminal|sdk` supplies a one-off
+  override; `routine` is deliberately rejected there, because it schedules a
+  future cloud run rather than delivering a turn now. Never equate
   method/process success with anchoring: scheduled children still bracket
   every method with usage reads, and only `AnchorVerification` may report a moved
   window. SDK helpers are materialized in `<workspace>/sdk-ping`; users install

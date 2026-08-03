@@ -73,7 +73,7 @@ public struct AccountPinger {
         var environment = ChildEnvironment.make(for: home, base: baseEnvironment)
         // A developer shell often exports direct-API keys. Letting those reach a
         // ping would test API billing instead of this managed subscription and,
-        // for SDK/headless experiments, make the comparison meaningless.
+        // for the programmatic and SDK drivers, make the comparison meaningless.
         for key in account.provider.apiKeyEnvironmentKeys { environment.removeValue(forKey: key) }
         let binary = ChildEnvironment.binary(for: account.provider, environment: environment)
         // `.localDriver` is what makes `routine` safe to store as a ping

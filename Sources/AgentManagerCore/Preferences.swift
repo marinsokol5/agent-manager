@@ -133,8 +133,8 @@ public struct Preferences: Codable, Sendable, Equatable {
     public init(
         clockStyle: ClockStyle = .twelveHour,
         theme: AppTheme = .system,
-        claudePingMethod: PingMethod = .terminal,
-        codexPingMethod: PingMethod = .terminal)
+        claudePingMethod: PingMethod = .headless,
+        codexPingMethod: PingMethod = .headless)
     {
         self.clockStyle = clockStyle
         self.theme = theme
@@ -157,7 +157,23 @@ public struct Preferences: Codable, Sendable, Equatable {
         }
     }
 
+    /// What a **fresh install** starts with: the programmatic CLI (`claude -p` /
+    /// `codex exec`) on both providers. It is the lightest turn that still
+    /// completes a real billed exchange, it needs nothing installed beyond the
+    /// provider's own CLI (unlike `.sdk`), and it doesn't depend on a TUI's
+    /// screen output staying the shape we parse (unlike `.terminal`) — so it is
+    /// the method most likely to keep working untouched.
     public static let `default` = Preferences()
+
+    /// What an install that predates that default keeps: the terminal driver.
+    ///
+    /// Anchoring is the whole product, and `.terminal` is the method a working
+    /// install was verified on — silently moving a user who already has
+    /// scheduled pings onto a different one is not a thing an upgrade may do.
+    /// So "which default applies" is decided once, from evidence that the
+    /// workspace was in use before (see `PreferencesStore.load`), and frozen to
+    /// disk. Everything else here matches `default`; only the methods differ.
+    public static let legacyDefault = Preferences(claudePingMethod: .terminal, codexPingMethod: .terminal)
 
     private enum CodingKeys: String, CodingKey {
         case clockStyle, theme, claudePingMethod, codexPingMethod
@@ -167,10 +183,15 @@ public struct Preferences: Codable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         clockStyle = (try? c.decode(ClockStyle.self, forKey: .clockStyle)) ?? Self.default.clockStyle
         theme = (try? c.decode(AppTheme.self, forKey: .theme)) ?? Self.default.theme
+        // A `preferences.json` that exists but names no method was written
+        // before the programmatic default did — an existing install, whose
+        // pings have been anchoring over the terminal. Same for a method we
+        // can't parse: an unhonorable stored value is not a place to switch
+        // someone's anchoring method.
         claudePingMethod = ((try? c.decode(PingMethod.self, forKey: .claudePingMethod))
-            ?? Self.default.claudePingMethod).sanitized(for: .claude)
+            ?? Self.legacyDefault.claudePingMethod).sanitized(for: .claude)
         codexPingMethod = ((try? c.decode(PingMethod.self, forKey: .codexPingMethod))
-            ?? Self.default.codexPingMethod).sanitized(for: .codex)
+            ?? Self.legacyDefault.codexPingMethod).sanitized(for: .codex)
     }
 }
 
@@ -179,23 +200,59 @@ public struct Preferences: Codable, Sendable, Equatable {
 /// file.
 public struct PreferencesStore {
     let fileURL: URL
+    /// A file that only an install predating the programmatic default can have:
+    /// the account inventory. `nil` (the bare-`fileURL` init) means "no way to
+    /// tell" and reads as a fresh install — see `load`.
+    let priorUseMarker: URL?
     let fileManager: FileManager
 
-    public init(fileURL: URL, fileManager: FileManager = .default) {
+    public init(fileURL: URL, priorUseMarker: URL? = nil, fileManager: FileManager = .default) {
         self.fileURL = fileURL
+        self.priorUseMarker = priorUseMarker
         self.fileManager = fileManager
     }
 
     public init(workspace: Workspace, fileManager: FileManager = .default) {
-        self.init(fileURL: workspace.preferencesFile, fileManager: fileManager)
+        self.init(
+            fileURL: workspace.preferencesFile,
+            priorUseMarker: workspace.accountsFile,
+            fileManager: fileManager)
     }
 
+    /// Preferences as stored, or — for a workspace that has none yet — the
+    /// defaults for *this* install, seeded to disk so the choice is made once.
+    ///
+    /// The seed is the whole reason this isn't a plain `?? .default`. The
+    /// fresh-vs-existing question is answered from `priorUseMarker`, and that
+    /// evidence appears the moment the user adds their first account — so a new
+    /// install read twice, once before and once after, would answer differently
+    /// and silently move a real user off the method their pings were set up on.
+    /// Writing the answer down on first read fixes it: the app loads
+    /// preferences at launch, long before any account exists, and every later
+    /// reader (CLI, ping child, daemon) finds a file and never consults the
+    /// marker again.
     public func load() -> Preferences {
-        guard fileManager.fileExists(atPath: fileURL.path),
-              let data = try? Data(contentsOf: fileURL),
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            let seeded = defaultsForThisInstall()
+            // Not under `sudo am wake …`: a root-owned preferences.json in the
+            // user's workspace would make every later save silently fail.
+            if geteuid() != 0 { save(seeded) }
+            return seeded
+        }
+        guard let data = try? Data(contentsOf: fileURL),
               let prefs = try? JSONDecoder().decode(Preferences.self, from: data)
-        else { return .default }
+        // A file we can't read still proves this install chose once, so it gets
+        // the conservative defaults — and is left alone rather than clobbered.
+        else { return .legacyDefault }
         return prefs
+    }
+
+    /// `Preferences.default` for a workspace that has never held an account,
+    /// `.legacyDefault` for one that has.
+    private func defaultsForThisInstall() -> Preferences {
+        guard let priorUseMarker, fileManager.fileExists(atPath: priorUseMarker.path)
+        else { return .default }
+        return .legacyDefault
     }
 
     public func save(_ prefs: Preferences) {

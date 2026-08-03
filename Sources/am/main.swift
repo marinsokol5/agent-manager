@@ -82,7 +82,7 @@ USAGE:
                             capacity for connected accounts (or just <id>); one-row
                             table for 2+ accounts (rank order; --sort reorders it,
                             --provider filters by provider), --week shows the 7d window
-  am ping <id> [--method terminal|headless|sdk]
+  am ping <id> [--method headless|terminal|sdk]
                             fire one configured ping now; --method is a one-off
                             override for A/B testing. The background scheduler uses
                             the provider's saved preference and verifies anchoring.
@@ -369,7 +369,7 @@ func runPing(_ args: [String]) async {
     let id = args.enumerated().first { i, a in
         !a.hasPrefix("-") && !(i > 0 && valueFlags.contains(args[i - 1]))
     }?.element
-    guard let id else { fail("usage: am ping <id> [--method terminal|headless|sdk]") }
+    guard let id else { fail("usage: am ping <id> [--method headless|terminal|sdk]") }
     let methodOverride: PingMethod? = {
         guard args.contains("--method") else { return nil }
         // `routine` is deliberately not accepted: it schedules a claude.ai
@@ -379,7 +379,7 @@ func runPing(_ args: [String]) async {
         guard let raw = value("--method", in: args),
               let method = PingMethod(rawValue: raw), method != .routine
         else {
-            fail("--method must be one of: terminal, headless, sdk"
+            fail("--method must be one of: headless, terminal, sdk"
                 + " (routine is the scheduled cloud method — pick it in Preferences → Ping method)")
         }
         return method

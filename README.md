@@ -65,7 +65,7 @@ individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 Instead of starting your subscription's 5-hour usage window on your first request, start it at a fixed time beforehand, to maximize the number of tokens available when working.
 
 Paint your working hours in the app, flip the **Scheduler active**
-switch, and Agent Manager fires a small ping (programmatic, sdk, controlled terminal or Claude routine) to open each account's window just
+switch, and Agent Manager fires a small ping (programmatic by default; also sdk, controlled terminal or Claude routine) to open each account's window just
 before you start, so that you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
 
