@@ -17,27 +17,70 @@ public enum SDKPingRunner {
         let error: String?
     }
 
-    /// Pure command shape after scripts and the provider CLI have been resolved.
+    /// Asked of a candidate interpreter: can it see the SDK module?
+    typealias ModuleProbe = @Sendable (_ interpreter: String, _ environment: [String: String]) -> Bool
+
+    /// Which interpreter runs the helper — the decision the two runtimes make
+    /// very differently, resolved before the pure command shape below.
+    ///
+    /// Node resolves `@anthropic-ai/claude-agent-sdk` by walking up from the
+    /// helper *script*, so any `node` on any PATH finds the workspace's
+    /// `node_modules`: there is nothing to choose. Python resolves imports from
+    /// the *running interpreter's* site-packages, so for Codex the interpreter
+    /// **is** the dependency location — and a bare `python3` is the one thing we
+    /// must not settle for. `ChildEnvironment.enriched` prepends `/opt/homebrew/bin`
+    /// ahead of the caller's PATH, and the scheduler daemon's sealed plist carries
+    /// no user PATH at all, so the `python3` that runs the helper is routinely
+    /// *not* the `python3` the user typed `pip install` into (Homebrew's shadows
+    /// mise/pyenv/uv's, and Homebrew's is PEP 668 externally-managed anyway).
+    /// `sdk-ping/.venv` is the fix: one interpreter, inside the workspace, that
+    /// app, CLI, and daemon all resolve identically. The PATH probe behind it is
+    /// a courtesy for an install that already put the module in *some* python.
+    static func runtime(
+        provider: Provider,
+        workspace: Workspace,
+        environment: [String: String],
+        fileManager: FileManager = .default,
+        probe: ModuleProbe = importProbe)
+        -> String
+    {
+        switch provider {
+        case .claude:
+            return nonEmpty(environment["AGENT_MANAGER_NODE_BIN"]) ?? "node"
+        case .codex:
+            if let override = nonEmpty(environment["AGENT_MANAGER_PYTHON_BIN"]) { return override }
+            // The venv wins on existence alone, never on a probe: the documented
+            // install location must stay deterministic, so a venv missing the
+            // module reports *that* rather than silently anchoring elsewhere.
+            let venv = workspace.sdkPingVenvPython.path
+            if fileManager.isExecutableFile(atPath: venv) { return venv }
+            let candidates = ExecutableResolver.resolveAll(
+                "python3", environment: environment, fileManager: fileManager)
+            return candidates.first { probe($0, environment) } ?? candidates.first ?? "python3"
+        }
+    }
+
+    /// Pure command shape after the interpreter, scripts, and provider CLI have
+    /// been resolved.
     static func command(
         provider: Provider,
         providerBinary: String,
+        runtime: String,
         scripts: (claude: URL, codex: URL),
         environment: [String: String],
         workingDirectory: URL)
         -> Command
     {
-        var childEnvironment = environment
         switch provider {
         case .claude:
-            let runtime = nonEmpty(environment["AGENT_MANAGER_NODE_BIN"]) ?? "node"
             return Command(
                 executable: runtime,
                 arguments: [scripts.claude.path, ClaudePingRunner.pingPrompt, providerBinary],
-                environment: childEnvironment,
+                environment: environment,
                 workingDirectory: workingDirectory)
         case .codex:
+            var childEnvironment = environment
             childEnvironment["AGENT_MANAGER_CODEX_SDK_CWD"] = workingDirectory.path
-            let runtime = nonEmpty(environment["AGENT_MANAGER_PYTHON_BIN"]) ?? "python3"
             return Command(
                 executable: runtime,
                 arguments: [scripts.codex.path, CodexPingRunner.pingPrompt, providerBinary],
@@ -108,24 +151,28 @@ public enum SDKPingRunner {
         let command = command(
             provider: provider,
             providerBinary: providerBinary,
+            runtime: runtime(
+                provider: provider,
+                workspace: workspace,
+                environment: environment,
+                fileManager: fileManager),
             scripts: scripts,
             environment: environment,
             workingDirectory: workingDirectory)
-        guard let runtime = ExecutableResolver.resolve(
+        guard let interpreter = ExecutableResolver.resolve(
             command.executable, environment: command.environment, fileManager: fileManager)
         else {
-            let runtimeName = provider == .claude ? "node" : "python3"
             return .init(
                 ok: false,
                 detail: unavailableDetail(
                     provider: provider,
                     workspace: workspace,
-                    reason: "\(runtimeName) not found on PATH"),
+                    reason: "\(command.executable) not found on PATH"),
                 transcript: "")
         }
 
         let output = PingProcessRunner.run(
-            executable: runtime,
+            executable: interpreter,
             arguments: command.arguments,
             environment: command.environment,
             workingDirectory: command.workingDirectory,
@@ -148,9 +195,15 @@ public enum SDKPingRunner {
             stderr: output.stderr,
             parsedError: parsed?.error)
         if dependencyMissing {
+            // Name the interpreter/runtime that came up short: with Python the
+            // *which* is the whole failure, and "run pip install" on its own has
+            // already been obeyed once by anyone reading this line.
             return .init(
                 ok: false,
-                detail: unavailableDetail(provider: provider, workspace: workspace),
+                detail: unavailableDetail(
+                    provider: provider,
+                    workspace: workspace,
+                    reason: missingDependencyReason(provider: provider, runtime: interpreter)),
                 transcript: transcript)
         }
         guard output.exitStatus == 0, let parsed, parsed.ok, let usage = parsed.usage else {
@@ -179,13 +232,42 @@ public enum SDKPingRunner {
 
     /// Exact user-run prerequisite command shown by both the SDK failure and
     /// Preferences' copy button. Keeping one source prevents UI instructions
-    /// from drifting away from the runtime's actual module resolution rules.
+    /// from drifting away from the runtime's actual module resolution rules —
+    /// which is why the Codex line installs into `sdk-ping/.venv` by absolute
+    /// path rather than saying `python3 -m pip install`: whichever `python3` the
+    /// user's shell happens to resolve is exactly what `runtime` cannot rely on.
+    /// (`python3 -m venv` creates intermediate directories, so this works before
+    /// the first ping has materialized anything; `mkdir -p` covers the same for
+    /// npm's `cd`.)
     public static func setupCommand(provider: Provider, workspace: Workspace) -> String {
+        let directory = workspace.sdkPingDir.path.singleQuotedForShell
         switch provider {
         case .claude:
-            "cd \(workspace.sdkPingDir.path.singleQuotedForShell) && npm install @anthropic-ai/claude-agent-sdk"
+            return "mkdir -p \(directory) && cd \(directory) && npm install @anthropic-ai/claude-agent-sdk"
         case .codex:
-            "python3 -m pip install openai-codex"
+            return "python3 -m venv \(workspace.sdkPingVenv.path.singleQuotedForShell) && "
+                + "\(workspace.sdkPingVenvPython.path.singleQuotedForShell) -m pip install openai-codex"
+        }
+    }
+
+    /// Nothing in the package is imported — `find_spec` only *locates* it — and
+    /// the probe runs from `/` so that a stray `openai_codex` directory in the
+    /// caller's cwd (which Python puts on `sys.path` for `-c`) cannot vouch for
+    /// an interpreter that doesn't actually have it installed.
+    static let importProbe: ModuleProbe = { interpreter, environment in
+        let output = PingProcessRunner.run(
+            executable: interpreter,
+            arguments: ["-c", "import importlib.util as u, sys; sys.exit(0 if u.find_spec('openai_codex') else 1)"],
+            environment: environment,
+            workingDirectory: URL(fileURLWithPath: "/"),
+            timeout: 10)
+        return output.launchError == nil && !output.timedOut && output.exitStatus == 0
+    }
+
+    private static func missingDependencyReason(provider: Provider, runtime: String) -> String {
+        switch provider {
+        case .claude: "\(runtime) cannot resolve @anthropic-ai/claude-agent-sdk"
+        case .codex: "\(runtime) cannot import openai_codex"
         }
     }
 

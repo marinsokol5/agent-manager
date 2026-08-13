@@ -197,8 +197,9 @@ design follows from them.
   first read if it's missing, because that read is also where "which default
   applies" is decided — see the ping-method gotcha.
 - `sdk-ping/` — the Node/Python helper scripts materialized by the installed
-  binary when an SDK ping runs. SDK dependencies are user-installed here; the
-  app never runs npm/pip or contacts a package registry.
+  binary when an SDK ping runs, plus the two dependency locations the user
+  populates: `node_modules/` (Claude) and `.venv/` (Codex). The app never runs
+  npm/pip or contacts a package registry — it only *resolves* what's there.
 - `audit.log.jsonl`, `activity.jsonl`, `network.jsonl` — the three local logs
   shown in Monitoring.
 - `homes/<id>/` — the managed config home per account (created `0o700`).
@@ -413,7 +414,21 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   every method with usage reads, and only `AnchorVerification` may report a moved
   window. SDK helpers are materialized in `<workspace>/sdk-ping`; users install
   `@anthropic-ai/claude-agent-sdk` / `openai-codex` themselves, and Agent Manager
-  must never auto-install them or contact a package registry.
+  must never auto-install them or contact a package registry. Both dependencies
+  live *in the workspace*, because the two runtimes resolve them from opposite
+  ends: Node walks up from the helper script, so any `node` finds
+  `sdk-ping/node_modules`, while Python imports from the running interpreter's
+  own site-packages — making the interpreter itself the dependency location, and
+  a bare `python3` the one thing `SDKPingRunner.runtime` may not settle for
+  (`ChildEnvironment.enriched` prepends `/opt/homebrew/bin` ahead of the caller's
+  PATH, and the daemon's sealed plist carries no user PATH at all, so the
+  `python3` that runs the helper is routinely not the one the user pip-installed
+  into). Hence `sdk-ping/.venv`, resolved identically by app, CLI, and daemon:
+  `AGENT_MANAGER_PYTHON_BIN` > that venv (on existence alone — the documented
+  location stays deterministic) > the first PATH `python3` that can `find_spec`
+  the module. Keep `setupCommand` installing into that exact interpreter by
+  absolute path; an instruction that says `python3 -m pip install` is an
+  instruction about a different interpreter than the one that will run.
 - **Sleep & stale pings.** The daemon spawns each scheduled ping as
   `am ping <id> --manage-sleep --scheduled-for <epoch>`: the child holds the Mac
   awake for the turn (a `caffeinate` idle assertion bound to the ping's PID) and

@@ -85,6 +85,20 @@ public struct Workspace: Sendable {
     /// Agent Manager never contacts a package registry or installs them itself.
     public var sdkPingDir: URL { root.appendingPathComponent("sdk-ping", isDirectory: true) }
 
+    /// `sdk-ping/.venv/` — the Codex SDK's dependency location, the Python
+    /// mirror of the `sdk-ping/node_modules/` that Node resolves for the Claude
+    /// helper. Node finds packages by walking up from the *script*, so every
+    /// `node` sees the same tree; Python finds them in the *running
+    /// interpreter's* site-packages, so without a fixed interpreter "installed"
+    /// depends on whose `python3` won the PATH race — see `SDKPingRunner.runtime`.
+    public var sdkPingVenv: URL { sdkPingDir.appendingPathComponent(".venv", isDirectory: true) }
+
+    /// The interpreter inside `sdk-ping/.venv`. Absent (or dangling, if the base
+    /// interpreter it symlinks to was removed by a pyenv/mise version cleanup)
+    /// simply means "no workspace venv" — resolution falls through rather than
+    /// hard-failing.
+    public var sdkPingVenvPython: URL { sdkPingVenv.appendingPathComponent("bin/python3") }
+
     /// `keychain-grants.json` — Keychain services for which a `/usr/bin/security`
     /// read is verified to succeed silently. Shared by the app, `am`, and the
     /// scheduler daemon so a background read in any of them can use the CLI path

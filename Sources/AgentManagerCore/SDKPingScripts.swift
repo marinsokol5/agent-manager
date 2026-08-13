@@ -88,9 +88,11 @@ def main() -> int:
         from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
     except ModuleNotFoundError as error:
         if error.name == "openai_codex":
+            # Name the interpreter, not a fix: which python3 is running is the
+            # whole question here, and the caller owns the exact install command.
             emit({
                 "ok": False,
-                "error": "openai-codex is not installed; run `python3 -m pip install openai-codex`",
+                "error": f"openai-codex is not installed for {sys.executable}",
             })
             return 1
         raise

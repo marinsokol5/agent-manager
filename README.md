@@ -122,7 +122,7 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `cloud-fallback-state.json` | which claude.ai routine is armed per account, and for when |
 | `usage.json` | last-known usage reading per account |
 | `preferences.json` | display preferences plus separate Claude/Codex ping methods |
-| `sdk-ping/` | SDK helper scripts and user-installed SDK dependencies (only when SDK pings are used) |
+| `sdk-ping/` | SDK helper scripts plus the SDK dependencies you install — `node_modules/` for Claude, `.venv/` for Codex (only when SDK pings are used) |
 | `audit.log.jsonl` / `activity.jsonl` / `network.jsonl` | local logs (auth headers redacted) |
 | `homes/<id>/` | per-account config home (created `0700`) |
 
