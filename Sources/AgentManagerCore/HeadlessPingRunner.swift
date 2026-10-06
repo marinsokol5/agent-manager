@@ -233,11 +233,25 @@ enum PingProcessRunner {
 
 /// One concurrently drained pipe. Access is synchronized because Swift 6
 /// correctly treats the dispatch reader as a separate concurrency domain.
-private final class AsyncPipeCapture: @unchecked Sendable {
+///
+/// `tailLimit` bounds what is *kept*, not what is read: the pipe is always
+/// drained to EOF (a child blocked on a full pipe would never finish), but only
+/// the last `tailLimit` bytes survive. That is for long-running user commands
+/// (`CustomPingRunner`), where the end of the output — the verdict, the error —
+/// is the part worth a transcript, and minutes of progress lines are not worth
+/// holding in memory. The built-in drivers pass nil and keep everything.
+final class AsyncPipeCapture: @unchecked Sendable {
     let pipe = Pipe()
     private let group = DispatchGroup()
     private let lock = NSLock()
     private var captured = Data()
+    private let tailLimit: Int?
+    /// Whether `tailLimit` ever discarded a prefix, so the transcript can say so.
+    private var truncated = false
+
+    init(tailLimit: Int? = nil) {
+        self.tailLimit = tailLimit
+    }
 
     func closeParentWriterAndStart() {
         try? pipe.fileHandleForWriting.close()
@@ -249,6 +263,12 @@ private final class AsyncPipeCapture: @unchecked Sendable {
             {
                 lock.lock()
                 captured.append(data)
+                // Trim lazily (at 2× the limit) so a chatty child costs one
+                // copy per limit's worth of output, not one per read.
+                if let tailLimit, captured.count > 2 * tailLimit {
+                    captured = captured.suffix(tailLimit)
+                    truncated = true
+                }
                 lock.unlock()
             }
         }
@@ -263,8 +283,14 @@ private final class AsyncPipeCapture: @unchecked Sendable {
             _ = group.wait(timeout: .now() + 0.2)
         }
         lock.lock()
-        let data = captured
+        var data = captured
+        var cut = truncated
         lock.unlock()
-        return String(decoding: data, as: UTF8.self)
+        if let tailLimit, data.count > tailLimit {
+            data = data.suffix(tailLimit)
+            cut = true
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        return cut ? "[… earlier output truncated — last \(data.count) bytes kept …]\n" + text : text
     }
 }

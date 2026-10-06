@@ -245,6 +245,45 @@ final class SchedulerTests: XCTestCase {
         XCTAssertFalse(deactivated.accounts[0].scheduled)
     }
 
+    // MARK: - heartbeat freshness
+
+    /// An idle daemon keeps the 180 s rule: it ticks every poll interval, so
+    /// anything older is a dead or unloaded daemon.
+    func testIdleHeartbeatKeepsShortTolerance() {
+        let now = Date()
+        XCTAssertTrue(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-170))
+            .isFresh(asOf: now))
+        XCTAssertFalse(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-190))
+            .isFresh(asOf: now))
+    }
+
+    /// While a child is in flight the daemon is awaiting it, not ticking: the
+    /// heartbeat stays fresh for the child's whole budget (a five-minute
+    /// custom eval must not read as a dead daemon), then goes stale.
+    func testInFlightHeartbeatStaysFreshForTheChildBudget() {
+        let now = Date()
+        func inFlight(startedAgo: TimeInterval) -> SchedulerDaemonStatus {
+            let started = now.addingTimeInterval(-startedAgo)
+            return SchedulerDaemonStatus(
+                pid: 42, startedAt: now.addingTimeInterval(-3600), updatedAt: started, active: true,
+                upcoming: [], lastHandled: [:], horizonFloor: started, currentAccountID: "a1",
+                inFlight: SchedulerInFlight(
+                    accountID: "a1", nominalFireAt: started, effectiveFireAt: started,
+                    startedAt: started, windowSeconds: 5 * 3600))
+        }
+        let budget = SchedulerDaemon.pingChildTimeout + 180
+        XCTAssertTrue(inFlight(startedAgo: 300).isFresh(asOf: now))
+        XCTAssertTrue(inFlight(startedAgo: budget - 5).isFresh(asOf: now))
+        XCTAssertFalse(inFlight(startedAgo: budget + 5).isFresh(asOf: now))
+
+        // A status with only `currentAccountID` (no `inFlight` checkpoint)
+        // measures the budget from `updatedAt`.
+        XCTAssertTrue(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-300), pinging: "a1")
+            .isFresh(asOf: now))
+        XCTAssertFalse(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-(budget + 5)), pinging: "a1")
+            .isFresh(asOf: now))
+    }
+
     // MARK: - stale daemon restart
 
     func testRestartDaemonIfOutdatedKicksStaleDaemon() throws {
@@ -287,6 +326,11 @@ final class SchedulerTests: XCTestCase {
 
         // Ping child in flight → never kill a daemon mid-turn.
         store.save(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-10), pinging: "a1"))
+        XCTAssertFalse(scheduler.restartDaemonIfOutdated(now: now))
+        // …including a long (custom) child whose heartbeat is only fresh
+        // because it is in flight: widened liveness must not license a kick.
+        store.save(daemonStatus(startedAt: now.addingTimeInterval(-3600), updatedAt: now.addingTimeInterval(-300), pinging: "a1"))
+        XCTAssertTrue(store.load()?.isFresh(asOf: now) ?? false)
         XCTAssertFalse(scheduler.restartDaemonIfOutdated(now: now))
 
         // Binary too fresh — a build may still be writing it.

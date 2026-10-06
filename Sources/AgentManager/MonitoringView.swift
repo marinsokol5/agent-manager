@@ -443,17 +443,14 @@ struct MonitoringView: View {
             }
             Text(anchorText(record))
                 .font(Theme.Font.caption)
-                .foregroundStyle(record.ok ? (record.anchored ? Theme.success : Theme.warning) : .secondary)
+                .foregroundStyle(record.anchored ? Theme.success : (record.ok ? Theme.warning : .secondary))
             Text(record.detail).font(Theme.Font.caption).foregroundStyle(.secondary).lineLimit(1)
             Spacer(minLength: 0)
         }
         .padding(.vertical, 3)
     }
 
-    private func anchorText(_ r: ActivityRecord) -> String {
-        guard r.ok else { return "failed" }
-        return r.anchored ? "anchored" : "ran · no anchor"
-    }
+    private func anchorText(_ r: ActivityRecord) -> String { r.outcomeLabel }
 
     // MARK: - Logs tab
 

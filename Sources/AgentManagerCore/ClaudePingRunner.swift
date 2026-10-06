@@ -18,13 +18,31 @@ public enum ClaudePingRunner {
         /// Delivery method selected by `AccountPinger`. Low-level runners leave
         /// this nil; the choke point stamps it before audit/activity logging.
         public let pingMethod: PingMethod?
+        /// A failed result that still can't rule out billed turns, so the
+        /// scheduled child must verify it against usage like a success instead
+        /// of writing it off. Only the `custom` method sets it: a user command
+        /// that launched and then timed out may have run real turns (an eval
+        /// is several) before we killed it. Every built-in driver leaves it
+        /// false, so for them `!ok` keeps meaning "nothing to verify".
+        public let mayHaveRunTurns: Bool
 
-        public init(ok: Bool, detail: String, transcript: String, pingMethod: PingMethod? = nil) {
+        public init(
+            ok: Bool,
+            detail: String,
+            transcript: String,
+            pingMethod: PingMethod? = nil,
+            mayHaveRunTurns: Bool = false)
+        {
             self.ok = ok
             self.detail = detail
             self.transcript = transcript
             self.pingMethod = pingMethod
+            self.mayHaveRunTurns = mayHaveRunTurns
         }
+
+        /// Whether the scheduled child should run postflight verification:
+        /// every success, plus the failures flagged above.
+        public var needsAnchorVerification: Bool { ok || mayHaveRunTurns }
     }
 
     public static func run(

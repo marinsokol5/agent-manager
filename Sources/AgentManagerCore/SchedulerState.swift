@@ -171,11 +171,28 @@ public struct SchedulerDaemonStatus: Codable, Sendable, Equatable {
     }
 
     /// Whether the heartbeat is recent enough to call the daemon alive.
-    /// `tolerance` defaults to a few poll intervals so one slow tick (a ping in
-    /// flight bumps the heartbeat before and after, but a long turn can stretch
-    /// a gap) doesn't read as dead.
+    /// `tolerance` defaults to a few poll intervals so one slow tick doesn't
+    /// read as dead.
+    ///
+    /// A ping child in flight gets its whole budget on top. The daemon only
+    /// rewrites this file from `tick()`, and while it awaits a child the last
+    /// write is the pre-spawn checkpoint (`currentAccountID` / `inFlight` set)
+    /// — nothing refreshes it until the child returns. 180 s covered a
+    /// one-line turn, but a `custom` ping runs a minutes-long eval, and every
+    /// such fire would otherwise read as a dead daemon in Monitoring, in
+    /// `am scheduler status`, and to the runbook. So while a child is
+    /// recorded, the heartbeat stays fresh until the daemon's hard kill
+    /// (`SchedulerDaemon.pingChildTimeout`) plus the same `tolerance`,
+    /// measured from the in-flight write (`inFlight.startedAt`, else
+    /// `updatedAt`). Past that the daemon would have killed the child and
+    /// written again, so silence means what it always meant. This only widens
+    /// *liveness*; callers that must not act mid-ping (the outdated-daemon
+    /// restart) still check `currentAccountID` themselves.
     public func isFresh(asOf now: Date, tolerance: TimeInterval = 180) -> Bool {
-        now.timeIntervalSince(updatedAt) <= tolerance
+        if now.timeIntervalSince(updatedAt) <= tolerance { return true }
+        guard currentAccountID != nil || inFlight != nil else { return false }
+        let childStarted = inFlight?.startedAt ?? updatedAt
+        return now.timeIntervalSince(childStarted) <= SchedulerDaemon.pingChildTimeout + tolerance
     }
 }
 

@@ -1249,6 +1249,14 @@ public actor SchedulerDaemon {
         }
     }
 
+    /// The hard kill for one scheduled ping child. Every method's own turn
+    /// timeout has to finish *inside* it with room for the postflight usage
+    /// read, or the daemon kills a child that was about to report a verified
+    /// anchor and records `.timedOut` instead. The longest one is the `custom`
+    /// method's (`CustomPingRunner.timeout`); `CustomPingTests` pins the two
+    /// together, so raise them together or not at all.
+    public static let pingChildTimeout: TimeInterval = 600
+
     /// Spawn `am ping <id> --manage-sleep --scheduled-for <epoch>` — the
     /// workspace root travels as `AGENT_MANAGER_ROOT` in the child's env, set
     /// explicitly (not just inherited) so a hand-run daemon serving a custom
@@ -1261,7 +1269,7 @@ public actor SchedulerDaemon {
         program: String,
         workspace: Workspace,
         fileManager: FileManager = .default,
-        timeout: TimeInterval = 600)
+        timeout: TimeInterval = pingChildTimeout)
         -> PingRunner
     {
         let root = workspace.root.path

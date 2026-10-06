@@ -101,6 +101,12 @@ design follows from them.
    Logins, pings, and launches always drive the *official* `claude` / `codex`
    binary over a PTY (`GuidedLogin`, `*PingRunner`, `am run`). We only ever
    *read* credentials the official CLI wrote; we never write or relay them.
+   The one narrow carve-out is the `custom` ping method: it runs the user's
+   *own* executable instead of driving the CLI ourselves. It gets exactly the
+   environment the built-in drivers get (managed home, API keys stripped), we
+   never inspect or relay any credential for it, and whether it anchored is
+   still decided only from usage (`AnchorVerification`) — see
+   `CustomPingRunner`.
 3. **Isolated homes, never credential-swap.** Each account is its own managed
    `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. We never mutate the user's global default
    login. The one identity file per provider (`.claude.json` / `auth.json`) stays
@@ -119,7 +125,12 @@ design follows from them.
    `executableURL` (absolute path) + an `arguments` array. Never build a
    `/bin/sh -c "…"` command string from interpolated values. (`TerminalLauncher`
    is the sole place that emits a shell/AppleScript string, and only from
-   validated/managed inputs.)
+   validated/managed inputs.) The `custom` ping method is consistent with this,
+   not an exception to it: the user's command line is parsed once into argv
+   (`CustomPingCommand`, an absolute executable + arguments) and only that argv
+   ever reaches `Process`. Never re-join it into a string; a user who wants
+   shell features points it at their own script or `/bin/zsh -lc '…'`
+   explicitly.
 6. **Account IDs are filesystem-safe slugs.** Validate with `AccountID.validate`
    (`[A-Za-z0-9_-]`) before an ID is used as a directory name, launchd label, or
    plist path. This is what makes path/XML interpolation safe — keep new code
@@ -197,13 +208,16 @@ design follows from them.
   path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
   any of them stay silent (see `KeychainGrantStore`).
 - `preferences.json` — display preferences plus the provider-wide Claude and
-  Codex ping methods, shared by app + CLI *and the scheduler daemon*. Three
-  local drivers (`headless` / `terminal` / `sdk`) plus, for Claude only,
+  Codex ping methods, shared by app + CLI *and the scheduler daemon*. Four
+  local drivers (`headless` / `terminal` / `sdk` / `custom`) plus, for Claude only,
   `routine`: the claude.ai cloud routine, which is a ping method rather than a
   separate feature because it answers the same question — what anchors this
   account. Picking it stops local Claude pings entirely. The file is written on
   first read if it's missing, because that read is also where "which default
-  applies" is decided — see the ping-method gotcha.
+  applies" is decided — see the ping-method gotcha. Optional
+  `claudeCustomCommand` / `codexCustomCommand` (`{executable, arguments}`)
+  hold what `custom` runs; they are omitted while unset, so older files stay
+  byte-identical.
 - `sdk-ping/` — the Node/Python helper scripts materialized by the installed
   binary when an SDK ping runs, plus the two dependency locations the user
   populates: `node_modules/` (Claude) and `.venv/` (Codex). The app never runs
@@ -249,7 +263,9 @@ Work the chain in this order:
 
 1. **Was the daemon alive?** `scheduler-status.json` is the heartbeat,
    rewritten every tick. `updatedAt` more than ~3 min stale at some point
-   means the daemon was dead or unloaded then; `startedAt`/`pid` reveal
+   means the daemon was dead or unloaded then (unless `currentAccountID` /
+   `inFlight` is set: a ping child is running, and a gap up to its 10-minute
+   budget, `pingChildTimeout`, is expected); `startedAt`/`pid` reveal
    restarts; `lastHandled` is the per-account watermark of the last resolved
    fire (fired *or* deliberately dropped), while `inFlight` identifies a child
    whose outcome is not resolved yet; `upcoming` is what it planned next.
@@ -418,7 +434,7 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   (anything that must run a turn here under `routine`: Test ping, a hand-run `am
   ping`) — because an unhonorable value says nothing about what this install
   wants, and those paths are exactly where someone is checking that a turn
-  works. `am ping <id> --method headless|terminal|sdk` supplies a one-off
+  works. `am ping <id> --method headless|terminal|sdk|custom` supplies a one-off
   override; `routine` is deliberately rejected there, because it schedules a
   future cloud run rather than delivering a turn now. Never equate
   method/process success with anchoring: scheduled children still bracket
@@ -440,6 +456,23 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   the module. Keep `setupCommand` installing into that exact interpreter by
   absolute path; an instruction that says `python3 -m pip install` is an
   instruction about a different interpreter than the one that will run.
+
+  `custom` runs the user's own command (say a daily eval) as the anchoring
+  turn, under the account's managed home, with `AGENT_MANAGER_ACCOUNT_ID`,
+  `AGENT_MANAGER_PROVIDER`, and the resolved provider binary
+  (`AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN`, its directory first
+  on `PATH`) added; cwd is the executable's directory, stdin `/dev/null`. It
+  always uses its own 8-minute timeout (`CustomPingRunner.timeout`) — never the
+  90 s turn budget, Test ping included — and on timeout kills the whole
+  process group. That timeout is pinned below the daemon's 600 s hard kill
+  (`SchedulerDaemon.pingChildTimeout`) with room for the postflight read, and
+  must stay well inside the 15-min stale grace because the daemon drains due
+  pings sequentially. Outcome: never launched ⇒ failed, no verification; exited
+  on its own (any status) ⇒ `ok`, status in the detail; timed out ⇒ `ok: false`
+  but `mayHaveRunTurns`, so the scheduled child still verifies it (and reports
+  `anchorUnknown` if usage can't tell). That is the one case where
+  `anchored: true` can sit next to `ok: false`, which is why Monitoring reads
+  `ActivityRecord.outcomeLabel` (anchored wins) rather than `ok` first.
 - **Sleep & stale pings.** The daemon spawns each scheduled ping as
   `am ping <id> --manage-sleep --scheduled-for <epoch>`: the child holds the Mac
   awake for the turn (a `caffeinate` idle assertion bound to the ping's PID) and

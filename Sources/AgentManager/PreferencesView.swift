@@ -83,7 +83,7 @@ struct PreferencesView: View {
         }
     }
 
-    /// The one "what anchors this account?" question. The three local drivers
+    /// The one "what anchors this account?" question. The local drivers
     /// and Claude's cloud routine sit in the same list on purpose: they are
     /// alternatives, not a feature plus a mode — picking the routine means the
     /// scheduler stops running local Claude turns entirely.
@@ -140,11 +140,35 @@ struct PreferencesView: View {
                     // hangs off the selected card instead of a separate row.
                     statusCaption: method == .routine && selection == .routine
                         ? cloudRoutineCaption
-                        : nil,
+                        : method == .custom && selection == .custom
+                            ? customCommandCaption(provider: provider)
+                            : nil,
                     isSelected: selection == method,
                     action: { select(method) })
+                // The card is a Button, so the editable command lives under
+                // it rather than inside it. Keyed by provider so switching the
+                // segmented picker reloads the field from that provider's value.
+                if method == .custom && selection == .custom {
+                    CustomCommandField(model: model, provider: provider)
+                        .id(provider)
+                }
             }
         }
+    }
+
+    /// Selecting Custom without a usable command is allowed — you may pick the
+    /// method first and the command second — but the card must say plainly
+    /// that scheduled pings fail until one is set: never a silent dead method.
+    private func customCommandCaption(provider: Provider) -> (text: String, tint: Color) {
+        guard let command = model.customCommand(for: provider) else {
+            return ("No command set — every ping fails until you save one below.", Theme.warning)
+        }
+        do {
+            try command.validate()
+        } catch {
+            return ("Saved command can't run (\(error)) — pings fail until it's fixed.", Theme.warning)
+        }
+        return ("Runs your command (up to 8 minutes); usage decides whether it anchored.", Theme.success)
     }
 
     /// What the armed routine is actually doing, straight from the daemon's
@@ -236,6 +260,7 @@ private extension PingMethod {
         case .terminal: "Controlled terminal"
         case .headless: "Programmatic CLI"
         case .sdk: "SDK"
+        case .custom: "Custom command"
         // The list is already scoped to a provider, so no "Claude" prefix.
         case .routine: "Cloud routine"
         }
@@ -246,6 +271,7 @@ private extension PingMethod {
         case .terminal: "terminal"
         case .headless: "chevron.left.forwardslash.chevron.right"
         case .sdk: "shippingbox"
+        case .custom: "wrench.and.screwdriver"
         case .routine: "cloud.fill"
         }
     }
@@ -261,9 +287,90 @@ private extension PingMethod {
         case .sdk:
             let sdk = provider == .claude ? "Claude Agent SDK" : "Codex SDK"
             return "Install the \(sdk) once: \(setupCommand ?? "")"
+        case .custom:
+            let home = provider == .claude ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"
+            return "Runs your own executable — say a daily eval — with \(home) set to the account's home, so real work anchors the window. Arguments only, no shell."
         case .routine:
             return "A one-shot claude.ai routine anchors every scheduled slot from Anthropic's cloud. No local ping runs, so a sleeping Mac still anchors."
         }
+    }
+}
+
+/// The `custom` method's command line: one text field parsed into argv
+/// (`CustomPingCommand.parse` — quote-aware, never a shell string), a
+/// "Choose…" picker for the executable, and inline validation.
+///
+/// Saving is explicit (Return, or picking a file) rather than per keystroke:
+/// half-typed lines like `/bin/zsh -lc 'echo` would otherwise be saved as
+/// whatever happened to parse along the way. Only a line that parses *and*
+/// points at an executable file is ever written.
+private struct CustomCommandField: View {
+    @Bindable var model: AppModel
+    let provider: Provider
+    @State private var text: String = ""
+    @State private var loaded = false
+
+    var body: some View {
+        let state = validation
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                TextField("/path/to/your-eval.sh --flag value", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .onSubmit(save)
+                Button("Choose…", action: choose)
+            }
+            Text(state.text)
+                .font(.system(size: 11.5))
+                .foregroundStyle(state.tint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.leading, 51)
+        .onAppear {
+            guard !loaded else { return }
+            loaded = true
+            text = model.customCommand(for: provider)?.commandLine ?? ""
+        }
+    }
+
+    private var saved: CustomPingCommand? { model.customCommand(for: provider) }
+
+    private var validation: (text: String, tint: Color) {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ("Absolute path first, then arguments. Quote with '…' or \"…\". For pipes or &&, point at a script. Scheduled runs don't load your shell profile.", Color.secondary)
+        }
+        do {
+            let parsed = try CustomPingCommand.parse(text)
+            if parsed == saved {
+                let args = parsed.arguments.count
+                return ("Saved — runs \(parsed.executable)\(args == 0 ? "" : " with \(args) argument\(args == 1 ? "" : "s")").",
+                        Theme.success)
+            }
+            return ("Press Return to save.", Color.secondary)
+        } catch {
+            return ("\(error)", Theme.warning)
+        }
+    }
+
+    private func save() {
+        guard let parsed = try? CustomPingCommand.parse(text) else { return }
+        model.setCustomCommand(parsed, for: provider)
+        text = parsed.commandLine
+    }
+
+    /// Swap in the picked executable, keeping any arguments already typed.
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Pick the executable the custom ping runs."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let arguments = Array(((try? CustomPingCommand.tokenize(text)) ?? []).dropFirst())
+        text = CustomPingCommand(executable: url.path, arguments: arguments).commandLine
+        save()
     }
 }
 

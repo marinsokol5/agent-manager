@@ -55,7 +55,7 @@ struct MonitoringLogEntry: Identifiable, Sendable {
         var out: [MonitoringLogEntry] = []
 
         for r in activity {
-            let outcome = r.ok ? (r.anchored ? "anchored" : "ran · no anchor") : "failed"
+            let outcome = r.outcomeLabel
             let method = r.pingMethod.map { "\($0.rawValue) · " } ?? ""
             out.append(.init(
                 id: "ping-\(r.time.timeIntervalSince1970)-\(r.accountID)",

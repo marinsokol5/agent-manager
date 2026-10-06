@@ -126,6 +126,15 @@ public struct Preferences: Codable, Sendable, Equatable {
     /// answer to "what anchors this account?".
     public var claudePingMethod: PingMethod
     public var codexPingMethod: PingMethod
+    /// The command each provider's `custom` ping method runs. Optional and
+    /// omitted from the file while nil (synthesized `encodeIfPresent`), so a
+    /// `preferences.json` written before this existed stays byte-identical
+    /// until someone actually sets one. Kept even while another method is
+    /// selected, so switching away and back doesn't lose it. Reach it through
+    /// `customCommand(for:)` rather than these fields: that accessor is the
+    /// seam a per-account override will slot into.
+    public var claudeCustomCommand: CustomPingCommand?
+    public var codexCustomCommand: CustomPingCommand?
 
     /// Both methods are sanitized against their provider, so a `Preferences`
     /// value can never carry a method that provider doesn't offer (only Claude
@@ -134,12 +143,32 @@ public struct Preferences: Codable, Sendable, Equatable {
         clockStyle: ClockStyle = .twelveHour,
         theme: AppTheme = .system,
         claudePingMethod: PingMethod = .headless,
-        codexPingMethod: PingMethod = .headless)
+        codexPingMethod: PingMethod = .headless,
+        claudeCustomCommand: CustomPingCommand? = nil,
+        codexCustomCommand: CustomPingCommand? = nil)
     {
         self.clockStyle = clockStyle
         self.theme = theme
         self.claudePingMethod = claudePingMethod.sanitized(for: .claude)
         self.codexPingMethod = codexPingMethod.sanitized(for: .codex)
+        self.claudeCustomCommand = claudeCustomCommand
+        self.codexCustomCommand = codexCustomCommand
+    }
+
+    /// The command the `custom` method runs for `provider`'s accounts, or nil
+    /// when none is set (a custom ping then fails without launching anything).
+    public func customCommand(for provider: Provider) -> CustomPingCommand? {
+        switch provider {
+        case .claude: claudeCustomCommand
+        case .codex: codexCustomCommand
+        }
+    }
+
+    public mutating func setCustomCommand(_ command: CustomPingCommand?, for provider: Provider) {
+        switch provider {
+        case .claude: claudeCustomCommand = command
+        case .codex: codexCustomCommand = command
+        }
     }
 
     /// Provider-wide anchoring method, loaded afresh by every ping invocation
@@ -177,6 +206,7 @@ public struct Preferences: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case clockStyle, theme, claudePingMethod, codexPingMethod
+        case claudeCustomCommand, codexCustomCommand
     }
 
     public init(from decoder: Decoder) throws {
@@ -192,6 +222,10 @@ public struct Preferences: Codable, Sendable, Equatable {
             ?? Self.legacyDefault.claudePingMethod).sanitized(for: .claude)
         codexPingMethod = ((try? c.decode(PingMethod.self, forKey: .codexPingMethod))
             ?? Self.legacyDefault.codexPingMethod).sanitized(for: .codex)
+        // A malformed command decodes as "none set" rather than discarding the
+        // whole file: the custom ping then fails loudly, everything else holds.
+        claudeCustomCommand = (try? c.decodeIfPresent(CustomPingCommand.self, forKey: .claudeCustomCommand)) ?? nil
+        codexCustomCommand = (try? c.decodeIfPresent(CustomPingCommand.self, forKey: .codexCustomCommand)) ?? nil
     }
 }
 

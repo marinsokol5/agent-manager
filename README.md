@@ -65,9 +65,39 @@ individual menu bar entries or one collapsed) or from the CLI (`am usage`).
 Instead of starting your subscription's 5-hour usage window on your first request, start it at a fixed time beforehand, to maximize the number of tokens available when working.
 
 Paint your working hours in the app, flip the **Scheduler active**
-switch, and Agent Manager fires a small ping (programmatic by default; also sdk, controlled terminal or Claude routine) to open each account's window just
+switch, and Agent Manager fires a small ping (programmatic by default; also sdk, controlled terminal, your own custom command, or Claude routine) to open each account's window just
 before you start, so that you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
+If you already run a daily job against Claude or Codex — an eval, say — pick
+the **Custom command** ping method and point it at that executable: the job
+itself becomes the anchoring turn, so the morning window is set up by real
+work instead of a throwaway prompt. The command is stored as arguments, never
+run through a shell (point it at a script, or at `/bin/zsh -lc '…'`, if you
+want shell features). It runs from its own directory with stdin closed, may
+take up to 8 minutes, and Agent Manager still checks usage afterwards to
+decide whether the window actually anchored. A non-zero exit is reported but
+not treated as a failed ping.
+
+A *scheduled* run does not get your login shell's environment: it inherits
+the scheduler's minimal launchd environment (no `~/.zshrc` exports, no
+nvm/pyenv setup; `PATH` is just `~/.local/bin`, Homebrew, and the system
+directories). The app's **Test ping** sees the app's environment, and only
+`am ping --method custom` from Terminal sees your shell — so a job that passes
+there can still fail at 6 am. Export what the job needs (dataset paths, tool
+versions, `PATH` entries) inside the script itself, or deliberately point the
+command at `/bin/zsh -lc '…'` to load your profile.
+On top of that environment it can rely on:
+
+| Variable | Value |
+| --- | --- |
+| `CLAUDE_CONFIG_DIR` / `CODEX_HOME` | the account's managed home, so `claude` / `codex` run as that account |
+| `AGENT_MANAGER_ACCOUNT_ID` | the account id |
+| `AGENT_MANAGER_PROVIDER` | `claude` or `codex` |
+| `AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN` | the CLI binary Agent Manager would run; its directory is also first on `PATH` |
+
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are removed, so the job bills the
+subscription, not an API key.
+
 If you only want that automated morning window and would rather start later
 ones yourself, tick **First ping only** above the day's ping list: each account
 then keeps just its first ping of every workday.
@@ -91,7 +121,8 @@ Everything else is doable only in the app, the CLI handles only running-related 
   real and per-account; the rest is symlinked from your real config, so accounts
   share settings and history without stepping on each other's login.
 - **Official tooling only.** Logins and launches run the real `claude` / `codex`
-  binary. Pings use those binaries directly or through their official SDKs.
+  binary. Pings use those binaries directly or through their official SDKs —
+  or, with the custom method, your own command under the account's home.
   Agent Manager only reads the credentials those tools write — it never relays
   or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
@@ -124,7 +155,7 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `wake.json` | the "Wake Mac for pings" opt-in |
 | `cloud-fallback-state.json` | which claude.ai routine is armed per account, and for when |
 | `usage.json` | last-known usage reading per account |
-| `preferences.json` | display preferences plus separate Claude/Codex ping methods |
+| `preferences.json` | display preferences plus separate Claude/Codex ping methods (and the custom command, if you set one) |
 | `sdk-ping/` | SDK helper scripts plus the SDK dependencies you install — `node_modules/` for Claude, `.venv/` for Codex (only when SDK pings are used) |
 | `audit.log.jsonl` / `activity.jsonl` / `network.jsonl` | local logs (auth headers redacted) |
 | `homes/<id>/` | per-account config home (created `0700`) |

@@ -22,6 +22,12 @@ public struct AccountPinger {
     let audit: AuditLog
     let activity: ActivityLog
     let baseEnvironment: [String: String]
+    /// The `custom` method's budget, deliberately separate from `runTurn`'s
+    /// `timeout` (see the `.custom` arm). Internal so tests can drive a real
+    /// timeout through this dispatch — the only way to prove a killed command
+    /// still reaches postflight verification (`mayHaveRunTurns` must survive
+    /// the `Result` rebuild below) without waiting out eight minutes.
+    var customTimeout: TimeInterval = CustomPingRunner.timeout
 
     public init(
         workspace: Workspace,
@@ -82,9 +88,12 @@ public struct AccountPinger {
         // Test ping, a hand-run `am ping` — so it falls back to the verified
         // terminal driver rather than doing nothing. (The scheduler never gets
         // here for such an account: the daemon skips its local fires entirely.)
+        // Read preferences only when something needs them (no override, or the
+        // custom command to run), so an overridden ping never seeds the file.
+        let store = PreferencesStore(workspace: workspace, fileManager: fileManager)
+        let stored = methodOverride == nil ? store.load() : nil
         let method = (methodOverride
-            ?? PreferencesStore(workspace: workspace, fileManager: fileManager).load()
-                .pingMethod(for: account.provider)).localDriver
+            ?? (stored ?? store.load()).pingMethod(for: account.provider)).localDriver
 
         audit.append(accountID: id, action: "ping.start", ok: true, detail: method.rawValue)
         let rawResult: ClaudePingRunner.Result
@@ -117,12 +126,25 @@ public struct AccountPinger {
                 workspace: workspace,
                 timeout: timeout,
                 fileManager: fileManager)
+        case .custom:
+            // Always the custom method's own timeout, never `timeout`: callers
+            // pass a budget sized for a one-line turn (90 s), and cutting a
+            // five-minute eval short would make every custom ping a failure.
+            rawResult = CustomPingRunner.run(
+                command: (stored ?? store.load()).customCommand(for: account.provider),
+                accountID: id,
+                provider: account.provider,
+                binary: binary,
+                environment: environment,
+                timeout: customTimeout,
+                fileManager: fileManager)
         }
         let result = ClaudePingRunner.Result(
             ok: rawResult.ok,
             detail: rawResult.detail,
             transcript: rawResult.transcript,
-            pingMethod: method)
+            pingMethod: method,
+            mayHaveRunTurns: rawResult.mayHaveRunTurns)
         audit.append(accountID: id, action: "ping", ok: result.ok, detail: result.detail)
         return result
     }

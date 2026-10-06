@@ -2,7 +2,7 @@ import Foundation
 
 /// How an account's rolling window gets anchored — one question, one list.
 ///
-/// Three of these are *local drivers*: different ways this Mac delivers the
+/// Four of these are *local drivers*: different ways this Mac delivers the
 /// tiny turn. `headless` is what a fresh install starts on
 /// (`Preferences.default`) — it needs nothing installed beyond the provider's
 /// own CLI, and it reads a documented structured result instead of scraping a
@@ -11,6 +11,9 @@ import Foundation
 /// rolling window, still what installs made before that default keep, and the
 /// fallback wherever a stored choice can't be honored (see `sanitized` and
 /// `localDriver`). `sdk` is the outlier that needs a user-installed dependency.
+/// `custom` is the user's own executable (an eval, a daily job) run under the
+/// managed home instead of a throwaway turn — see `CustomPingRunner`; it is a
+/// local driver too, so `localDriver` leaves it alone.
 /// Whichever runs, scheduled pings claim an anchor only from post-turn usage
 /// evidence, never from process success.
 ///
@@ -32,6 +35,9 @@ public enum PingMethod: String, Codable, Sendable, CaseIterable, Identifiable {
     case terminal
     /// Drive the official provider SDK through a workspace helper script.
     case sdk
+    /// Run the user's own command (`Preferences.customCommand(for:)`) under
+    /// the managed home and let usage verification decide if it anchored.
+    case custom
     /// Let a one-shot claude.ai routine anchor each scheduled slot from
     /// Anthropic's cloud; no local ping runs for the account (Claude only).
     case routine

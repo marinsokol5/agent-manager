@@ -91,6 +91,17 @@ final class MonitoringLogTests: XCTestCase {
         let trigger = merged.first { $0.http != nil && $0.category == .scheduler }
         XCTAssertEqual(trigger?.providerHint, .claude)
     }
+
+    /// A custom command that timed out (`ok: false`) but that usage proved
+    /// anchored must read "anchored", not "failed".
+    func testMergeReadsAnchoredEvenWhenProcessFailed() {
+        let merged = MonitoringLogEntry.merge(
+            activity: [ActivityRecord(
+                accountID: "work", ok: false, anchored: true,
+                detail: "custom command timed out after 8m00s", pingMethod: .custom)],
+            audit: [], network: [])
+        XCTAssertTrue(merged.first?.detail.hasPrefix("custom · anchored") == true)
+    }
 }
 
 /// `TranscriptCleaner` turns a raw PTY dump into legible plain text. The

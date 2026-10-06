@@ -147,6 +147,44 @@ final class AppModel {
         }
     }
 
+    /// The command each provider's `custom` ping method runs (preferences.json).
+    /// Saved independently of the method selection — the Preferences field
+    /// writes it whether or not Custom is picked — and read afresh by every
+    /// ping, like the methods above. nil until the user sets one.
+    var claudeCustomCommand: CustomPingCommand? {
+        didSet {
+            guard claudeCustomCommand != oldValue else { return }
+            saveCustomCommand(claudeCustomCommand, for: .claude)
+        }
+    }
+
+    var codexCustomCommand: CustomPingCommand? {
+        didSet {
+            guard codexCustomCommand != oldValue else { return }
+            saveCustomCommand(codexCustomCommand, for: .codex)
+        }
+    }
+
+    func customCommand(for provider: Provider) -> CustomPingCommand? {
+        switch provider {
+        case .claude: claudeCustomCommand
+        case .codex: codexCustomCommand
+        }
+    }
+
+    func setCustomCommand(_ command: CustomPingCommand?, for provider: Provider) {
+        switch provider {
+        case .claude: claudeCustomCommand = command
+        case .codex: codexCustomCommand = command
+        }
+    }
+
+    private func saveCustomCommand(_ command: CustomPingCommand?, for provider: Provider) {
+        var prefs = preferencesStore.load()
+        prefs.setCustomCommand(command, for: provider)
+        preferencesStore.save(prefs)
+    }
+
     /// Persisted app appearance (preferences.json). Defaults to following macOS.
     var theme: AppTheme = .system {
         didSet {
@@ -316,6 +354,8 @@ final class AppModel {
         theme = prefs.theme
         claudePingMethod = prefs.claudePingMethod
         codexPingMethod = prefs.codexPingMethod
+        claudeCustomCommand = prefs.claudeCustomCommand
+        codexCustomCommand = prefs.codexCustomCommand
         applyTheme() // didSet doesn't fire during init — apply the loaded theme explicitly
         reload()
         reconcileAll()

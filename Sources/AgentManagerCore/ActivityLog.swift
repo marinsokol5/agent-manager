@@ -33,6 +33,17 @@ public struct ActivityRecord: Codable, Sendable, Equatable {
         self.transcriptPath = transcriptPath
         self.pingMethod = pingMethod
     }
+
+    /// The one-word outcome Monitoring shows. `anchored` wins over `ok`: a
+    /// custom command that timed out (`ok: false`) can still have anchored the
+    /// window before it was killed, and usage proved it — calling that
+    /// "failed" would hide the one fact the record exists for. Every other
+    /// method only ever records `anchored` alongside `ok`, so for them this is
+    /// the old `ok ? … : "failed"` reading unchanged.
+    public var outcomeLabel: String {
+        if anchored { return "anchored" }
+        return ok ? "ran · no anchor" : "failed"
+    }
 }
 
 /// Append-only JSONL ping log. Best-effort — like `AuditLog`, a logging failure

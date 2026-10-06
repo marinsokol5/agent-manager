@@ -82,10 +82,11 @@ USAGE:
                             capacity for connected accounts (or just <id>); one-row
                             table for 2+ accounts (rank order; --sort reorders it,
                             --provider filters by provider), --week shows the 7d window
-  am ping <id> [--method headless|terminal|sdk]
+  am ping <id> [--method headless|terminal|sdk|custom]
                             fire one configured ping now; --method is a one-off
-                            override for A/B testing. The background scheduler uses
-                            the provider's saved preference and verifies anchoring.
+                            override for A/B testing (custom runs the command saved
+                            in Preferences, up to 8 minutes). The background scheduler
+                            uses the provider's saved preference and verifies anchoring.
 """
 // Deliberately unlisted verb sets (functional, but the supported surfaces
 // live elsewhere):
@@ -369,7 +370,7 @@ func runPing(_ args: [String]) async {
     let id = args.enumerated().first { i, a in
         !a.hasPrefix("-") && !(i > 0 && valueFlags.contains(args[i - 1]))
     }?.element
-    guard let id else { fail("usage: am ping <id> [--method headless|terminal|sdk]") }
+    guard let id else { fail("usage: am ping <id> [--method headless|terminal|sdk|custom]") }
     let methodOverride: PingMethod? = {
         guard args.contains("--method") else { return nil }
         // `routine` is deliberately not accepted: it schedules a claude.ai
@@ -379,7 +380,7 @@ func runPing(_ args: [String]) async {
         guard let raw = value("--method", in: args),
               let method = PingMethod(rawValue: raw), method != .routine
         else {
-            fail("--method must be one of: headless, terminal, sdk"
+            fail("--method must be one of: headless, terminal, sdk, custom"
                 + " (routine is the scheduled cloud method — pick it in Preferences → Ping method)")
         }
         return method
@@ -478,7 +479,11 @@ func runPing(_ args: [String]) async {
         let attemptStarted = Date()
         let result = try pinger.runTurn(id, methodOverride: methodOverride)
         let attemptFinished = Date()
-        guard result.ok else {
+        // A failed turn has nothing to verify — except a custom command that
+        // launched and then timed out, which may already have run billed
+        // turns. That one goes through the same postflight as a success, so
+        // `anchored` still comes only from usage evidence.
+        guard result.needsAnchorVerification else {
             pinger.recordOutcome(id, result: result, anchored: false)
             print("✗ [\(id)] \(result.detail)")
             finish(PingOutcome.failedExitCode)
@@ -516,9 +521,13 @@ func runPing(_ args: [String]) async {
             // slot must remain pending and re-fire just after that reset.
             finish(PingOutcome.deferredOpenWindowExitCode)
         case .unknown:
+            // Also the timed-out custom command's answer: turns may have run,
+            // so the daemon schedules around it conservatively (exactly how it
+            // treats a child it had to kill itself) rather than as a clean
+            // failure that dispatched nothing.
             let detail = result.detail + " (anchor unverified — usage did not prove a new window)"
             pinger.recordOutcome(id, result: result, anchored: false, detail: detail)
-            print("✅ [\(id)] \(detail)")
+            print("\(result.ok ? "✅" : "✗") [\(id)] \(detail)")
             finish(PingOutcome.anchorUnknownExitCode)
         }
     } catch let error as AccountPinger.PingError {
