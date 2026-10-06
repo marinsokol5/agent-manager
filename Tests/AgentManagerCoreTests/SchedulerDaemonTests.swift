@@ -571,6 +571,113 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(recorder.requests, [.init(accountID: "cx", scheduledFor: date(2026, 7, 6, 5, 0))])
     }
 
+    // MARK: - per-account ping-method overrides
+
+    /// Two Claude accounts due at the same minute, one resolving to `routine`
+    /// and one to a local method. The routine one is synced/armed and never
+    /// gets a local ping; the local one pings and gets the disable signal.
+    private func assertMixedRoutineAndLocal(
+        _ ws: Workspace, routine: String, local: String, file: StaticString = #filePath, line: UInt = #line)
+        async throws
+    {
+        let clock = TestClock(date(2026, 7, 6, 5, 0, 30)) // 05:00 slot due for both
+        let recorder = PingRecorder()
+        let syncs = SyncRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
+        _ = await daemon.tick()
+
+        // Only the local account's ping is spawned.
+        XCTAssertEqual(recorder.requests, [.init(accountID: local, scheduledFor: date(2026, 7, 6, 5, 0))],
+                       file: file, line: line)
+        // The routine account's slot is consumed as a routine-method skip.
+        let skips = ActivityLog(workspace: ws).readRecent(limit: 10).filter { $0.accountID == routine }
+        XCTAssertEqual(skips.count, 1, file: file, line: line)
+        XCTAssertTrue(skips.first?.detail.contains("cloud routine method") == true, file: file, line: line)
+
+        let last = Dictionary(syncs.requests.map { ($0.accountID, $0.nextFireAt) }, uniquingKeysWith: { $1 })
+        // Routine account: armed at its next planned fire.
+        XCTAssertEqual(last[routine] ?? nil, date(2026, 7, 6, 10, 0), file: file, line: line)
+        // Local account: still synced, with the nil disable signal.
+        XCTAssertTrue(last.keys.contains(local), file: file, line: line)
+        XCTAssertNil(last[local] ?? nil, file: file, line: line)
+    }
+
+    func testRoutineOverrideOnOneAccountLeavesTheOtherPingingLocally() async throws {
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        var prefs = Preferences(claudePingMethod: .headless)
+        prefs.setPingOverride(AccountPingOverride(method: .routine), forAccount: "a1")
+        PreferencesStore(workspace: ws).save(prefs)
+        try await assertMixedRoutineAndLocal(ws, routine: "a1", local: "a2")
+    }
+
+    func testLocalOverrideOptsOneAccountOutOfTheRoutineDefault() async throws {
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        var prefs = Preferences(claudePingMethod: .routine)
+        prefs.setPingOverride(AccountPingOverride(method: .custom), forAccount: "a1")
+        PreferencesStore(workspace: ws).save(prefs)
+        try await assertMixedRoutineAndLocal(ws, routine: "a2", local: "a1")
+    }
+
+    func testPassedRoutineOfAnOverriddenAccountResolvesWhileTheOtherPings() async throws {
+        // a1 resolves to routine through its override and its 05:00 one-shot
+        // ran; a2 is local. a1's fire resolves from the API evidence without a
+        // local ping, and a2's local ping fires as usual.
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        var prefs = Preferences(claudePingMethod: .terminal)
+        prefs.setPingOverride(AccountPingOverride(method: .routine), forAccount: "a1")
+        PreferencesStore(workspace: ws).save(prefs)
+        let armed = date(2026, 7, 6, 5, 0)
+        seedArmedRoutine(ws, id: "a1", armedFor: armed)
+
+        let clock = TestClock(date(2026, 7, 6, 5, 6))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(
+            ws, clock: clock, recorder: recorder, cloudRunConfirmer: firedRoutine(armedFor: armed))
+        _ = await daemon.tick()
+
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a2", scheduledFor: date(2026, 7, 6, 5, 0))])
+        XCTAssertEqual(SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"], armed)
+    }
+
+    func testDispatchHoldIsPerAccountForAMixedRoutineAndLocalPair() async throws {
+        // 05:01 — inside the dispatch settle of a1's 05:00 one-shot. a1 resolves
+        // to `routine` through its override, a2 is local. The hold must apply to
+        // a1 alone: a1's slot, arming, and bookkeeping stay untouched (moving
+        // `run_once_at` now would delete the pending run), while a2 pings at
+        // 05:00 as usual. a2 also carries a leftover armed one-shot (from before
+        // it went local): not the routine method's, so neither held nor
+        // reconciled — it gets the disable signal like any non-routine account.
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        var prefs = Preferences(claudePingMethod: .headless)
+        prefs.setPingOverride(AccountPingOverride(method: .routine), forAccount: "a1")
+        PreferencesStore(workspace: ws).save(prefs)
+        let fire = date(2026, 7, 6, 5, 0)
+        var seed = CloudFallbackState()
+        for id in ["a1", "a2"] {
+            seed.accounts[id] = AccountCloudFallbackState(
+                triggerID: "trig_\(id)", environmentID: "env_1", armedFor: fire,
+                routineRevision: CloudFallbackEngine.routineRevision)
+        }
+        CloudFallbackStateStore(workspace: ws).save(seed)
+
+        let clock = TestClock(date(2026, 7, 6, 5, 1))
+        let recorder = PingRecorder()
+        let syncs = SyncRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder, cloudSyncer: { syncs.append($0) })
+        _ = await daemon.tick()
+
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a2", scheduledFor: fire)])
+        XCTAssertNil(SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"])
+        XCTAssertTrue(ActivityLog(workspace: ws).readRecent(limit: 10).filter { $0.accountID == "a1" }.isEmpty)
+
+        let last = Dictionary(syncs.requests.map { ($0.accountID, $0.nextFireAt) }, uniquingKeysWith: { $1 })
+        // Held: a1's arming still aims at the fire it is dispatching.
+        XCTAssertEqual(last["a1"] ?? nil, fire)
+        // Not held: a2 is told to stand its leftover one-shot down.
+        XCTAssertTrue(last.keys.contains("a2"))
+        XCTAssertNil(last["a2"] ?? nil)
+    }
+
     func testCloudUsageResetTightensACloudFireDetectedHoursLate() async throws {
         // The Mac comes back two hours after the 05:00 one-shot. Detection
         // time + window would pretend the window lasts until noon and swallow

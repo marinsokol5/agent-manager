@@ -98,6 +98,16 @@ On top of that environment it can rely on:
 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are removed, so the job bills the
 subscription, not an API key.
 
+The ping method is a default per provider, and any single account can
+override it: in **Preferences → Ping method**, the menu lists *All Claude
+accounts*, *All Codex accounts*, and each account under them. Pick an account
+to give it its own method — say, your eval as a custom command on just the one
+account it belongs to, while the rest keep the default — or pick *Same as all
+… accounts* to make it follow the default again. An overridden account's
+custom command is its own; it never falls back to the provider's. The
+provider view names the accounts that override it, and `am list` marks them
+with `[ping: <method>]`.
+
 If you only want that automated morning window and would rather start later
 ones yourself, tick **First ping only** above the day's ping list: each account
 then keeps just its first ping of every workday.
@@ -127,8 +137,8 @@ Everything else is doable only in the app, the CLI handles only running-related 
   or stores a token.
 - **Local only.** Network calls go only to the official provider endpoints
   (`api.anthropic.com`, `chatgpt.com`): the usage reads the real CLI already
-  makes, plus — only if you pick Claude's cloud routine ping method — managing
-  the anchor routine in your own claude.ai account. No backend, no analytics.
+  makes, plus — only for accounts you set to Claude's cloud routine ping
+  method — managing the anchor routine in your own claude.ai account. No backend, no analytics.
 - **One quiet background agent.** Scheduled pings come from a single resident
   launchd agent with an in-process queue — flipping the scheduler on and off
   never churns launchd (and never re-triggers macOS's background-items
@@ -155,7 +165,7 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `wake.json` | the "Wake Mac for pings" opt-in |
 | `cloud-fallback-state.json` | which claude.ai routine is armed per account, and for when |
 | `usage.json` | last-known usage reading per account |
-| `preferences.json` | display preferences plus separate Claude/Codex ping methods (and the custom command, if you set one) |
+| `preferences.json` | display preferences plus separate Claude/Codex ping methods, any per-account overrides (and the custom commands, if you set them) |
 | `sdk-ping/` | SDK helper scripts plus the SDK dependencies you install — `node_modules/` for Claude, `.venv/` for Codex (only when SDK pings are used) |
 | `audit.log.jsonl` / `activity.jsonl` / `network.jsonl` | local logs (auth headers redacted) |
 | `homes/<id>/` | per-account config home (created `0700`) |

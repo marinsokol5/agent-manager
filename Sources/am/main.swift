@@ -86,7 +86,8 @@ USAGE:
                             fire one configured ping now; --method is a one-off
                             override for A/B testing (custom runs the command saved
                             in Preferences, up to 8 minutes). The background scheduler
-                            uses the provider's saved preference and verifies anchoring.
+                            uses the account's saved method (its override, else its
+                            provider's) and verifies anchoring.
 """
 // Deliberately unlisted verb sets (functional, but the supported surfaces
 // live elsewhere):
@@ -192,7 +193,8 @@ func execReplacing(path: String, arguments: [String], environment: [String: Stri
 /// lifecycle itself happens in the app. The leading dot is the account's own color
 /// (its menu-bar/identity color); the status icon + word (e.g. `✅ connected`)
 /// carry connection state. Every managed home lives under one workspace root, so
-/// that root is printed once at the top rather than repeated on each row.
+/// that root is printed once at the top rather than repeated on each row. An
+/// account whose ping method overrides its provider's ends in `[ping: <method>]`.
 func runList(_ args: [String]) {
     let color = !hasFlag("--no-color", in: args) && isatty(STDOUT_FILENO) != 0
     do {
@@ -201,10 +203,16 @@ func runList(_ args: [String]) {
         // Print the real homes/ directory (no `<id>` placeholder) so terminals can
         // turn it into a clickable link; each account's home is a child named <id>.
         print("homes: \(abbreviateHome(workspace.homesDir.path))\n")
+        let prefs = PreferencesStore(workspace: workspace).load()
         for (i, account) in accounts.enumerated() {
             let email = account.identityEmail.map { " <\($0)>" } ?? ""
+            // Only overridden accounts get a marker: everyone else runs their
+            // provider's method, which the app shows once for all of them.
+            let method = prefs.pingOverride(forAccount: account.id) == nil
+                ? ""
+                : "  [ping: \(prefs.pingMethod(forAccount: account.id, provider: account.provider).rawValue)]"
             let provider = account.provider.rawValue.padding(toLength: 6, withPad: " ", startingAt: 0)
-            print("\(i + 1). \(TerminalColor.dot(hex: account.color, color: color))  \(account.id.padding(toLength: 16, withPad: " ", startingAt: 0)) \(provider)  \(statusIcon(account.status)) \(account.status.rawValue)\(email)")
+            print("\(i + 1). \(TerminalColor.dot(hex: account.color, color: color))  \(account.id.padding(toLength: 16, withPad: " ", startingAt: 0)) \(provider)  \(statusIcon(account.status)) \(account.status.rawValue)\(email)\(method)")
         }
     } catch {
         fail("\(error)")
@@ -349,8 +357,9 @@ func sortRows(_ rows: [UsageReportRenderer.Row], by sort: UsageSort, week: Bool)
 
 // MARK: - ping (manual + scheduled anchoring)
 
-/// `am ping <id>` — fire one minimal turn for `id` now using its provider-wide
-/// preference (or a one-off `--method`). This is the one ping operation: the
+/// `am ping <id>` — fire one minimal turn for `id` now using its saved method
+/// (its own override, else its provider's — `Preferences.pingMethod(forAccount:provider:)`)
+/// or a one-off `--method`. This is the one ping operation: the
 /// manual "test ping" *and* exactly
 /// what the resident scheduler daemon spawns for each queue entry
 /// (`am ping <id> --manage-sleep --scheduled-for <epoch>`, workspace via
@@ -628,35 +637,60 @@ func printSchedulerStatus() {
 
 /// The cloud-routine tail of `am scheduler status`: what the daemon has armed on
 /// claude.ai, straight from `cloud-fallback-state.json` — the same state the
-/// app's Monitoring row shows, for a terminal with no app in front of it.
+/// app's Monitoring rows show, for a terminal with no app in front of it.
 ///
-/// Printed while Claude's method *is* the routine, and also while a routine
-/// still exists to report on: switching back to a local method leaves an armed
-/// one-shot behind until the daemon's next tick disables it, and that interval
-/// is exactly when someone asks what's still out there.
+/// Per account, because the method is: an account's own override can put it
+/// on (or take it off) the routine whatever Claude's provider-wide default
+/// says. Printed while any Claude account resolves to the routine, and also
+/// while a routine still exists to report on: switching an account back to a
+/// local method leaves an armed one-shot behind until the daemon's next tick
+/// disables it, and that interval is exactly when someone asks what's still
+/// out there.
 func printCloudRoutineStatus(prefs: Preferences) {
     let state = CloudFallbackStateStore(workspace: workspace).load()
-    let on = prefs.claudePingMethod.usesCloudRoutine
-    guard on || !state.accounts.isEmpty else { return }
-    print("cloud:  claude method \(prefs.claudePingMethod.rawValue) — "
-        + (on
-            ? "the daemon arms a one-shot at each Claude slot; no local Claude pings"
-            : "any armed routine is disabled on the daemon's next tick"))
-    // Reached only with the method on: nothing tracked yet is a real answer
-    // (the engine arms per account, once the plan has a Claude fire to aim at),
-    // not the same as having no routine rows to show.
-    guard !state.accounts.isEmpty else {
-        print("cloud:  nothing armed yet — the daemon arms one on its next tick, once a plan exists")
-        return
-    }
-    for (id, account) in state.accounts.sorted(by: { $0.key < $1.key }) {
-        var bits: [String] = [account.triggerID ?? "no routine"]
-        if account.disabled {
-            bits.append("disabled")
-        } else if let at = account.armedFor {
-            bits.append("armed for \(prefs.clockStyle.dayTimeString(at))")
+    let claude = ((try? AccountStore(workspace: workspace).load()) ?? [])
+        .filter { $0.provider.supportsCloudAnchorRoutines }
+        .inPriorityOrder()
+    let routine = prefs.cloudRoutineAccounts(claude)
+    guard !routine.isEmpty || !state.accounts.isEmpty else { return }
+    print("cloud:  claude default method \(prefs.claudePingMethod.rawValue) — routine accounts get a one-shot "
+        + "at each slot and no local ping; any other account's routine is disabled on the daemon's next tick")
+    // Inventory order first, then any routine the state file still tracks for
+    // an account that no longer exists (the daemon stops syncing those).
+    let known = claude.map(\.id)
+    let orphans = state.accounts.keys.filter { !known.contains($0) }.sorted()
+    for id in known + orphans {
+        // A removed account has no method to report, and the daemon never
+        // visits it again (`syncCloudFallback` walks accounts.json), so no
+        // disable is coming either: an armed one-shot just fires once and
+        // auto-disables server-side. Say that instead of promising a tick.
+        let removed = !known.contains(id)
+        var bits: [String] = []
+        if !removed {
+            let overridden = prefs.pingOverride(forAccount: id) != nil
+            let method = prefs.pingMethod(forAccount: id, provider: .claude)
+            bits.append("method \(method.rawValue)\(overridden ? " (override)" : "")")
         }
-        if let error = account.lastError { bits.append("error: \(error)") }
+        if let account = state.accounts[id] {
+            bits.append(account.triggerID ?? "no routine")
+            if account.disabled {
+                bits.append("disabled")
+            } else if let at = account.armedFor {
+                bits.append("armed for \(prefs.clockStyle.dayTimeString(at))")
+                if removed {
+                    bits.append("account removed — not synced; the one-shot self-disables after it fires")
+                } else if !routine.contains(id) {
+                    bits.append("disabled on the daemon's next tick")
+                }
+            } else if removed {
+                bits.append("account removed — not synced")
+            }
+            if let error = account.lastError { bits.append("error: \(error)") }
+        } else if routine.contains(id) {
+            // Nothing tracked yet is a real answer: the engine arms per
+            // account, once the plan has a fire for it to aim at.
+            bits.append("nothing armed yet — arms on the daemon's next tick, once a plan exists")
+        }
         print("cloud:  \(id)  \(bits.joined(separator: " · "))")
     }
 }

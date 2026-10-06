@@ -92,8 +92,10 @@ public struct AccountPinger {
         // custom command to run), so an overridden ping never seeds the file.
         let store = PreferencesStore(workspace: workspace, fileManager: fileManager)
         let stored = methodOverride == nil ? store.load() : nil
+        // Resolved per account: an account's own override wins over its
+        // provider's method (`Preferences.pingMethod(forAccount:provider:)`).
         let method = (methodOverride
-            ?? (stored ?? store.load()).pingMethod(for: account.provider)).localDriver
+            ?? (stored ?? store.load()).pingMethod(forAccount: id, provider: account.provider)).localDriver
 
         audit.append(accountID: id, action: "ping.start", ok: true, detail: method.rawValue)
         let rawResult: ClaudePingRunner.Result
@@ -131,7 +133,11 @@ public struct AccountPinger {
             // pass a budget sized for a one-line turn (90 s), and cutting a
             // five-minute eval short would make every custom ping a failure.
             rawResult = CustomPingRunner.run(
-                command: (stored ?? store.load()).customCommand(for: account.provider),
+                // From the scope that chose the method — the account's own
+                // command when it's overridden, the provider's otherwise. A
+                // one-off `--method custom` on an overridden account still
+                // reads the override's command, never the provider's.
+                command: (stored ?? store.load()).customCommand(forAccount: id, provider: account.provider),
                 accountID: id,
                 provider: account.provider,
                 binary: binary,

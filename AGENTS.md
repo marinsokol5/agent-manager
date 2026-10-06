@@ -114,10 +114,11 @@ design follows from them.
 4. **Local-only. No backend, no telemetry, no analytics.** Network calls go
    only to the *official* provider endpoints (`api.anthropic.com`,
    `chatgpt.com`), mirroring the real CLI's requests. Two kinds exist:
-   read-only usage fetches, and — only while Claude's **`routine` ping method**
-   is selected — first-party management of the user's own claude.ai anchor
-   routines (`/v1/code/triggers` via `TriggerClient`), plus the disable call that
-   stands a routine down when it isn't. Those trigger calls are the sole
+   read-only usage fetches, and — only for Claude accounts whose resolved ping
+   method is **`routine`** (Claude's default, or that account's own override) —
+   first-party management of the user's own claude.ai anchor routines
+   (`/v1/code/triggers` via `TriggerClient`), plus the disable call that stands
+   a routine down when an account's method isn't `routine`. Those trigger calls are the sole
    writes, they configure state in the *user's own* account,
    and they are always fail-soft (local scheduling never depends on them).
    Don't add phone-home, crash reporting, or third-party endpoints.
@@ -193,7 +194,7 @@ design follows from them.
 - `cloud-fallback-state.json` — which claude.ai anchor routine is armed per
   account and for when. Written **only** by the daemon's `CloudFallbackEngine`
   (single writer); the app/CLI just read it for display. (Whether to arm one is
-  *not* here — it's Claude's `routine` ping method in `preferences.json`. The
+  *not* here — it's each account's resolved `routine` ping method in `preferences.json`. The
   file name is historical: the routine began as a dead-man's fallback behind a
   local ping, and kept its name so an armed routine survived that redesign.)
 - `scheduler-status.json` — the scheduler daemon's heartbeat + upcoming-queue
@@ -207,17 +208,25 @@ design follows from them.
 - `keychain-grants.json` — which Keychain services the `/usr/bin/security` read
   path is verified-granted for, shared app ↔ CLI ↔ daemon so background reads in
   any of them stay silent (see `KeychainGrantStore`).
-- `preferences.json` — display preferences plus the provider-wide Claude and
-  Codex ping methods, shared by app + CLI *and the scheduler daemon*. Four
+- `preferences.json` — display preferences plus the Claude and Codex ping
+  methods — a default per provider, optionally overridden per account —
+  shared by app + CLI *and the scheduler daemon*. Four
   local drivers (`headless` / `terminal` / `sdk` / `custom`) plus, for Claude only,
   `routine`: the claude.ai cloud routine, which is a ping method rather than a
   separate feature because it answers the same question — what anchors this
-  account. Picking it stops local Claude pings entirely. The file is written on
-  first read if it's missing, because that read is also where "which default
+  account. Picking it stops local pings for every account it applies to. The
+  file is written on first read if it's missing, because that read is also where "which default
   applies" is decided — see the ping-method gotcha. Optional
   `claudeCustomCommand` / `codexCustomCommand` (`{executable, arguments}`)
   hold what `custom` runs; they are omitted while unset, so older files stay
-  byte-identical.
+  byte-identical. Optional `accountPingOverrides` (`{<accountID>: {method,
+  customCommand?}}`, omitted while empty) holds per-account exceptions: an
+  overridden account uses its own method and, for `custom`, **its own**
+  command — never the provider's (`Preferences.pingMethod(forAccount:provider:)`
+  / `customCommand(forAccount:provider:)` are the only resolution; every
+  reader — ping child, daemon, app, `am scheduler status` — goes through
+  them). An undecodable entry is dropped by itself (that account inherits
+  again); removing an account in the app prunes its override.
 - `sdk-ping/` — the Node/Python helper scripts materialized by the installed
   binary when an SDK ping runs, plus the two dependency locations the user
   populates: `node_modules/` (Claude) and `.venv/` (Codex). The app never runs
@@ -296,8 +305,10 @@ Work the chain in this order:
    fire time) — deferral is the fix for phantom pings, not a malfunction: a
    turn fired into a still-open window anchors nothing. Cloud-routine arming
    appears as `routine.create` / `routine.adopt` / `routine.arm` /
-   `routine.disable` (and `cloud.enable` / `cloud.disable` when the Claude ping
-   method crossed into or out of `routine`) — and since
+   `routine.disable` (and `cloud.enable` / `cloud.disable`, one line per
+   account with its `accountID`, whenever a preferences edit — Claude's
+   default or an account's override — moved that account's resolved method
+   into or out of `routine`) — and since
    `cloud-fallback-state.json` only holds the *current* arming, the last
    `routine.arm` with `ok: true` before the night is what tells you what was
    armed going in. Caveat: a
@@ -500,10 +511,14 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
 - **The cloud routine is a ping method, not a safety net.** The case the wake
   helper can't cover — closed lid on battery, where the firmware suppresses RTC
   wakes, or any Mac with chronic sleep races — is handled by picking `routine`
-  as Claude's ping method (Claude only). The daemon then keeps a
-  claude.ai routine ("AgentManager Routine") armed at the **exact planned
-  fire** and **never spawns a local Claude ping**; Codex is untouched (no
-  routines → it keeps pinging locally). `reconcilePassedCloudFire` resolves
+  as the ping method (Claude only) — for all Claude accounts, or for one via
+  its per-account override. The daemon resolves the set of accounts whose
+  method is `routine` (`Preferences.cloudRoutineAccounts`) and, for each of
+  those, keeps a claude.ai routine ("AgentManager Routine") armed at the
+  **exact planned fire** and **never spawns a local ping**; every other
+  account — Codex (no routines; a `routine` override sanitizes to
+  `terminal`), or a Claude account resolved to a local method — gets exactly
+  "routine off": local pings, and the disable signal for any leftover routine. `reconcilePassedCloudFire` resolves
   each fire the routine covered (real anchor vs. phantom still decided by usage
   evidence), and a drain-loop guard consumes any Claude entry the routine
   hasn't confirmed yet — that one window goes **unanchored by design** (logged

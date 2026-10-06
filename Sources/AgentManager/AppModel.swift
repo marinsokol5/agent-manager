@@ -110,79 +110,58 @@ final class AppModel {
         }
     }
 
-    /// Provider-wide anchoring preferences. Every ping process reloads the file
-    /// at invocation time, and the scheduler daemon re-reads it on its next
-    /// tick, so these take effect immediately for Test ping, future scheduler
-    /// children, *and* cloud-routine arming — without touching the launchd
-    /// agent.
-    var claudePingMethod: PingMethod = Preferences.default.claudePingMethod {
-        didSet {
-            guard claudePingMethod != oldValue else { return }
-            var prefs = preferencesStore.load()
-            prefs.claudePingMethod = claudePingMethod
-            preferencesStore.save(prefs)
-            // Crossing into (or out of) `routine` changes what anchors every
-            // scheduled Claude slot and makes the daemon arm/disable real
-            // claude.ai routines — the runbook needs that moment on the record,
-            // and the routine caption needs a fresh read of the state file.
-            if claudePingMethod.usesCloudRoutine != oldValue.usesCloudRoutine {
-                let on = claudePingMethod.usesCloudRoutine
-                AuditLog(workspace: workspace).append(
-                    accountID: nil, action: on ? "cloud.enable" : "cloud.disable",
-                    ok: true, detail: "via Claude ping method")
-                statusMessage = on
-                    ? "Claude cloud routine on — routines arm on the daemon's next tick"
-                    : "Claude cloud routine off — routines are disabled on the daemon's next tick"
-                refreshMonitoring()
-            }
+    /// The ping-method settings as last written to `preferences.json`: the
+    /// provider-wide methods and commands (the defaults) plus per-account
+    /// overrides. Only those fields are read from this snapshot — clock style
+    /// and theme have their own properties above. Every ping process reloads
+    /// the file at invocation time, and the scheduler daemon re-reads it on its
+    /// next tick, so edits take effect immediately for Test ping, future
+    /// scheduler children, *and* cloud-routine arming — without touching the
+    /// launchd agent. Resolution (override vs. inherit, which scope's command)
+    /// is Core's — `Preferences.pingMethod(forAccount:provider:)` — so the
+    /// screen can never show something other than what runs.
+    private(set) var pingPreferences: Preferences = .default
+
+    /// Select a method in `scope` (nil makes an account inherit again). Core's
+    /// `Preferences.setPingMethod(_:in:)` owns the rules — sanitizing, and an
+    /// account override keeping its command across method changes — so this
+    /// only routes the write through the audited update path.
+    func setPingMethod(_ method: PingMethod?, in scope: PingMethodScope) {
+        guard pingPreferences.pingMethod(in: scope) != method else { return }
+        updatePingPreferences(via: "\(scopeLabel(scope)) ping method") { $0.setPingMethod(method, in: scope) }
+    }
+
+    /// Save the command the `custom` method runs in `scope` (the Preferences field).
+    func setCustomCommand(_ command: CustomPingCommand?, in scope: PingMethodScope) {
+        guard pingPreferences.customCommand(in: scope) != command else { return }
+        updatePingPreferences(via: "\(scopeLabel(scope)) custom command") { $0.setCustomCommand(command, in: scope) }
+    }
+
+    /// Names the edited scope in the `cloud.*` audit detail.
+    private func scopeLabel(_ scope: PingMethodScope) -> String {
+        switch scope {
+        case let .provider(provider): provider.displayName
+        case let .account(id, _): "\(id) override"
         }
     }
 
-    var codexPingMethod: PingMethod = Preferences.default.codexPingMethod {
-        didSet {
-            guard codexPingMethod != oldValue else { return }
-            var prefs = preferencesStore.load()
-            prefs.codexPingMethod = codexPingMethod
-            preferencesStore.save(prefs)
+    /// The one write path for ping-method settings. Core loads, applies,
+    /// saves, and logs `cloud.enable` / `cloud.disable` for every account
+    /// whose resolved method crossed into or out of `routine` — whichever
+    /// scope the edit came from. Crossing changes what anchors those accounts
+    /// and makes the daemon arm/disable real claude.ai routines, so the status
+    /// line says so and the routine caption gets a fresh state-file read.
+    private func updatePingPreferences(via: String, _ change: (inout Preferences) -> Void) {
+        let (saved, transition) = preferencesStore.updatePingMethods(
+            accounts: accounts, audit: AuditLog(workspace: workspace), via: via, change)
+        pingPreferences = saved
+        guard !transition.isEmpty else { return }
+        if !transition.entered.isEmpty {
+            statusMessage = "Cloud routine on for \(transition.entered.joined(separator: ", ")) — arms on the daemon's next tick"
+        } else {
+            statusMessage = "Cloud routine off for \(transition.left.joined(separator: ", ")) — disabled on the daemon's next tick"
         }
-    }
-
-    /// The command each provider's `custom` ping method runs (preferences.json).
-    /// Saved independently of the method selection — the Preferences field
-    /// writes it whether or not Custom is picked — and read afresh by every
-    /// ping, like the methods above. nil until the user sets one.
-    var claudeCustomCommand: CustomPingCommand? {
-        didSet {
-            guard claudeCustomCommand != oldValue else { return }
-            saveCustomCommand(claudeCustomCommand, for: .claude)
-        }
-    }
-
-    var codexCustomCommand: CustomPingCommand? {
-        didSet {
-            guard codexCustomCommand != oldValue else { return }
-            saveCustomCommand(codexCustomCommand, for: .codex)
-        }
-    }
-
-    func customCommand(for provider: Provider) -> CustomPingCommand? {
-        switch provider {
-        case .claude: claudeCustomCommand
-        case .codex: codexCustomCommand
-        }
-    }
-
-    func setCustomCommand(_ command: CustomPingCommand?, for provider: Provider) {
-        switch provider {
-        case .claude: claudeCustomCommand = command
-        case .codex: codexCustomCommand = command
-        }
-    }
-
-    private func saveCustomCommand(_ command: CustomPingCommand?, for provider: Provider) {
-        var prefs = preferencesStore.load()
-        prefs.setCustomCommand(command, for: provider)
-        preferencesStore.save(prefs)
+        refreshMonitoring()
     }
 
     /// Persisted app appearance (preferences.json). Defaults to following macOS.
@@ -312,11 +291,19 @@ final class AppModel {
     /// The self-heal is attempted at most once per app run: if re-registering
     /// doesn't fix the spawn failure, retrying in a loop won't either.
     var wakeHealAttempted = false
-    /// Whether scheduled Claude slots are anchored by claude.ai routines rather
-    /// than local pings — i.e. Claude's ping method *is* the cloud routine.
-    /// Derived, never stored twice: the preference is the single source of
-    /// truth the daemon reads too.
-    var claudeCloudRoutineEnabled: Bool { claudePingMethod.usesCloudRoutine }
+    /// Whether this account's scheduled slots are anchored by a claude.ai
+    /// routine rather than local pings — i.e. its *resolved* ping method (its
+    /// own override, or Claude's default) is the cloud routine. Derived, never
+    /// stored twice: the preference is the single source of truth the daemon
+    /// reads too.
+    func cloudRoutineEnabled(forAccount id: String) -> Bool {
+        guard let account = accounts.first(where: { $0.id == id }) else { return false }
+        return pingPreferences.pingMethod(forAccount: account.id, provider: account.provider).usesCloudRoutine
+    }
+
+    /// Whether *any* account resolves to the cloud routine — gates Monitoring's
+    /// routine rows (shown while one is selected or a routine still exists).
+    var anyCloudRoutineEnabled: Bool { !pingPreferences.cloudRoutineAccounts(accounts).isEmpty }
     /// Per-account cloud routine state (`cloud-fallback-state.json`, written by
     /// the daemon's engine) for the Monitoring row and the Preferences caption.
     /// nil = not read yet.
@@ -352,10 +339,7 @@ final class AppModel {
         let prefs = preferencesStore.load()
         clockStyle = prefs.clockStyle
         theme = prefs.theme
-        claudePingMethod = prefs.claudePingMethod
-        codexPingMethod = prefs.codexPingMethod
-        claudeCustomCommand = prefs.claudeCustomCommand
-        codexCustomCommand = prefs.codexCustomCommand
+        pingPreferences = prefs
         applyTheme() // didSet doesn't fire during init — apply the loaded theme explicitly
         reload()
         reconcileAll()
@@ -531,6 +515,13 @@ final class AppModel {
 
     func remove(_ account: Account, purge: Bool) {
         try? store.remove(account.id)
+        // Prune its ping-method override, so a slug re-added later starts from
+        // its provider's default instead of silently inheriting a stale method
+        // or command. Checked against the snapshot first so removing an
+        // ordinary account never rewrites preferences.json.
+        if pingPreferences.pingOverride(forAccount: account.id) != nil {
+            pingPreferences = preferencesStore.removeAccount(account.id)
+        }
         if purge { try? FileManager.default.removeItem(at: account.homeURL) }
         AuditLog(workspace: workspace).append(
             accountID: account.id, action: "account.remove", ok: true,

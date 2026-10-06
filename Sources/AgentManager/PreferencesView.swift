@@ -2,15 +2,18 @@ import AgentManagerCore
 import AppKit
 import SwiftUI
 
-/// The **Preferences** screen. Hosts the per-provider ping method (including
-/// Claude's cloud routine — see `pingMethodSection`), the set-once "Wake Mac
+/// The **Preferences** screen. Hosts the ping method — a default per provider,
+/// overridable per account (including Claude's cloud routine — see
+/// `pingMethodSection`), the set-once "Wake Mac
 /// for pings" opt-in (it lives here rather than next to the Scheduler toggle
 /// because you flip it once and forget it — ongoing health shows on the
 /// Monitoring screen), the menu-bar display mode, the theme, and the clock
 /// style.
 struct PreferencesView: View {
     @Bindable var model: AppModel
-    @State private var pingMethodProvider: Provider = .claude
+    /// Which ping-method setting the section is showing: a provider's default
+    /// or one account's override of it.
+    @State private var pingMethodScope: PingMethodScope = .provider(.claude)
 
     var body: some View {
         ScrollView {
@@ -86,42 +89,106 @@ struct PreferencesView: View {
     /// The one "what anchors this account?" question. The local drivers
     /// and Claude's cloud routine sit in the same list on purpose: they are
     /// alternatives, not a feature plus a mode — picking the routine means the
-    /// scheduler stops running local Claude turns entirely.
+    /// scheduler stops running local Claude turns for those accounts entirely.
+    ///
+    /// One compact scope menu picks *whose* answer is shown: a provider's
+    /// default ("All Claude accounts"), or a single account's override of it.
+    /// A menu rather than the old segmented control because it has to scale to
+    /// however many accounts there are; everything below it is the same card
+    /// list either way, so overriding one account costs no new screen.
     private var pingMethodSection: some View {
-        section(
+        let scope = resolvedScope
+        return section(
             title: "Ping method",
-            subtitle: "How each provider's 5-hour window gets anchored. Scheduled runs always verify anchoring; Test ping always runs a local turn.")
+            subtitle: "How each account's 5-hour window gets anchored — a default per provider, overridable per account. Scheduled runs always verify anchoring; Test ping always runs a local turn.")
         {
-            Picker("Provider", selection: $pingMethodProvider) {
-                Text("Claude").tag(Provider.claude)
-                Text("Codex").tag(Provider.codex)
+            Picker("Applies to", selection: Binding(
+                get: { scope },
+                set: { pingMethodScope = $0 }))
+            {
+                // One section per provider, its "All … accounts" default first
+                // and selectable, then that provider's accounts — grouped by the
+                // menu itself rather than by indenting titles with spaces (which
+                // the collapsed popup button would show).
+                ForEach(Provider.allCases, id: \.self) { provider in
+                    Section(provider.displayName) {
+                        Text("All \(provider.displayName) accounts").tag(PingMethodScope.provider(provider))
+                        ForEach(model.accounts.filter { $0.provider == provider }) { account in
+                            Text(scopeMenuTitle(for: account))
+                                .tag(PingMethodScope.account(id: account.id, provider: provider))
+                        }
+                    }
+                }
             }
             .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 220, alignment: .leading)
+            .pickerStyle(.menu)
+            .fixedSize()
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            // Inheriting is a choice in the same list, first: picking it
+            // removes the override, so there is no separate "reset" control.
+            if case .account = scope {
+                let provider = scope.provider
+                PreferenceRadioCard(
+                    systemImage: "arrow.uturn.up",
+                    title: "Same as all \(provider.displayName) accounts",
+                    subtitle: "Currently \(prefs.pingMethod(for: provider).displayTitle). Follows that default when it changes.",
+                    isSelected: prefs.pingMethod(in: scope) == nil,
+                    action: { model.setPingMethod(nil, in: scope) })
+            }
             pingMethodGroup(
-                provider: pingMethodProvider,
-                selection: pingMethodProvider == .claude
-                    ? model.claudePingMethod
-                    : model.codexPingMethod)
-            { method in
-                switch pingMethodProvider {
-                case .claude: model.claudePingMethod = method
-                case .codex: model.codexPingMethod = method
-                }
+                scope: scope,
+                selection: prefs.pingMethod(in: scope),
+                select: { model.setPingMethod($0, in: scope) })
+            if case let .provider(provider) = scope, let line = overriddenLine(provider: provider) {
+                Text(line)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
+    private var prefs: Preferences { model.pingPreferences }
+
+    /// The scope actually shown: the picked one, unless it names an account
+    /// that no longer exists (removed while this screen was open) — then that
+    /// account's provider default.
+    private var resolvedScope: PingMethodScope {
+        if case let .account(id, provider) = pingMethodScope,
+           !model.accounts.contains(where: { $0.id == id }) {
+            return .provider(provider)
+        }
+        return pingMethodScope
+    }
+
+    /// An account's entry in the scope menu: its label, plus its own method
+    /// when it overrides — so an override is visible
+    /// from the menu itself, without opening each account.
+    private func scopeMenuTitle(for account: Account) -> String {
+        guard prefs.pingOverride(forAccount: account.id) != nil else { return account.label }
+        return "\(account.label)  ·  \(prefs.pingMethod(forAccount: account.id, provider: account.provider).displayTitle)"
+    }
+
+    /// Under a provider's default: the accounts that don't follow it, so an
+    /// override is never invisible from the scope it overrides.
+    private func overriddenLine(provider: Provider) -> String? {
+        let names = model.accounts
+            .filter { $0.provider == provider && prefs.pingOverride(forAccount: $0.id) != nil }
+            .map { "\($0.label) (\(prefs.pingMethod(forAccount: $0.id, provider: provider).displayTitle))" }
+        guard !names.isEmpty else { return nil }
+        return "Overridden for: \(names.joined(separator: ", "))"
+    }
+
     private func pingMethodGroup(
-        provider: Provider,
-        selection: PingMethod,
+        scope: PingMethodScope,
+        selection: PingMethod?,
         select: @escaping (PingMethod) -> Void)
         -> some View
     {
-        VStack(alignment: .leading, spacing: 8) {
+        let provider = scope.provider
+        return VStack(alignment: .leading, spacing: 8) {
             // Only Claude offers `.routine` — `available(for:)` is what keeps
             // the Codex list from showing a method it has no routines for.
             ForEach(PingMethod.available(for: provider)) { method in
@@ -139,18 +206,18 @@ struct PreferencesView: View {
                     // nothing will arm) reads as part of the choice, so it
                     // hangs off the selected card instead of a separate row.
                     statusCaption: method == .routine && selection == .routine
-                        ? cloudRoutineCaption
+                        ? cloudRoutineCaption(scope: scope)
                         : method == .custom && selection == .custom
-                            ? customCommandCaption(provider: provider)
+                            ? customCommandCaption(scope: scope)
                             : nil,
                     isSelected: selection == method,
                     action: { select(method) })
                 // The card is a Button, so the editable command lives under
-                // it rather than inside it. Keyed by provider so switching the
-                // segmented picker reloads the field from that provider's value.
+                // it rather than inside it. Keyed by scope so switching the
+                // scope menu reloads the field from that scope's own command.
                 if method == .custom && selection == .custom {
-                    CustomCommandField(model: model, provider: provider)
-                        .id(provider)
+                    CustomCommandField(model: model, scope: scope)
+                        .id(scope)
                 }
             }
         }
@@ -159,8 +226,10 @@ struct PreferencesView: View {
     /// Selecting Custom without a usable command is allowed — you may pick the
     /// method first and the command second — but the card must say plainly
     /// that scheduled pings fail until one is set: never a silent dead method.
-    private func customCommandCaption(provider: Provider) -> (text: String, tint: Color) {
-        guard let command = model.customCommand(for: provider) else {
+    /// The command is the scope's own: an overridden account never borrows
+    /// its provider's.
+    private func customCommandCaption(scope: PingMethodScope) -> (text: String, tint: Color) {
+        guard let command = model.pingPreferences.customCommand(in: scope) else {
             return ("No command set — every ping fails until you save one below.", Theme.warning)
         }
         do {
@@ -173,17 +242,32 @@ struct PreferencesView: View {
 
     /// What the armed routine is actually doing, straight from the daemon's
     /// `cloud-fallback-state.json` — or the reason nothing will arm yet, in the
-    /// order the daemon decides it (account → scheduler → plan).
-    private var cloudRoutineCaption: (text: String, tint: Color) {
-        guard model.accounts.contains(where: { $0.provider.supportsCloudAnchorRoutines && $0.status == .connected }) else {
-            return ("No connected Claude account — nothing to anchor.", Theme.warning)
+    /// order the daemon decides it (account → scheduler → plan). Scoped like
+    /// the cards it hangs off: the provider default speaks for the Claude
+    /// accounts that inherit it, an account scope for that one account.
+    private func cloudRoutineCaption(scope: PingMethodScope) -> (text: String, tint: Color) {
+        let inScope = model.accounts.filter { account in
+            guard account.provider.supportsCloudAnchorRoutines else { return false }
+            switch scope {
+            case .provider: return prefs.pingOverride(forAccount: account.id) == nil
+            case let .account(id, _): return account.id == id
+            }
+        }
+        guard inScope.contains(where: { $0.status == .connected }) else {
+            if case .account = scope {
+                return ("This account isn't connected — nothing to anchor.", Theme.warning)
+            }
+            return ("No connected Claude account follows this default — nothing to anchor.", Theme.warning)
         }
         guard model.schedulerActive else {
             return ("Waiting for the Scheduler — turn it on to arm.", Theme.warning)
         }
         // Sorted by account id, not dictionary order: with two Claude accounts
         // erroring, an unordered pick would flip the caption between refreshes.
-        let entries = (model.cloudFallbackState?.accounts ?? [:]).sorted(by: { $0.key < $1.key })
+        let ids = Set(inScope.map(\.id))
+        let entries = (model.cloudFallbackState?.accounts ?? [:])
+            .filter { ids.contains($0.key) }
+            .sorted(by: { $0.key < $1.key })
         if let bad = entries.compactMap({ $0.value.lastError }).first {
             return ("Sync problem: \(bad) — see Monitoring.", Theme.warning)
         }
@@ -304,9 +388,12 @@ private extension PingMethod {
 /// half-typed lines like `/bin/zsh -lc 'echo` would otherwise be saved as
 /// whatever happened to parse along the way. Only a line that parses *and*
 /// points at an executable file is ever written.
+///
+/// Scoped rather than per provider: the same field edits a provider's default
+/// command or one overridden account's own — whichever the section shows.
 private struct CustomCommandField: View {
     @Bindable var model: AppModel
-    let provider: Provider
+    let scope: PingMethodScope
     @State private var text: String = ""
     @State private var loaded = false
 
@@ -329,11 +416,11 @@ private struct CustomCommandField: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            text = model.customCommand(for: provider)?.commandLine ?? ""
+            text = model.pingPreferences.customCommand(in: scope)?.commandLine ?? ""
         }
     }
 
-    private var saved: CustomPingCommand? { model.customCommand(for: provider) }
+    private var saved: CustomPingCommand? { model.pingPreferences.customCommand(in: scope) }
 
     private var validation: (text: String, tint: Color) {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -354,7 +441,7 @@ private struct CustomCommandField: View {
 
     private func save() {
         guard let parsed = try? CustomPingCommand.parse(text) else { return }
-        model.setCustomCommand(parsed, for: provider)
+        model.setCustomCommand(parsed, in: scope)
         text = parsed.commandLine
     }
 

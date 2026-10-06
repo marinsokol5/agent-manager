@@ -103,13 +103,16 @@ public actor SchedulerDaemon {
     /// Every known account's provider (connected or not) — the cloud-routine
     /// sync must also reach routines of accounts that just *disconnected*.
     private var providersByID: [String: Provider] = [:]
-    /// Claude's ping method is the cloud routine (`preferences.json` →
-    /// `claudePingMethod: routine`): the claude.ai one-shot is the *sole* anchor
-    /// for Claude accounts — armed at the exact planned fire — and local Claude
-    /// pings are never spawned. Codex is unaffected (no routines → it keeps
-    /// pinging locally). Reloaded with the other config stamps, from the same
-    /// file the ping children read.
-    private var cloudRoutineEnabled = false
+    /// The accounts whose *resolved* ping method is the cloud routine
+    /// (`preferences.json` → Claude's provider method, or the account's own
+    /// override): for these the claude.ai one-shot is the *sole* anchor —
+    /// armed at the exact planned fire — and no local ping is ever spawned.
+    /// Every other account, including a Claude account overridden to a local
+    /// method, gets exactly what "routine off" always meant: the disable
+    /// signal and local pings. Only Claude accounts can be here (resolution
+    /// sanitizes `routine` away for Codex). Reloaded with the other config
+    /// stamps, from the same file and the same resolution the ping children use.
+    private var cloudRoutineAccounts: Set<String> = []
     /// Fire times whose cloud routine run is accounted for: a passed one-shot,
     /// a verified local anchor, or an entry already covered by a known-open
     /// window. Persisted because losing it between the local decision and the
@@ -254,7 +257,7 @@ public actor SchedulerDaemon {
 
         // One read per tick: which cloud routines are armed (for the
         // covered-fire check below). The engine is the file's only writer.
-        let cloudStates = cloudRoutineEnabled
+        let cloudStates = !cloudRoutineAccounts.isEmpty
             ? CloudFallbackStateStore(workspace: workspace, fileManager: fileManager).load()
             : CloudFallbackState()
 
@@ -298,9 +301,7 @@ public actor SchedulerDaemon {
                 dropped.append(head)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
-            } else if cloudRoutineEnabled
-                && providersByID[head.accountID]?.supportsCloudAnchorRoutines == true
-            {
+            } else if cloudRoutineAccounts.contains(head.accountID) {
                 // The `routine` ping method: this account is anchored solely by
                 // its claude.ai routine, never a local ping. An armed fire still
                 // settling was filtered out above, and
@@ -411,8 +412,9 @@ public actor SchedulerDaemon {
     }
 
     /// Reconcile each Claude account's cloud anchor routine with the plan:
-    /// keep a one-shot armed at the next planned fire while the `routine` ping
-    /// method and the scheduler are on; drive it to disabled otherwise (a nil
+    /// keep a one-shot armed at the next planned fire while the account's
+    /// resolved ping method is `routine` (its own override, or Claude's
+    /// provider method) and the scheduler is on; drive it to disabled otherwise (a nil
     /// `nextFireAt` is the disable signal — that also covers accounts that just
     /// disconnected). Steady state is a no-op (the engine's planner returns
     /// `.none`), so this only talks to the API when something actually changed.
@@ -420,7 +422,7 @@ public actor SchedulerDaemon {
         for (id, provider) in providersByID.sorted(by: { $0.key < $1.key })
             where provider.supportsCloudAnchorRoutines
         {
-            let nextFire: Date? = (cloudRoutineEnabled && active && accountIDs.contains(id))
+            let nextFire: Date? = (cloudRoutineAccounts.contains(id) && active && accountIDs.contains(id))
                 ? upcoming.first(where: { $0.accountID == id })?.fireAt
                 : nil
             await cloudSyncer(CloudFallbackSyncRequest(
@@ -553,12 +555,13 @@ public actor SchedulerDaemon {
         let knownAccountIDs = Set(providersByID.keys)
         windowStates = windowStates.filter { knownAccountIDs.contains($0.key) }
         lastResolvedFire = lastResolvedFire.filter { knownAccountIDs.contains($0.key) }
-        // The one Claude-side question this daemon asks of `preferences.json`:
-        // is the cloud routine Claude's ping method? Same file the ping children
-        // read their driver from, so the daemon can never disagree with them
-        // about what anchors an account.
-        cloudRoutineEnabled = PreferencesStore(workspace: workspace, fileManager: fileManager)
-            .load().pingMethod(for: .claude).usesCloudRoutine
+        // The one question this daemon asks of `preferences.json`: which
+        // accounts' resolved ping method is the cloud routine? Same file, and
+        // the same per-account resolution, the ping children read their driver
+        // from — so the daemon can never disagree with them about what anchors
+        // an account.
+        cloudRoutineAccounts = PreferencesStore(workspace: workspace, fileManager: fileManager)
+            .load().cloudRoutineAccounts(accounts)
     }
 
     // MARK: - queue
@@ -706,9 +709,9 @@ public actor SchedulerDaemon {
     /// seconds wide in practice; see `dispatchSettle` for why it is measured in
     /// minutes anyway.
     private func routinesAwaitingDispatch(_ cloudStates: CloudFallbackState) -> Set<String> {
-        guard cloudRoutineEnabled else { return [] }
+        guard !cloudRoutineAccounts.isEmpty else { return [] }
         var held: Set<String> = []
-        for id in accountIDs where providersByID[id]?.supportsCloudAnchorRoutines == true {
+        for id in accountIDs where cloudRoutineAccounts.contains(id) {
             guard let armedFor = unresolvedArmedFire(cloudStates, id),
                   now() < armedFor.addingTimeInterval(CloudFallbackPlanner.dispatchSettle)
             else { continue }
@@ -731,12 +734,12 @@ public actor SchedulerDaemon {
     /// Returning after one mutation forces the caller to rebuild before it
     /// considers another account.
     private func reconcilePassedCloudFire(_ cloudStates: CloudFallbackState) async -> Bool {
-        guard cloudRoutineEnabled else { return false }
+        guard !cloudRoutineAccounts.isEmpty else { return false }
 
         let nominal = rebuildQueue()
         let adjusted = adjustNominalQueue(nominal)
 
-        for id in accountIDs where providersByID[id]?.supportsCloudAnchorRoutines == true {
+        for id in accountIDs where cloudRoutineAccounts.contains(id) {
             guard let armedFor = unresolvedArmedFire(cloudStates, id),
                   now() >= armedFor.addingTimeInterval(CloudFallbackPlanner.dispatchSettle)
             else { continue }
@@ -922,8 +925,8 @@ public actor SchedulerDaemon {
     /// when exact reset evidence proves a run at that minute would land inside
     /// an already-open window — nothing left for the reconciler to attribute.
     /// Otherwise leave the fire unresolved: the routine may still be the event
-    /// that anchors. (Reachable only across a method switch — while `routine`
-    /// is Claude's method no local Claude turn runs at all.)
+    /// that anchors. (Reachable only across a method switch — for an account
+    /// whose resolved method is `routine`, no local turn runs at all.)
     private func resolveCloudFireIfWindowOpen(for entry: QueueEntry) {
         if windowWasAlreadyOpen(entry.accountID, at: entry.fireAt) {
             markCloudFireResolved(entry.accountID, fireAt: entry.fireAt)

@@ -35,7 +35,8 @@ public enum PingMethod: String, Codable, Sendable, CaseIterable, Identifiable {
     case terminal
     /// Drive the official provider SDK through a workspace helper script.
     case sdk
-    /// Run the user's own command (`Preferences.customCommand(for:)`) under
+    /// Run the user's own command (`Preferences.customCommand(forAccount:provider:)`
+    /// — the account override's command, else its provider's) under
     /// the managed home and let usage verification decide if it anchored.
     case custom
     /// Let a one-shot claude.ai routine anchor each scheduled slot from

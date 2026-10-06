@@ -143,14 +143,14 @@ struct MonitoringView: View {
     }
 
     /// One row per Claude account's cloud anchor routine (the `routine` ping
-    /// method) — shown under the two daemons only while that method is selected
-    /// or a routine still exists to report on. Clicking a row opens that routine
+    /// method) — shown under the two daemons only while some account resolves
+    /// to that method or a routine still exists to report on. Clicking a row opens that routine
     /// on claude.ai (the authoritative info/run-history view — also the only
     /// place a routine can be deleted).
     @ViewBuilder
     private var cloudRoutineCards: some View {
         let entries = (model.cloudFallbackState?.accounts ?? [:]).sorted(by: { $0.key < $1.key })
-        if model.claudeCloudRoutineEnabled || !entries.isEmpty {
+        if model.anyCloudRoutineEnabled || !entries.isEmpty {
             if entries.isEmpty {
                 HStack(spacing: 10) {
                     Image(systemName: "circle.dashed")
@@ -243,12 +243,13 @@ struct MonitoringView: View {
     }
 
     /// Why a routine sits disabled, in the same priority order the daemon's
-    /// sync signal is computed from (feature → scheduler → per-account plan).
+    /// sync signal is computed from (this account's resolved method →
+    /// scheduler → per-account plan).
     /// Kept terse and lowercase to read as one column with the daemon cards'
     /// "no pings planned this week" / "no wakes needed yet".
     private func cloudRoutineDisabledReason(accountID: String) -> String {
-        if !model.claudeCloudRoutineEnabled {
-            return "Claude's ping method isn't the cloud routine"
+        if !model.cloudRoutineEnabled(forAccount: accountID) {
+            return "this account's ping method isn't the cloud routine"
         }
         if model.schedulerStatus?.active != true {
             return "the Scheduler is off"
