@@ -157,10 +157,96 @@ public enum LaunchAgentPlanner {
                 period: minutesPerWeek,
                 window: window,
                 minSlice: schedule.resolvedMinSliceMinutes)
+            let kept = schedule.keepsOnlyFirstPingOfDay
+                ? firstAnchorPerWorkday(physical, workBlocks: blocks, period: minutesPerWeek)
+                : physical
             return AccountDayPlan(
                 accountID: accountID,
-                pings: physical.map(Ping.init(atMin:)))
+                pings: kept.map(Ping.init(atMin:)))
         }
+    }
+
+    /// The "first ping of the day only" filter (`WorkSchedule.firstPingOfDayOnly`):
+    /// keep one account's earliest anchor of each *workday* and drop the rest.
+    /// Applied per account, after the engine has placed everything, so it only
+    /// ever removes pings — it never moves one — and each account keeps its own
+    /// first ping even when lanes rotate accounts through the day.
+    ///
+    /// A workday is defined by the painted work a ping serves, not by the
+    /// calendar date of the fire, because neither the fire nor the work
+    /// respects midnight:
+    ///
+    /// 1. **Sessions.** Painted work is merged into uninterrupted sessions on the
+    ///    cyclic week (`absoluteWeekBlocks` already joins midnight-adjacent
+    ///    hours; this also joins Sunday 24:00 to Monday 00:00). Mon 22:00–Tue
+    ///    02:00 is one session, and so is Sun 22:00–Mon 02:00.
+    /// 2. **Owning session.** An anchor belongs to the session it lands in, or
+    ///    else the next session to begin (cyclically). A previous-evening
+    ///    pre-ping therefore belongs to the morning it sets up, and an anchor
+    ///    after midnight inside a late session still belongs to that session.
+    /// 3. **Workday.** A session's workday is the 24 h stretch counted from its
+    ///    start; the workday *key* is the calendar day of that stretch's start.
+    ///    So a session belongs to the day it started, and sessions starting on
+    ///    the same calendar day — a lunch split (9–12 + 13–18) — share one
+    ///    workday. Only painted work that runs uninterrupted for more than 24 h
+    ///    is cut into further workdays (one per 24 h from its start), so even
+    ///    an around-the-clock grid keeps one ping per day rather than per week.
+    ///    A fully painted week has no session start; it is cut at Monday 00:00,
+    ///    i.e. into plain calendar days.
+    /// 4. **Earliest.** Within a workday, "earliest" is chronological on the
+    ///    unwrapped timeline, so a Sunday-evening pre-ping for Monday beats
+    ///    Monday's own anchors even though its canonical minute is larger.
+    ///
+    /// Note that two sessions on different calendar days are different
+    /// workdays even when a pre-ping for the later one lands on the earlier
+    /// day — that pre-ping belongs (by rule 2) to the session it sets up.
+    /// Returns canonical anchors in `0..<period`, sorted.
+    static func firstAnchorPerWorkday(
+        _ anchors: [Int],
+        workBlocks: [Block],
+        period: Int)
+        -> [Int]
+    {
+        guard anchors.count > 1, !workBlocks.isEmpty else { return anchors }
+
+        // Rule 1: close the cyclic Sunday → Monday seam. A painted block that
+        // already spans the whole period is a single endless session.
+        var sessions = workBlocks
+        if sessions.count > 1, sessions[sessions.count - 1].end == period, sessions[0].start == 0 {
+            let first = sessions.removeFirst()
+            sessions[sessions.count - 1].end = first.end + period
+        }
+
+        // Workday key → earliest unwrapped anchor serving it.
+        var earliest: [Int: Int] = [:]
+        for anchor in anchors {
+            // Rule 2: the first session whose end is still ahead of the anchor
+            // (cyclically). `ahead` is how many minutes until that session's
+            // last painted minute; the unwrapped anchor sits that far before it.
+            var best: (session: Int, ahead: Int)?
+            for (index, session) in sessions.enumerated() {
+                let ahead = floorMod(session.end - 1 - anchor, period)
+                if best.map({ ahead < $0.ahead }) ?? true { best = (index, ahead) }
+            }
+            guard let best else { continue }
+            let session = sessions[best.session]
+            let unwrapped = session.end - 1 - best.ahead
+
+            // Rule 3: which 24 h stretch of the session the anchor serves (a
+            // pre-ping, before the session starts, serves its first), keyed by
+            // the calendar day that stretch starts on.
+            let stretch = max(unwrapped - session.start, 0) / minutesPerDay
+            let day = floorDiv(session.start + stretch * minutesPerDay, minutesPerDay)
+            let daysPerPeriod = period / minutesPerDay
+            let key = floorMod(day, daysPerPeriod)
+            // Rule 4: chronological, on the unwrapped line — shifted by whole
+            // periods so a key reached through the Sunday → Monday seam (day
+            // 7 = Monday) compares against Monday's own anchors in one frame.
+            let position = unwrapped - floorDiv(day, daysPerPeriod) * period
+            if let current = earliest[key], current <= position { continue }
+            earliest[key] = position
+        }
+        return Array(Set(earliest.values.map { floorMod($0, period) })).sorted()
     }
 
     /// Project the continuous weekly plan onto one weekday for display (the

@@ -278,8 +278,11 @@ public actor SchedulerDaemon {
             let held = routinesAwaitingDispatch(cloudStates)
             let adjusted = adjustedQueue()
             let covered = adjusted.covered.filter { !held.contains($0.accountID) }
-            if !covered.isEmpty {
-                resolveCovered(covered)
+            let workdayCovered = adjusted.startOfWorkdayCovered
+                .filter { !held.contains($0.accountID) }
+            if !covered.isEmpty || !workdayCovered.isEmpty {
+                resolveCovered(covered, detail: SchedulerDaemon.noSliceCoveredDetail)
+                resolveCovered(workdayCovered, detail: SchedulerDaemon.startOfWorkdayCoveredDetail)
                 let checkpoint = adjustedQueue()
                 writeStatus(upcoming: checkpoint.entries, current: nil)
                 continue
@@ -645,17 +648,13 @@ public actor SchedulerDaemon {
                 SchedulerDaemon.cyclicSuccessor(
                     after: entry, in: nominal, calendar: calendar)
             },
+            firstPingOfDayOnly: schedule.keepsOnlyFirstPingOfDay,
             hasPaintedWork: { from, to in
                 SchedulerDaemon.paintedWorkOverlaps(
                     schedule: schedule,
                     calendar: calendar,
                     from: from,
                     to: to,
-                    // The floor is measured from the *deferred* fire, so it has
-                    // to tolerate the deferral itself: see
-                    // `RuntimeAnchorPolicy.maxSliceShortfall`. Never negative —
-                    // at 0 the check degrades to "any painted work at all",
-                    // which still drops a fire pushed into off-hours.
                     // The floor is measured from the *deferred* fire, so it has
                     // to tolerate the deferral itself: see
                     // `RuntimeAnchorPolicy.maxSliceShortfall`. Never negative —
@@ -1050,14 +1049,25 @@ public actor SchedulerDaemon {
         windowStates[accountID] = RuntimeAnchorPolicy.merged(windowStates[accountID], candidate)
     }
 
-    /// Resolve entries whose open window leaves no planner-worthy remainder:
-    /// consume the nominal slot and say why, mirroring stale-drop logging
-    /// (`ok: true, anchored: false` — nothing anchored *from this entry*).
-    private func resolveCovered(_ covered: [QueueEntry]) {
+    /// Skip detail for `AdjustedQueue.covered`: the open window leaves no
+    /// planner-worthy remainder for this slot.
+    static let noSliceCoveredDetail =
+        "skipped: open window leaves no usable budget slice for this slot"
+
+    /// Skip detail for `AdjustedQueue.startOfWorkdayCovered`: under "first
+    /// ping of the day only", deferring the morning ping would have carried it
+    /// into the workday, which the user's own window already covers.
+    static let startOfWorkdayCoveredDetail =
+        "skipped: first ping only — an open window already covers the start of this workday"
+
+    /// Resolve entries the open window already covers: consume the nominal
+    /// slot and say why (`detail` names which cover rule applied), mirroring
+    /// stale-drop logging (`ok: true, anchored: false` — nothing anchored
+    /// *from this entry*).
+    private func resolveCovered(_ covered: [QueueEntry], detail: String) {
         for entry in covered {
             markHandled(entry)
             markCloudFireResolved(entry.accountID, fireAt: entry.fireAt)
-            let detail = "skipped: open window leaves no usable budget slice for this slot"
             audit.append(accountID: entry.accountID, action: "ping.skip", ok: true, detail: detail)
             activity.append(ActivityRecord(
                 time: now(), accountID: entry.accountID, ok: true, anchored: false, detail: detail))

@@ -181,10 +181,24 @@ public enum RuntimeAnchorPolicy {
         /// the effective boundary in `fireAt` and nominal identity in
         /// `plannedAt`, so cloud-routine resolution follows the right time.
         public var covered: [QueueEntry]
+        /// Entries resolved for a different reason than `covered`, kept apart
+        /// so the skip each one logs stays truthful: under the "first ping of
+        /// the day only" mode (`WorkSchedule.firstPingOfDayOnly`), the
+        /// deferral would have carried the morning ping *into* the workday —
+        /// the user's own open window already covers the start of it, so the
+        /// automated morning anchor has nothing left to set up. Same shape and
+        /// resolution rules as `covered` (nominally-due only; `fireAt` is the
+        /// effective boundary, `plannedAt` the nominal identity).
+        public var startOfWorkdayCovered: [QueueEntry]
 
-        public init(entries: [QueueEntry] = [], covered: [QueueEntry] = []) {
+        public init(
+            entries: [QueueEntry] = [],
+            covered: [QueueEntry] = [],
+            startOfWorkdayCovered: [QueueEntry] = [])
+        {
             self.entries = entries
             self.covered = covered
+            self.startOfWorkdayCovered = startOfWorkdayCovered
         }
     }
 
@@ -218,6 +232,19 @@ public enum RuntimeAnchorPolicy {
     ///     schedule. The caller is expected to relax that floor by
     ///     `maxSliceShortfall`, since this policy measures the slice from the
     ///     *deferred* fire — see that constant for why.
+    ///   - firstPingOfDayOnly: the schedule's "first ping of the day only"
+    ///     mode. That mode exists so automation only ever sets up the morning;
+    ///     every later window is the user's to start. A deferral may still move
+    ///     the morning ping later while it stays a *pre-work* ping, but once
+    ///     `hasPaintedWork(planned, effective)` holds — a planner-worthy slice
+    ///     of work lies between the planned minute and the deferred fire — the
+    ///     shift would turn it into an automatic mid-workday anchor. The user's
+    ///     own open window already covers the start of that workday, so the
+    ///     entry resolves as `startOfWorkdayCovered` instead. Reusing the
+    ///     relaxed-floor predicate is deliberate: a window expiring before
+    ///     work, or only a sliver into it, still gets its morning ping just
+    ///     past the expiry. Defaults to off, which leaves every other caller
+    ///     unchanged.
     public static func adjust(
         _ queue: [QueueEntry],
         windowStates: [String: AccountWindowState],
@@ -225,6 +252,7 @@ public enum RuntimeAnchorPolicy {
         now: Date,
         margin: TimeInterval = RuntimeAnchorPolicy.margin,
         nextNominalFire: ((QueueEntry) -> Date?)? = nil,
+        firstPingOfDayOnly: Bool = false,
         hasPaintedWork: (Date, Date) -> Bool)
         -> AdjustedQueue
     {
@@ -244,6 +272,19 @@ public enum RuntimeAnchorPolicy {
             // to `reset + margin`; otherwise the boundary race survives.
             guard effective > planned else {
                 result.entries.append(entry)
+                continue
+            }
+            // First-ping-only: the morning ping may slide later, but never
+            // across the start of the workday it exists to set up. Checked
+            // before the generic cover rules so the logged reason names the
+            // mode — it is the more specific truth when both hold.
+            if firstPingOfDayOnly && hasPaintedWork(planned, effective) {
+                if planned <= now {
+                    var coveredEntry = entry
+                    coveredEntry.plannedAt = planned
+                    coveredEntry.fireAt = effective
+                    result.startOfWorkdayCovered.append(coveredEntry)
+                }
                 continue
             }
             // The daemon supplies the cyclic successor so the last entry in

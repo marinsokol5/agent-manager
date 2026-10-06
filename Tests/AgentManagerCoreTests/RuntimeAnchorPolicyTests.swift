@@ -172,6 +172,73 @@ final class RuntimeAnchorPolicyTests: XCTestCase {
         XCTAssertEqual(adjusted.entries.map(\.fireAt), [t(3), t(7 + marginMin)])
     }
 
+    // MARK: - first ping of the day only
+
+    /// `t(0)` is 06:00 and painted work runs 09:00–18:00 (`t(180)..<t(720)`),
+    /// a typical day whose only first-ping-only anchor is 06:00. The painted
+    /// predicate mirrors the daemon's: clipped overlap against a one-hour
+    /// floor relaxed by `maxSliceShortfall`.
+    func adjustMorning(expiresMin: Double, nowMin: Double, firstOnly: Bool) -> RuntimeAnchorPolicy.AdjustedQueue {
+        let workStart = t(180), workEnd = t(720)
+        let floor = 60 * 60 - RuntimeAnchorPolicy.maxSliceShortfall
+        return RuntimeAnchorPolicy.adjust(
+            [QueueEntry(fireAt: t(0), accountID: "a")],
+            windowStates: ["a": usage(expiresMin, observedMin: -60)],
+            window: window,
+            now: t(nowMin),
+            firstPingOfDayOnly: firstOnly,
+            hasPaintedWork: { from, to in
+                let start = max(from, workStart), end = min(to, workEnd)
+                return start < end && end.timeIntervalSince(start) >= floor
+            })
+    }
+
+    func testFirstPingOnlyWindowIntoWorkdayResolvesAsStartOfWorkdayCovered() {
+        // The user started a window at 05:30 (expiry 10:30). Deferring 06:00 to
+        // 10:32 would be an automatic mid-workday anchor: once due it resolves
+        // as covered under its own reason, not the generic one.
+        let due = adjustMorning(expiresMin: 270, nowMin: 1, firstOnly: true)
+        XCTAssertTrue(due.entries.isEmpty)
+        XCTAssertTrue(due.covered.isEmpty)
+        XCTAssertEqual(
+            due.startOfWorkdayCovered,
+            [QueueEntry(fireAt: t(270 + marginMin), accountID: "a", plannedAt: t(0))])
+
+        // Not yet due: it just sits out this rebuild.
+        let early = adjustMorning(expiresMin: 270, nowMin: -1, firstOnly: true)
+        XCTAssertTrue(early.entries.isEmpty)
+        XCTAssertTrue(early.covered.isEmpty)
+        XCTAssertTrue(early.startOfWorkdayCovered.isEmpty)
+    }
+
+    func testFirstPingOnlyWindowExpiringBeforeWorkStillShifts() {
+        // Expiry 08:30: the deferred fire is still a pre-work ping.
+        let adjusted = adjustMorning(expiresMin: 150, nowMin: 1, firstOnly: true)
+        XCTAssertEqual(
+            adjusted.entries,
+            [QueueEntry(fireAt: t(150 + marginMin), accountID: "a", plannedAt: t(0))])
+        XCTAssertTrue(adjusted.startOfWorkdayCovered.isEmpty)
+    }
+
+    func testFirstPingOnlyWindowExpiringASliverIntoWorkStillShifts() {
+        // Expiry 09:05: five minutes of work is below the (relaxed) slice floor,
+        // so the morning ping still lands just past the expiry.
+        let adjusted = adjustMorning(expiresMin: 185, nowMin: 1, firstOnly: true)
+        XCTAssertEqual(
+            adjusted.entries,
+            [QueueEntry(fireAt: t(185 + marginMin), accountID: "a", plannedAt: t(0))])
+        XCTAssertTrue(adjusted.startOfWorkdayCovered.isEmpty)
+    }
+
+    func testModeOffStillShiftsIntoTheWorkday() {
+        let adjusted = adjustMorning(expiresMin: 270, nowMin: 1, firstOnly: false)
+        XCTAssertEqual(
+            adjusted.entries,
+            [QueueEntry(fireAt: t(270 + marginMin), accountID: "a", plannedAt: t(0))])
+        XCTAssertTrue(adjusted.startOfWorkdayCovered.isEmpty)
+        XCTAssertTrue(adjusted.covered.isEmpty)
+    }
+
     func testShiftReachingCyclicSuccessorResolvesAtQueueSeam() {
         // The concrete queue contains one weekly occurrence per trigger. Its
         // final entry still has a successor just after the week wraps; runtime

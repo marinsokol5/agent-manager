@@ -611,6 +611,9 @@ func printSchedulerStatus() {
     for account in status.accounts {
         print("plan:   \(account.accountID)  \(account.pingsPerWeek) pings/wk\(account.scheduled ? "" : "  (inactive)")")
     }
+    if (try? ScheduleStore(workspace: workspace).load())?.keepsOnlyFirstPingOfDay == true {
+        print("mode:   first ping of each workday only (later windows start on first use)")
+    }
     printCloudRoutineStatus(prefs: prefs)
 }
 

@@ -14,8 +14,7 @@ struct PlannerView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                section("Working hours",
-                        "Drag to paint the hours you actually work. The planner anchors a fresh budget just before each block and re-pings every \(model.schedule.windowMinutes / 60)h so capacity tiles your day.") {
+                section("Working hours", workingHoursSubtitle) {
                     WeekPaintGrid(model: model, selectedDay: $selectedDay)
                 }
 
@@ -30,6 +29,16 @@ struct PlannerView: View {
             .padding(.horizontal, 22)
             .padding(.vertical, 18)
         }
+    }
+
+    /// The "Working hours" description. Under "first ping of the day only" the
+    /// ping list below shows one ping per account per day, so the off-mode
+    /// promise of re-pinging to tile the day would contradict it.
+    private var workingHoursSubtitle: String {
+        if model.firstPingOfDayOnly {
+            return "Drag to paint the hours you actually work. The planner anchors a fresh budget just before each workday; later windows start when you first use the account."
+        }
+        return "Drag to paint the hours you actually work. The planner anchors a fresh budget just before each block and re-pings every \(model.schedule.windowMinutes / 60)h so capacity tiles your day."
     }
 
     /// A titled section: bold heading + one-line description, then the content.

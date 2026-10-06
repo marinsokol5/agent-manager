@@ -1106,6 +1106,34 @@ final class SchedulerDaemonTests: XCTestCase {
         XCTAssertEqual(SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"], date(2026, 7, 6, 10, 0))
     }
 
+    func testFirstPingOnlyMorningPingIsNotDeferredIntoTheWorkday() async throws {
+        // Mode on, Monday 08:00–12:00: the day's only ping is 05:00. The user
+        // started a window by hand at 04:30, so it runs to 09:30. Deferring
+        // the 05:00 fire to 09:31 would be an automatic mid-workday anchor —
+        // exactly what the mode exists to avoid — so the slot resolves as a
+        // covered skip naming the mode.
+        let ws = try seedWorkspace()
+        var sched = try ScheduleStore(workspace: ws).load()
+        sched.firstPingOfDayOnly = true
+        try ScheduleStore(workspace: ws).save(sched)
+        seedUsage(ws, id: "a1", resetsAt: date(2026, 7, 6, 9, 30), fetchedAt: date(2026, 7, 6, 4, 50))
+        let clock = TestClock(date(2026, 7, 6, 5, 0, 30))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+
+        _ = await daemon.tick()
+
+        XCTAssertTrue(recorder.requests.isEmpty)
+        XCTAssertEqual(
+            SchedulerStatusStore(workspace: ws).load()?.lastHandled["a1"],
+            date(2026, 7, 6, 5, 0))
+        let records = ActivityLog(workspace: ws).readRecent(limit: 10)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertFalse(records[0].anchored)
+        XCTAssertEqual(records[0].detail, SchedulerDaemon.startOfWorkdayCoveredDetail)
+        XCTAssertTrue(records[0].detail.contains("first ping only"), records[0].detail)
+    }
+
     func testDeferredRemainderBelowMinimumSliceSkipsTheSlot() async throws {
         // The known window ends at 11:30. Refiring at 11:31 would buy only 29
         // painted minutes before noon, below the default one-hour slice floor.

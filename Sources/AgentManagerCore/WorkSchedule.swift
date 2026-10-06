@@ -31,18 +31,36 @@ public struct WorkSchedule: Codable, Sendable, Equatable {
     /// 30m + 5h + 30m on three). Optional so old `schedule.json` files (which
     /// lack the key) decode to `nil`.
     public var minSliceMinutes: Int?
+    /// "First ping of the day only": keep just each account's earliest ping of
+    /// every workday and drop the top-ups. For a user who wants the automated
+    /// *morning* anchor (a window already live when work starts, set up while
+    /// they sleep) but starts every later window by hand, simply by using the
+    /// account. The engine still places pings exactly as usual; the later ones
+    /// are filtered out of the canonical weekly geometry
+    /// (`LaunchAgentPlanner.weeklyPings`, which also defines "workday"), so the
+    /// daemon queue, wake helper, cloud routine, and coverage screen all agree.
+    /// At runtime the mode also bounds deferral: a morning ping pushed past a
+    /// window the user opened by hand may slide later only while it stays a
+    /// pre-work ping — if the shift would carry it into the workday, it is
+    /// skipped as covered instead (`RuntimeAnchorPolicy.adjust`).
+    /// `nil` = off (the default) — and turning it off stores `nil` again, so
+    /// old `schedule.json` files (which lack the key) decode unchanged and stay
+    /// byte-identical until the user flips it.
+    public var firstPingOfDayOnly: Bool?
 
     public init(
         version: Int = WorkSchedule.currentVersion,
         windowMinutes: Int = defaultWindowMinutes,
         hoursByWeekday: [[Int]] = Array(repeating: [], count: 7),
         parallelism: Int? = nil,
-        minSliceMinutes: Int? = nil)
+        minSliceMinutes: Int? = nil,
+        firstPingOfDayOnly: Bool? = nil)
     {
         self.version = version
         self.windowMinutes = windowMinutes
         self.parallelism = parallelism
         self.minSliceMinutes = minSliceMinutes
+        self.firstPingOfDayOnly = firstPingOfDayOnly
         // Defend against a short/long array sneaking in from hand-edited JSON.
         var days = hoursByWeekday
         while days.count < 7 { days.append([]) }
@@ -66,6 +84,10 @@ public struct WorkSchedule: Codable, Sendable, Equatable {
         let cap = max(windowMinutes, minSliceFloorMinutes)
         return min(max(minSliceMinutes ?? defaultMinSliceMinutes, minSliceFloorMinutes), cap)
     }
+
+    /// Whether the "first ping of the day only" mode is on. Only an explicit
+    /// `true` turns it on; `nil` and a hand-written `false` both mean off.
+    public var keepsOnlyFirstPingOfDay: Bool { firstPingOfDayOnly == true }
 
     /// Weekday labels, index 0 = Monday.
     public static let weekdayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]

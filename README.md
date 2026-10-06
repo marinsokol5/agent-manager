@@ -68,6 +68,9 @@ Paint your working hours in the app, flip the **Scheduler active**
 switch, and Agent Manager fires a small ping (programmatic by default; also sdk, controlled terminal or Claude routine) to open each account's window just
 before you start, so that you begin the day with a fresh window instead of starting
 the clock the moment you sit down.
+If you only want that automated morning window and would rather start later
+ones yourself, tick **First ping only** above the day's ping list: each account
+then keeps just its first ping of every workday.
 
 ![Planner screen: working hours painted on a weekly grid, the ping schedule, and the daily token-window timeline](screenshots/planner.png)
 
@@ -116,7 +119,7 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | File | Contents |
 | --- | --- |
 | `accounts.json` | account metadata (label, color, email, keychain service name) — no secrets |
-| `schedule.json` | your work hours and window length |
+| `schedule.json` | your work hours, window length, and planner options |
 | `scheduler.json` / `scheduler-status.json` | the scheduler switch + the background agent's heartbeat and upcoming pings |
 | `wake.json` | the "Wake Mac for pings" opt-in |
 | `cloud-fallback-state.json` | which claude.ai routine is armed per account, and for when |

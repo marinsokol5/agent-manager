@@ -165,7 +165,15 @@ design follows from them.
 - `accounts.json` — account inventory (metadata + identity email + keychain
   service name; **no secrets**).
 - `schedule.json` — painted work hours + window length + planner knobs
-  (parallel lanes, minimum budget-slice length).
+  (parallel lanes, minimum budget-slice length, and the optional
+  `firstPingOfDayOnly` mode — keep only each account's earliest ping per
+  workday, filtered once in `LaunchAgentPlanner.weeklyPings` so every surface
+  derives the same reduced plan; "workday" = the painted session a ping
+  serves, keyed by the day that session started — see
+  `firstAnchorPerWorkday`). At runtime the mode also caps deferral: a morning
+  ping shifted past a hand-started window that would land inside the workday
+  is skipped as covered rather than becoming an automatic mid-workday anchor
+  (`RuntimeAnchorPolicy.adjust`, `firstPingOfDayOnly:`).
 - `scheduler.json` — the resident scheduler's active flag (what the app's
   "Scheduler active" toggle actually writes).
 - `wake.json` — the "Wake Mac for pings" opt-in (app toggle / `am wake
@@ -258,7 +266,10 @@ Work the chain in this order:
    that window is genuinely unanchored, and the reason names which witness said
    so), `"cloud routine method — no local ping"` (the slot came due with no
    routine armed for it at all: unanchored by design, never a flaky local
-   turn), or `"open window leaves no usable budget slice"`.
+   turn), `"open window leaves no usable budget slice"`, or `"first ping only
+   — an open window already covers the start of this workday"` (first-ping-only
+   mode: deferring the morning ping past a hand-started window would have
+   made it an automatic mid-workday anchor, so it was dropped instead).
    Note the ~5-minute lag on any cloud-routine resolution: a passed one-shot is
    held untouched until `CloudFallbackPlanner.dispatchSettle`, because moving it
    sooner would cancel the run — so a fire's `ping.skip` legitimately trails its

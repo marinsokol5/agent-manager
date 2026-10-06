@@ -147,6 +147,18 @@ extension AppModel {
         saveSchedule()
     }
 
+    /// The "first ping of the day only" planner mode, as the coverage toggle
+    /// shows it.
+    var firstPingOfDayOnly: Bool { schedule.keepsOnlyFirstPingOfDay }
+
+    /// Flip the mode. Off stores `nil` (not `false`), so a user who tries it and
+    /// turns it back off leaves `schedule.json` exactly as an untouched install
+    /// writes it — the same rule as `setMinSlice` / `setParallelism`.
+    func setFirstPingOfDayOnly(_ on: Bool) {
+        schedule.firstPingOfDayOnly = on ? true : nil
+        saveSchedule()
+    }
+
     // MARK: - the Scheduler toggle / monitor (Core operations, off-main)
 
     /// The sidebar's "Scheduler active" switch. On = activate the resident

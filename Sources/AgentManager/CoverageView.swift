@@ -53,6 +53,7 @@ struct DayConsumptionTimeline: View {
 
             Spacer(minLength: 0)
 
+            firstPingOnlyToggle
             minSliceStepper
             parallelismStepper
         }
@@ -77,6 +78,22 @@ struct DayConsumptionTimeline: View {
         .controlSize(.small)
         .fixedSize()
         .help("The shortest usable block of a fresh token window worth scheduling a ping for. Raising it trades edge slivers for fewer, longer blocks — e.g. a 6-hour day becomes 3h + 3h on two pings instead of 30 min + 5h + 30 min on three.")
+    }
+
+    /// "First ping of the day only": keeps each account's automated morning
+    /// anchor and drops the top-ups, for a user who starts later windows
+    /// themselves. A planner knob like its neighbors — the ping list and the
+    /// timeline below re-render from the filtered plan.
+    private var firstPingOnlyToggle: some View {
+        Toggle(isOn: Binding(get: { model.firstPingOfDayOnly }, set: { model.setFirstPingOfDayOnly($0) })) {
+            Text("First ping only")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .toggleStyle(.checkbox)
+        .controlSize(.small)
+        .fixedSize()
+        .help("Schedule only each account's first ping of a workday — the one that has a fresh window ready when you start. Later windows start when you first use the account.")
     }
 
     /// "30m", "1h", "1h 15m" — compact duration for the stepper label.
