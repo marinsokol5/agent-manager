@@ -71,9 +71,9 @@ the clock the moment you sit down.
 If you already run a daily job against Claude or Codex — an eval, say — pick
 the **Custom command** ping method and point it at that executable: the job
 itself becomes the anchoring turn, so the morning window is set up by real
-work instead of a throwaway prompt. The command is stored as arguments, never
-run through a shell (point it at a script, or at `/bin/zsh -lc '…'`, if you
-want shell features). It runs from its own directory with stdin closed, may
+work instead of a throwaway prompt. By default the command is stored as
+arguments, never run through a shell (point it at a script if you want shell
+features). It runs from its own directory with stdin closed, may
 take up to 8 minutes, and Agent Manager still checks usage afterwards to
 decide whether the window actually anchored. A non-zero exit is reported but
 not treated as a failed ping.
@@ -84,8 +84,45 @@ nvm/pyenv setup; `PATH` is just `~/.local/bin`, Homebrew, and the system
 directories). The app's **Test ping** sees the app's environment, and only
 `am ping --method custom` from Terminal sees your shell — so a job that passes
 there can still fail at 6 am. Export what the job needs (dataset paths, tool
-versions, `PATH` entries) inside the script itself, or deliberately point the
-command at `/bin/zsh -lc '…'` to load your profile.
+versions, `PATH` entries) inside the script itself — or tick **Run in my login
+shell** under the command.
+
+With that box ticked, the field takes a command line in your own shell's
+syntax (pipes, `&&`, bare command names), stored exactly as typed, and each
+run starts your login shell — the one in your user account, not `$SHELL` — as
+a login, non-interactive shell, `<shell> -l -c '…'`, from your home folder.
+Which startup files that loads depends on the shell:
+
+| Shell | Loads with `-l -c` |
+| --- | --- |
+| zsh | `.zshenv`, `.zprofile`, `.zlogin` — **not** `.zshrc` |
+| bash | `.bash_profile` (or `.bash_login` / `.profile`) — not `.bashrc` unless your profile sources it |
+| sh / dash / ksh | `.profile` |
+| fish | `config.fish` and `conf.d/`, minus `status is-interactive` blocks |
+
+Other shells (tcsh/csh, nu, xonsh, …) aren't supported: pings fail without
+running anything, and the field says so — use an absolute path to a script
+instead. Your profile runs before your command, and Agent Manager re-applies
+its guarantees once, *after* the profile and before your line: the account's
+managed home is set again, the API key is removed again (in fish, a universal
+`set -Ux` key is masked with an empty value rather than erased), and the
+`claude` / `codex` binary goes back to the front of `PATH` — just that one
+binary, through a temporary directory holding only a link to it, so the
+node, python, or ruby your profile picked (nvm, mise, pyenv) stays first even
+when Homebrew keeps its own copies next to the CLI.
+
+That re-apply happens only in the shell that runs your line. A zsh or fish
+script your line starts (a `#!/bin/zsh` eval, `fish -c …`) re-reads `.zshenv`
+or `config.fish`, and `cd` hooks your profile installs (mise, direnv) can
+change the environment again mid-line. So keep provider API keys out of
+`.zshenv` and `config.fish` — put them in `.zshrc`, or behind `status
+is-interactive` in fish. Usage is still checked afterwards, so a run that
+ended up on an API key just reads as not anchored.
+
+Don't put secrets inline in the command line itself; reference environment
+variables set elsewhere. On a syntax error or an unknown command, fish and
+bash print the line back, and the saved transcript keeps that output.
+
 On top of that environment it can rely on:
 
 | Variable | Value |
@@ -93,7 +130,7 @@ On top of that environment it can rely on:
 | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` | the account's managed home, so `claude` / `codex` run as that account |
 | `AGENT_MANAGER_ACCOUNT_ID` | the account id |
 | `AGENT_MANAGER_PROVIDER` | `claude` or `codex` |
-| `AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN` | the CLI binary Agent Manager would run; its directory is also first on `PATH` |
+| `AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN` | the CLI binary Agent Manager would run; a bare `claude` / `codex` also resolves to it, through a per-run directory first on `PATH` that holds only that binary (its neighbours, like Homebrew's node, are not promoted) |
 
 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are removed, so the job bills the
 subscription, not an API key.

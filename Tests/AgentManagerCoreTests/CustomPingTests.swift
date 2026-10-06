@@ -151,6 +151,7 @@ final class CustomPingTests: XCTestCase {
             echo "account=$AGENT_MANAGER_ACCOUNT_ID provider=$AGENT_MANAGER_PROVIDER"
             echo "bin=$AGENT_MANAGER_CLAUDE_BIN"
             echo "which=$(command -v claude)"
+            echo "ran=$(claude)"
             echo "key=${ANTHROPIC_API_KEY:-unset}"
             echo "cwd=$(pwd -P)"
             echo "args=$1|$2"
@@ -169,7 +170,14 @@ final class CustomPingTests: XCTestCase {
         XCTAssertTrue(t.contains("home=/managed/home"), t)
         XCTAssertTrue(t.contains("account=work provider=claude"), t)
         XCTAssertTrue(t.contains("bin=\(claude.path)"), t)
-        XCTAssertTrue(t.contains("which=\(claude.path)"), t)
+        // A bare `claude` resolves through the run's shim directory to the
+        // resolved binary — not through the binary's own directory.
+        let which = try XCTUnwrap(t.split(separator: "\n").first { $0.hasPrefix("which=") }?.dropFirst(6))
+        XCTAssertEqual((String(which) as NSString).lastPathComponent, "claude", t)
+        XCTAssertTrue(which.contains(ProviderShim.directoryPrefix), t)
+        XCTAssertTrue(t.contains("ran=fake-claude"), t)
+        XCTAssertFalse(fileManager.fileExists(atPath: (String(which) as NSString).deletingLastPathComponent),
+                       "the shim directory is removed when the run ends")
         XCTAssertTrue(t.contains("key=unset"), t)
         // `pwd -P` reports /private/var; Foundation's resolver keeps /var.
         let physical = try XCTUnwrap(realpath(dir.path, nil).map { p in
@@ -181,14 +189,70 @@ final class CustomPingTests: XCTestCase {
         XCTAssertTrue(t.contains("oops"), "stderr shares the transcript: \(t)")
     }
 
-    func testEnvironmentPutsProviderBinaryDirFirstOnce() {
+    /// The shim directory — never the binary's own (`/opt/x`, which in real
+    /// life is `/opt/homebrew/bin` with node/python3 beside the CLI) — goes
+    /// first on PATH, once; the override var still names the real binary.
+    func testEnvironmentPutsShimDirFirstOnce() {
         let env = CustomPingRunner.environment(
-            base: ["PATH": "/usr/bin:/opt/x:/bin"],
-            accountID: "a", provider: .codex, providerBinary: "/opt/x/codex")
-        XCTAssertEqual(env["PATH"], "/opt/x:/usr/bin:/bin")
+            base: ["PATH": "/usr/bin:/tmp/shim:/opt/x:/bin"],
+            accountID: "a", provider: .codex, providerBinary: "/opt/x/codex", shimDirectory: "/tmp/shim")
+        XCTAssertEqual(env["PATH"], "/tmp/shim:/usr/bin:/opt/x:/bin")
         XCTAssertEqual(env["AGENT_MANAGER_CODEX_BIN"], "/opt/x/codex")
         XCTAssertEqual(env["AGENT_MANAGER_PROVIDER"], "codex")
         XCTAssertEqual(env["AGENT_MANAGER_ACCOUNT_ID"], "a")
+
+        // No shim (it couldn't be created): PATH is left exactly as it was.
+        let noShim = CustomPingRunner.environment(
+            base: ["PATH": "/usr/bin:/opt/x:/bin"],
+            accountID: "a", provider: .codex, providerBinary: "/opt/x/codex", shimDirectory: nil)
+        XCTAssertEqual(noShim["PATH"], "/usr/bin:/opt/x:/bin")
+        XCTAssertEqual(noShim["AGENT_MANAGER_CODEX_BIN"], "/opt/x/codex")
+    }
+
+    func testProviderShimHoldsExactlyOneSymlink() throws {
+        let bin = try script("codex", "echo real")
+        let shim = try XCTUnwrap(ProviderShim.create(binary: bin.path, name: "codex", parent: dir))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: shim.path), ["codex"])
+        XCTAssertEqual(
+            try fileManager.destinationOfSymbolicLink(atPath: shim.appendingPathComponent("codex").path), bin.path)
+        let mode = try XCTUnwrap(fileManager.attributesOfItem(atPath: shim.path)[.posixPermissions] as? Int)
+        XCTAssertEqual(mode & 0o777, 0o700)
+        ProviderShim.remove(shim)
+        XCTAssertFalse(fileManager.fileExists(atPath: shim.path))
+
+        // An unusable parent: no shim, nothing left behind.
+        let file = dir.appendingPathComponent("not-a-dir")
+        try "x".write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertNil(ProviderShim.create(binary: bin.path, name: "codex", parent: file))
+    }
+
+    /// argv mode gets the same toolchain-preserving PATH as the login-shell
+    /// form: a `node` beside the provider binary must not shadow the one
+    /// earlier on PATH, while bare `codex` still resolves to the provider.
+    func testArgvModeShimDoesNotShadowNeighbours() throws {
+        let providerDir = dir.appendingPathComponent("brew bin", isDirectory: true)
+        let nvmDir = dir.appendingPathComponent("nvm bin", isDirectory: true)
+        try fileManager.createDirectory(at: providerDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: nvmDir, withIntermediateDirectories: true)
+        let codex = try script("brew bin/codex", "echo provider-codex")
+        _ = try script("brew bin/node", "echo brew-node")
+        _ = try script("nvm bin/node", "echo nvm-node")
+        let exe = try script("eval.sh", """
+            echo "node=$(node)"
+            echo "codex=$(codex)"
+            echo "shim=$(dirname "$(command -v codex)")"
+            """)
+        let result = CustomPingRunner.run(
+            command: CustomPingCommand(executable: exe.path), accountID: "a", provider: .codex,
+            binary: codex.path,
+            environment: ["PATH": "\(nvmDir.path):\(providerDir.path):/usr/bin:/bin", "HOME": dir.path])
+        let t = result.transcript
+        XCTAssertTrue(result.ok, result.detail)
+        XCTAssertTrue(t.contains("node=nvm-node"), t)
+        XCTAssertTrue(t.contains("codex=provider-codex"), t)
+        let shim = try XCTUnwrap(t.split(separator: "\n").first { $0.hasPrefix("shim=") }?.dropFirst(5))
+        XCTAssertTrue(shim.contains(ProviderShim.directoryPrefix), t)
+        XCTAssertFalse(fileManager.fileExists(atPath: String(shim)))
     }
 
     func testTimeoutKillsTheWholeProcessGroup() throws {

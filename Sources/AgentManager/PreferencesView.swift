@@ -373,21 +373,26 @@ private extension PingMethod {
             return "Install the \(sdk) once: \(setupCommand ?? "")"
         case .custom:
             let home = provider == .claude ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"
-            return "Runs your own executable — say a daily eval — with \(home) set to the account's home, so real work anchors the window. Arguments only, no shell."
+            return "Runs your own executable — say a daily eval — with \(home) set to the account's home, so real work anchors the window. Arguments only — or, if you tick it, run through your login shell."
         case .routine:
             return "A one-shot claude.ai routine anchors every scheduled slot from Anthropic's cloud. No local ping runs, so a sleeping Mac still anchors."
         }
     }
 }
 
-/// The `custom` method's command line: one text field parsed into argv
-/// (`CustomPingCommand.parse` — quote-aware, never a shell string), a
-/// "Choose…" picker for the executable, and inline validation.
+/// The `custom` method's command line, in either of `CustomPingCommand`'s
+/// forms: by default one text field parsed into argv (`CustomPingCommand.parse`
+/// — quote-aware, never a shell string) with a "Choose…" picker for the
+/// executable; with "Run in my login shell" on, the same field takes a line in
+/// the user's own shell's syntax, stored verbatim and run as `<shell> -l -c`
+/// so their profile loads (see `LoginShell`).
 ///
 /// Saving is explicit (Return, or picking a file) rather than per keystroke:
 /// half-typed lines like `/bin/zsh -lc 'echo` would otherwise be saved as
 /// whatever happened to parse along the way. Only a line that parses *and*
-/// points at an executable file is ever written.
+/// points at an executable file — or, in login-shell mode, a non-blank line
+/// with a supported login shell — is ever written. Flipping the toggle only
+/// converts the text in place; it never saves.
 ///
 /// Scoped rather than per provider: the same field edits a provider's default
 /// command or one overridden account's own — whichever the section shows.
@@ -395,18 +400,32 @@ private struct CustomCommandField: View {
     @Bindable var model: AppModel
     let scope: PingMethodScope
     @State private var text: String = ""
+    @State private var useLoginShell = false
     @State private var loaded = false
+    /// Read once per appearance: the user database doesn't change under an
+    /// open Preferences window in any way worth polling for, and the runner
+    /// re-reads it at every ping anyway.
+    @State private var shell: Result<LoginShell, LoginShell.Problem> = LoginShell.resolve()
 
     var body: some View {
         let state = validation
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
-                TextField("/path/to/your-eval.sh --flag value", text: $text)
+                TextField(
+                    useLoginShell ? "cd ~/evals && npm run eval" : "/path/to/your-eval.sh --flag value",
+                    text: $text)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, design: .monospaced))
                     .onSubmit(save)
-                Button("Choose…", action: choose)
+                if !useLoginShell {
+                    Button("Choose…", action: choose)
+                }
             }
+            Toggle(isOn: Binding(get: { useLoginShell }, set: setLoginShell)) {
+                Text("Run in my login shell (\(shellName))")
+                    .font(.system(size: 12))
+            }
+            .toggleStyle(.checkbox)
             Text(state.text)
                 .font(.system(size: 11.5))
                 .foregroundStyle(state.tint)
@@ -416,21 +435,38 @@ private struct CustomCommandField: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            text = model.pingPreferences.customCommand(in: scope)?.commandLine ?? ""
+            shell = LoginShell.resolve()
+            useLoginShell = saved?.isLoginShell ?? false
+            text = saved?.commandLine ?? ""
         }
     }
 
     private var saved: CustomPingCommand? { model.pingPreferences.customCommand(in: scope) }
 
+    /// The detected shell's name for the checkbox label — or, when it can't
+    /// be used, the name of what was found, so the label never promises a
+    /// shell the run would refuse.
+    private var shellName: String {
+        switch shell {
+        case let .success(found): found.name
+        case let .failure(.unsupported(name)): "\(name), unsupported"
+        case .failure: "not found"
+        }
+    }
+
     private var validation: (text: String, tint: Color) {
+        useLoginShell ? loginShellValidation : argvValidation
+    }
+
+    private var argvValidation: (text: String, tint: Color) {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return ("Absolute path first, then arguments. Quote with '…' or \"…\". For pipes or &&, point at a script. Scheduled runs don't load your shell profile.", Color.secondary)
+            return ("Absolute path first, then arguments. Quote with '…' or \"…\". For pipes or &&, point at a script or run it in your login shell. Scheduled runs don't load your shell profile.", Color.secondary)
         }
         do {
             let parsed = try CustomPingCommand.parse(text)
             if parsed == saved {
                 let args = parsed.arguments.count
-                return ("Saved — runs \(parsed.executable)\(args == 0 ? "" : " with \(args) argument\(args == 1 ? "" : "s")").",
+                return ("Saved — runs \(parsed.executable ?? "")\(args == 0 ? "" : " with \(args) argument\(args == 1 ? "" : "s")").",
                         Theme.success)
             }
             return ("Press Return to save.", Color.secondary)
@@ -439,9 +475,54 @@ private struct CustomCommandField: View {
         }
     }
 
+    private var loginShellValidation: (text: String, tint: Color) {
+        let found: LoginShell
+        switch shell {
+        case let .success(s): found = s
+        case let .failure(problem): return ("\(problem)", Theme.warning)
+        }
+        let how = "Runs as \(found.name) -l -c '…' from your home folder, so your shell config loads."
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ("Your shell's own syntax — pipes, &&, PATH lookups. \(how)", Color.secondary)
+        }
+        if saved == .loginShell(text) {
+            return ("Saved. \(how)", Theme.success)
+        }
+        return ("Press Return to save. \(how)", Color.secondary)
+    }
+
     private func save() {
+        if useLoginShell {
+            // Stored exactly as typed: it's in the user's shell's syntax, and
+            // any normalization of ours could change what it means.
+            guard case .success = shell,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return }
+            model.setCustomCommand(.loginShell(text), in: scope)
+            return
+        }
         guard let parsed = try? CustomPingCommand.parse(text) else { return }
         model.setCustomCommand(parsed, in: scope)
+        text = parsed.commandLine
+    }
+
+    /// Convert the text in place where the other form can express it; never
+    /// save. argv → line: rendered for the detected shell's family
+    /// (`CustomPingCommand.loginShellLine(for:)`), which declines — leaving the
+    /// text as typed — when fish would read the rendering as different words
+    /// (a backslash inside fish single quotes is an escape). Line → argv:
+    /// only if it parses as one (an absolute executable); otherwise the text
+    /// stays and the validation line shows exactly why it isn't one.
+    private func setLoginShell(_ on: Bool) {
+        guard on != useLoginShell else { return }
+        useLoginShell = on
+        // Whatever parses as argv is rendered canonically; anything else is
+        // left untouched.
+        guard let parsed = try? CustomPingCommand.parse(text) else { return }
+        if on, case let .success(found) = shell {
+            if let line = parsed.loginShellLine(for: found.family) { text = line }
+            return
+        }
         text = parsed.commandLine
     }
 

@@ -28,6 +28,10 @@ public struct AccountPinger {
     /// still reaches postflight verification (`mayHaveRunTurns` must survive
     /// the `Result` rebuild below) without waiting out eight minutes.
     var customTimeout: TimeInterval = CustomPingRunner.timeout
+    /// Where the `custom` method's login-shell form reads the user's shell and
+    /// home from. Internal so dispatch tests can pin a real `/bin/zsh` instead
+    /// of whatever the developer running them logs in with.
+    var loginShellLookup: LoginShell.Lookup = LoginShell.systemLookup
 
     public init(
         workspace: Workspace,
@@ -143,7 +147,8 @@ public struct AccountPinger {
                 binary: binary,
                 environment: environment,
                 timeout: customTimeout,
-                fileManager: fileManager)
+                fileManager: fileManager,
+                loginShell: loginShellLookup)
         }
         let result = ClaudePingRunner.Result(
             ok: rawResult.ok,

@@ -125,13 +125,21 @@ design follows from them.
 5. **No shell string execution.** Spawn subprocesses with `Process` +
    `executableURL` (absolute path) + an `arguments` array. Never build a
    `/bin/sh -c "…"` command string from interpolated values. (`TerminalLauncher`
-   is the sole place that emits a shell/AppleScript string, and only from
-   validated/managed inputs.) The `custom` ping method is consistent with this,
-   not an exception to it: the user's command line is parsed once into argv
+   and `LoginShell` are the only places that emit a shell/AppleScript string —
+   `TerminalLauncher` only from validated/managed inputs, `LoginShell` only the
+   carve-out below.) The `custom` ping method's argv form is consistent with
+   this: the user's command line is parsed once into argv
    (`CustomPingCommand`, an absolute executable + arguments) and only that argv
-   ever reaches `Process`. Never re-join it into a string; a user who wants
-   shell features points it at their own script or `/bin/zsh -lc '…'`
-   explicitly.
+   ever reaches `Process`. Never re-join it into a string. Its login-shell form
+   is a narrow carve-out, behind an explicit toggle
+   (`CustomPingCommand.loginShell`): the user's *own* line, in their own
+   shell's syntax, run as `<login shell> -l -c` (`LoginShell.prologue`). The
+   string that shell receives is that line verbatim
+   behind a **constant**, per-family prologue that only names env vars we own
+   and references their values (`$AGENT_MANAGER_CONFIG_HOME`,
+   `$AGENT_MANAGER_PROVIDER_BIN_DIR`) — no value of ours is ever interpolated
+   into it. Keep it that way: anything new the prologue needs travels as an
+   env var, never as text.
 6. **Account IDs are filesystem-safe slugs.** Validate with `AccountID.validate`
    (`[A-Za-z0-9_-]`) before an ID is used as a directory name, launchd label, or
    plist path. This is what makes path/XML interpolation safe — keep new code
@@ -217,8 +225,10 @@ design follows from them.
   account. Picking it stops local pings for every account it applies to. The
   file is written on first read if it's missing, because that read is also where "which default
   applies" is decided — see the ping-method gotcha. Optional
-  `claudeCustomCommand` / `codexCustomCommand` (`{executable, arguments}`)
-  hold what `custom` runs; they are omitted while unset, so older files stay
+  `claudeCustomCommand` / `codexCustomCommand` hold what `custom` runs —
+  `{executable, arguments}` (argv), or `{loginShell: "<line>"}` (the line as
+  typed, run through the user's login shell); they are omitted while unset,
+  and the argv form encodes exactly as it always has, so older files stay
   byte-identical. Optional `accountPingOverrides` (`{<accountID>: {method,
   customCommand?}}`, omitted while empty) holds per-account exceptions: an
   overridden account uses its own method and, for `custom`, **its own**
@@ -471,8 +481,37 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   `custom` runs the user's own command (say a daily eval) as the anchoring
   turn, under the account's managed home, with `AGENT_MANAGER_ACCOUNT_ID`,
   `AGENT_MANAGER_PROVIDER`, and the resolved provider binary
-  (`AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN`, its directory first
-  on `PATH`) added; cwd is the executable's directory, stdin `/dev/null`. It
+  (`AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN`) added, and a
+  per-run shim directory first on `PATH` (`ProviderShim`: one `claude` /
+  `codex` symlink to that binary, removed on every exit path — normal,
+  timeout, launch failure); cwd is the executable's directory, stdin
+  `/dev/null`. Never put the binary's *real* directory first instead: it's
+  the `PATH` entry the binary was found in, usually `/opt/homebrew/bin`, and
+  its node/npm/python3 neighbours would shadow the nvm/mise/pyenv toolchain
+  the user's profile set up. No shim (it couldn't be created) means no `PATH`
+  re-assert at all, never a fallback to the real directory.
+  Its login-shell form instead runs `<shell> -l -c '<prologue><line>'`, with
+  the shell read at run time from the user database (`getpwuid` →
+  `pw_shell`, never `$SHELL`, which launchd doesn't set) and cwd the user's
+  home (`pw_dir`). Only POSIX shells (`zsh`/`bash`/`sh`/`dash`/`ksh`) and
+  `fish` are supported; anything else fails as never launched. The prologue
+  exists because the profile runs *after* we set the environment and can
+  re-export `ANTHROPIC_API_KEY` (API billing — the window never anchors) or
+  `CLAUDE_CONFIG_DIR` (wrong account): it re-asserts the managed home, the
+  API-key removal, and the shim directory first on `PATH` — once, after the
+  profile and before the line. That is all it guarantees: a zsh/fish the line
+  starts (a `#!/bin/zsh` script, `fish -c`) re-reads `.zshenv` /
+  `config.fish`, and profile-installed `cd` hooks (mise's `--on-variable PWD`
+  handler fires even in non-interactive fish, direnv) can change the
+  environment mid-line — so don't document it as "can't bill the API"; the
+  README tells users to keep keys out of `.zshenv`/`config.fish`, and usage
+  verification still reads such a run as not anchored. In fish a universal
+  exported key can't be removed without erasing the user's stored value, so
+  the prologue shadows it with an exported empty global instead. The detail
+  reads `custom command (fish login shell) exited 1 after 5m02s`; *our*
+  transcript header names the shell, never the line — but fish and bash echo
+  the `-c` source in their own error messages, which land in the transcript,
+  hence the README's "no secrets inline" line. It
   always uses its own 8-minute timeout (`CustomPingRunner.timeout`) — never the
   90 s turn budget, Test ping included — and on timeout kills the whole
   process group. That timeout is pinned below the daemon's 600 s hard kill
