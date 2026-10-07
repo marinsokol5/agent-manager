@@ -145,6 +145,105 @@ final class ParsingTests: XCTestCase {
         XCTAssertNil(CodexAuth.chatgptAccountId(accessToken: "not-a-jwt"))
     }
 
+    // MARK: CodexUsageFetcher 401/403 classification (real captured rejection)
+
+    /// The real `wham/usage` 401 body from the revoked-token incident (served as
+    /// `text/plain`, alongside header `x-openai-ide-error-code: token_expired`).
+    private let codexTokenExpiredBody = """
+    {"error":{"message":"Your authentication token has expired. Please try refreshing it.",
+      "type":"invalid_request_error","code":"token_expired","param":null},
+     "status":401,
+     "detail":{"code":"token_expired","message":"Your authentication token has expired. Please try refreshing it."}}
+    """
+
+    private func codexRejection(
+        _ status: Int, header: String? = nil, body: String = "", lastRefresh: Date? = nil) -> UsageFetchError
+    {
+        CodexUsageFetcher.classifyRejectionForTesting(
+            statusCode: status, errorCodeHeader: header, body: Data(body.utf8),
+            accountID: "codex-ms55", lastRefresh: lastRefresh)
+    }
+
+    private func assertTokenRevoked(
+        _ error: UsageFetchError, lastRefresh expected: Date? = nil,
+        file: StaticString = #filePath, line: UInt = #line)
+    {
+        guard case let .tokenRevoked(accountID, lastRefresh) = error else {
+            return XCTFail("expected .tokenRevoked, got \(error)", file: file, line: line)
+        }
+        XCTAssertEqual(accountID, "codex-ms55", file: file, line: line)
+        XCTAssertEqual(lastRefresh, expected, file: file, line: line)
+    }
+
+    private func assertUnauthorized(_ error: UsageFetchError, file: StaticString = #filePath, line: UInt = #line) {
+        guard case .unauthorized = error else {
+            return XCTFail("expected .unauthorized, got \(error)", file: file, line: line)
+        }
+        XCTAssertEqual(error.errorDescription,
+                       "Usage API rejected the token (401/403) — re-login this account.",
+                       file: file, line: line)
+    }
+
+    func testCodexRejectionTokenExpiredHeaderOnly() {
+        // A non-JSON body (say a proxy rewrote it) still classifies off the header,
+        // whatever its case/whitespace.
+        assertTokenRevoked(codexRejection(401, header: "token_expired", body: "Unauthorized"))
+        assertTokenRevoked(codexRejection(401, header: " Token_Expired "))
+    }
+
+    func testCodexRejectionTokenExpiredBodyOnly() {
+        // Header stripped → the body's error.code / detail.code carry it, each alone.
+        assertTokenRevoked(codexRejection(401, body: codexTokenExpiredBody))
+        assertTokenRevoked(codexRejection(401, body: #"{"error":{"code":"token_expired"}}"#))
+        assertTokenRevoked(codexRejection(401, body: #"{"detail":{"code":"token_expired"}}"#))
+    }
+
+    func testCodexRejectionPlain401KeepsGenericMessage() {
+        assertUnauthorized(codexRejection(401))
+        assertUnauthorized(codexRejection(401, body: "<html>Unauthorized</html>"))
+        // A different reason code is not a revocation.
+        assertUnauthorized(codexRejection(
+            401, header: "invalid_token", body: #"{"error":{"code":"invalid_api_key"}}"#))
+    }
+
+    func testCodexRejection403StaysUnauthorizedEvenWithCode() {
+        // 403 is an authorization refusal a fresh login isn't known to fix.
+        assertUnauthorized(codexRejection(403, body: "<html>Just a moment...</html>"))
+        assertUnauthorized(codexRejection(403, header: "token_expired", body: codexTokenExpiredBody))
+    }
+
+    func testCodexTokenRevokedMessageNamesManagedLoginAndAge() throws {
+        let lastRefresh = try XCTUnwrap(CodexUsageFetcher.parseLastRefreshForTesting("2026-09-28T08:49:28.060093Z"))
+        let error = codexRejection(401, header: "token_expired", lastRefresh: lastRefresh)
+        assertTokenRevoked(error, lastRefresh: lastRefresh)
+
+        let now = lastRefresh.addingTimeInterval(9 * 86400 + 3600)
+        guard case let .tokenRevoked(accountID, stamp) = error else { return XCTFail() }
+        let message = UsageFetchError.tokenRevokedMessage(accountID: accountID, lastRefresh: stamp, now: now)
+        XCTAssertTrue(message.contains("revoked"), message)
+        XCTAssertTrue(message.contains("“am run codex-ms55 login”"), message)
+        XCTAssertTrue(message.contains("~/.codex"), message)
+        XCTAssertTrue(message.hasSuffix("Its auth.json was last refreshed 9d ago."), message)
+
+        // No stamp → no age clause; a future stamp (clock skew) never reads negative.
+        XCTAssertFalse(UsageFetchError.tokenRevokedMessage(accountID: "codex-ms55", lastRefresh: nil)
+            .contains("last refreshed"))
+        XCTAssertTrue(UsageFetchError.tokenRevokedMessage(
+            accountID: "codex-ms55", lastRefresh: now.addingTimeInterval(120), now: now)
+            .hasSuffix("last refreshed 0s ago."))
+    }
+
+    func testCodexLastRefreshParsesMicrosecondsAndPlainSeconds() {
+        // Codex writes microseconds; the age only needs whole seconds.
+        XCTAssertEqual(CodexUsageFetcher.parseLastRefreshForTesting("2026-10-07T08:49:28.060093Z")?
+            .timeIntervalSince1970.rounded(.down), 1_791_362_968)
+        XCTAssertEqual(CodexUsageFetcher.parseLastRefreshForTesting("2026-10-07T08:49:28Z")?
+            .timeIntervalSince1970, 1_791_362_968)
+        XCTAssertEqual(CodexUsageFetcher.parseLastRefreshForTesting("2026-10-07T10:49:28.5+02:00")?
+            .timeIntervalSince1970.rounded(.down), 1_791_362_968)
+        XCTAssertNil(CodexUsageFetcher.parseLastRefreshForTesting("not a date"))
+    }
+
     // MARK: ClaudeCredentials expiry / needsRefresh
 
     func testClaudeCredentialsParsesMillisExpiryAndToken() throws {

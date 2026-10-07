@@ -7,6 +7,22 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
     case tokenDecodeFailed
     case invalidResponse
     case unauthorized
+    /// Codex only: the usage API answered 401 with OpenAI's `token_expired`
+    /// code (see `CodexUsageFetcher.classifyRejection`). Split out of
+    /// `.unauthorized` because "re-login this account" was not enough to act
+    /// on. In the incident that motivated it the access token's JWT `exp` was
+    /// still a week out — OpenAI had revoked it server-side (most likely after
+    /// a ChatGPT plan change), so waiting or retrying never helps — and the
+    /// user's re-login went through the Codex app / a plain `codex login`,
+    /// which writes the *default* `~/.codex/auth.json`, never this account's
+    /// managed `CODEX_HOME`, so the error never cleared. The message therefore
+    /// names the one command that logs in *this* home (`am run <id> login`
+    /// runs `codex login` with the account's `CODEX_HOME`; the app's Log in
+    /// button is only offered while an account isn't connected, and a revoked
+    /// `auth.json` still reads as connected). `lastRefresh` is the managed
+    /// `auth.json`'s own `last_refresh` stamp — a timestamp, not a secret — so
+    /// a re-login that landed elsewhere shows up as a file that kept aging.
+    case tokenRevoked(accountID: String, lastRefresh: Date?)
     case rateLimited(retryAfter: Date?)
     case serverError(Int)
     /// A background read needs the Keychain prompt we won't show; keep cached
@@ -28,6 +44,8 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
             "Invalid response from usage API."
         case .unauthorized:
             "Usage API rejected the token (401/403) — re-login this account."
+        case let .tokenRevoked(accountID, lastRefresh):
+            Self.tokenRevokedMessage(accountID: accountID, lastRefresh: lastRefresh)
         case .keychainAccessDeferred:
             "Click “Refresh usage” to allow Keychain access."
         case .refreshDeferred:
@@ -41,6 +59,29 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
         case let .serverError(code):
             "Usage API returned HTTP \(code)."
         }
+    }
+
+    /// `.tokenRevoked`'s text, with `now` injected so tests can pin the age.
+    /// The `~/.codex` mention is the whole point: it's where the wrong re-login
+    /// lands. We only *name* that folder — nothing here reads it.
+    static func tokenRevokedMessage(accountID: String, lastRefresh: Date?, now: Date = Date()) -> String {
+        var message = "OpenAI revoked this account's token (token_expired). Log in again as this account "
+            + "with “am run \(accountID) login” — the Codex app or a plain “codex login” signs in "
+            + "your default ~/.codex instead."
+        if let lastRefresh {
+            message += " Its auth.json was last refreshed \(ageLabel(since: lastRefresh, now: now))."
+        }
+        return message
+    }
+
+    /// "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago" (a future stamp from clock
+    /// skew reads as "0s ago" rather than a negative age).
+    private static func ageLabel(since date: Date, now: Date) -> String {
+        let age = max(0, Int(now.timeIntervalSince(date)))
+        if age < 60 { return "\(age)s ago" }
+        if age < 3600 { return "\(age / 60)m ago" }
+        if age < 86400 { return "\(age / 3600)h ago" }
+        return "\(age / 86400)d ago"
     }
 
     private static func shortTime(_ date: Date) -> String {
@@ -238,7 +279,12 @@ public enum CodexUsageFetcher {
             await gate.recordSuccess(accountID: account.id)
             return try decodeResponse(data)
         case 401, 403:
-            throw UsageFetchError.unauthorized
+            throw classifyRejection(
+                statusCode: http.statusCode,
+                errorCodeHeader: http.value(forHTTPHeaderField: errorCodeHeader),
+                body: data,
+                accountID: account.id,
+                lastRefresh: (root["last_refresh"] as? String).flatMap(parseLastRefresh))
         case 429:
             // Report the *effective* block, not the raw `Retry-After` — the server
             // sends `Retry-After: 0`, so the header would read "retry now" while the
@@ -250,6 +296,80 @@ public enum CodexUsageFetcher {
             throw UsageFetchError.serverError(http.statusCode)
         }
     }
+
+    /// Response header carrying OpenAI's machine-readable reason for a rejected
+    /// token (captured on the wire: `x-openai-ide-error-code: token_expired`).
+    private static let errorCodeHeader = "x-openai-ide-error-code"
+    private static let tokenExpiredCode = "token_expired"
+
+    /// Pure classifier for a 401/403 from the usage endpoint. A 401 whose
+    /// reason is `token_expired` becomes `.tokenRevoked` (see that case for
+    /// why it needs its own message); every other 401, and every 403, stays
+    /// `.unauthorized` with the old text. 403 is deliberately excluded even
+    /// with the code: it's an authorization refusal (Cloudflare, plan, policy)
+    /// that a fresh login isn't known to fix.
+    ///
+    /// The reason is honored from any of the places OpenAI puts it — the
+    /// response header, or the body's `error.code` / `detail.code` (the body is
+    /// JSON despite a `text/plain` content type) — so a proxy stripping the
+    /// header, or a body reshuffle, still classifies. `token_expired` is what
+    /// the server says even when the JWT's own `exp` is days away: on this
+    /// endpoint it means "no longer accepted", not "time ran out". Either way
+    /// the fix is the same login, so no `exp` check is needed here; and we never
+    /// refresh a Codex token ourselves (hard rule 2) — only the official CLI may.
+    private static func classifyRejection(
+        statusCode: Int,
+        errorCodeHeader: String?,
+        body: Data,
+        accountID: String,
+        lastRefresh: Date?) -> UsageFetchError
+    {
+        guard statusCode == 401,
+              errorCodes(header: errorCodeHeader, body: body).contains(tokenExpiredCode)
+        else { return .unauthorized }
+        return .tokenRevoked(accountID: accountID, lastRefresh: lastRefresh)
+    }
+
+    /// Every reason code the rejection carries, lowercased: the header plus the
+    /// body's `error.code` and `detail.code` (non-JSON bodies contribute none).
+    private static func errorCodes(header: String?, body: Data) -> Set<String> {
+        var codes: [String?] = [header]
+        if let root = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            codes += ["error", "detail"].map { (root[$0] as? [String: Any])?["code"] as? String }
+        }
+        return Set(codes.compactMap {
+            $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }.filter { !$0.isEmpty })
+    }
+
+    /// `auth.json`'s `last_refresh`, which the Codex CLI writes as RFC 3339 with
+    /// *microseconds* (`2026-10-07T08:49:28.060093Z`) — more fractional digits
+    /// than `ISO8601DateFormatter` promises to accept, so on a miss the fraction
+    /// is dropped (an age label doesn't need sub-second precision).
+    private static func parseLastRefresh(_ raw: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = f.date(from: raw) { return date }
+        f.formatOptions = [.withInternetDateTime]
+        if let dot = raw.firstIndex(of: ".") {
+            let fractionEnd = raw[raw.index(after: dot)...].firstIndex { !$0.isNumber } ?? raw.endIndex
+            return f.date(from: String(raw[..<dot] + raw[fractionEnd...]))
+        }
+        return f.date(from: raw)
+    }
+
+    /// Test hook for the rejection classifier (the network path is not unit-tested).
+    static func classifyRejectionForTesting(
+        statusCode: Int, errorCodeHeader: String?, body: Data,
+        accountID: String, lastRefresh: Date? = nil) -> UsageFetchError
+    {
+        classifyRejection(
+            statusCode: statusCode, errorCodeHeader: errorCodeHeader, body: body,
+            accountID: accountID, lastRefresh: lastRefresh)
+    }
+
+    /// Test hook for the `last_refresh` parser.
+    static func parseLastRefreshForTesting(_ raw: String) -> Date? { parseLastRefresh(raw) }
 
     private static func resolveURL(homeURL: URL) -> URL {
         let configURL = homeURL.appendingPathComponent("config.toml")
