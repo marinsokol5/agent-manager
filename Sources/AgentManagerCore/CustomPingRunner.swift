@@ -4,7 +4,7 @@ import Darwin
 #endif
 
 /// The `custom` ping method: run the user's own executable (an eval, a daily
-/// job they wanted on a timer anyway) under the account's managed home, so the
+/// job they wanted on a timer anyway) under the account's home, so the
 /// window gets anchored by real work instead of a throwaway turn.
 ///
 /// What this runner does and doesn't decide:
@@ -14,7 +14,8 @@ import Darwin
 ///   Anchoring is never inferred from that: the scheduled child verifies it
 ///   from usage exactly as for every other method.
 /// - It never looks at credentials. The command gets the same environment the
-///   built-in drivers get (managed `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, enriched
+///   built-in drivers get (managed `CLAUDE_CONFIG_DIR` / `CODEX_HOME` — or,
+///   for a default-login account, neither, see `Login` — enriched
 ///   `PATH`, direct-API keys stripped), so whatever it runs authenticates the
 ///   way the official CLI does under that home. We neither read nor relay a
 ///   token — this is the narrow carve-out from hard rules 2 and 5 in
@@ -31,7 +32,8 @@ import Darwin
 ///   database (`LoginShell`), launched as `<shell> -l -c '<prologue><line>'`
 ///   so their profile sets up PATH and tooling the way Terminal does. The
 ///   prologue is constant per shell family and re-asserts, *after* the
-///   profile ran, the managed home, the API-key removal, and the provider
+///   profile ran, the managed home (or, on the default login, its absence),
+///   the API-key removal, and the provider
 ///   shim directory (below) first on `PATH` — reading their values from
 ///   namespaced env vars, so nothing of ours is interpolated into the string.
 ///   cwd is the user's home; an unsupported or missing shell fails as never
@@ -127,23 +129,50 @@ public enum CustomPingRunner {
         return env
     }
 
+    /// Which login a run uses — the one thing the environment alone can't say
+    /// to the login-shell form, because an *absent* isolation variable means
+    /// either "nothing to re-assert" or "the default login: keep it absent".
+    public enum Login: Sendable, Equatable {
+        /// The managed home, carried in the environment as the provider's
+        /// isolation variable (`environment` already holds it, or holds none).
+        case managed
+        /// The provider's default login (`Account.tracksDefaultLogin`): the
+        /// environment has no isolation variable and the prologue must keep it
+        /// that way after the profile ran, by *unsetting* it — a profile that
+        /// exports `CLAUDE_CONFIG_DIR` would otherwise move the run onto another
+        /// Keychain item and config. `configHome` is the default home
+        /// (`~/.claude` / `~/.codex`), exported as `AGENT_MANAGER_CONFIG_HOME`
+        /// so the variable always names the config home the run uses; the
+        /// prologue never reads it in this mode.
+        case providerDefault(configHome: String)
+    }
+
     /// The login-shell form's additions on top of `environment(...)`: the
     /// namespaced carriers the constant prologue reads (`LoginShell`) — the
-    /// managed home, and the run's shim directory when one was created.
+    /// config home, and the run's shim directory when one was created.
     /// Returns which prologue clauses those make safe to emit, so a clause is
     /// never present without the var it reads. Pure, like `environment`.
     static func loginShellEnvironment(
         _ env: [String: String],
         provider: Provider,
+        login: Login = .managed,
         shimDirectory: String?)
-        -> (env: [String: String], reassertsConfigHome: Bool, prependsProviderBinDir: Bool)
+        -> (env: [String: String], configHome: LoginShell.ConfigHomeClause, prependsProviderBinDir: Bool)
     {
         var env = env
-        var home = false
+        var home = LoginShell.ConfigHomeClause.untouched
         var binDir = false
-        if let managed = env[provider.configHomeEnvKey], !managed.isEmpty {
-            env[LoginShell.configHomeEnvKey] = managed
-            home = true
+        switch login {
+        case .managed:
+            if let managed = env[provider.configHomeEnvKey], !managed.isEmpty {
+                env[LoginShell.configHomeEnvKey] = managed
+                home = .reassert
+            }
+        case let .providerDefault(configHome):
+            // Belt and braces: `AccountPinger` already built `env` without it.
+            env.removeValue(forKey: provider.configHomeEnvKey)
+            env[LoginShell.configHomeEnvKey] = configHome
+            home = .unset
         }
         if let shimDirectory {
             env[LoginShell.providerBinDirEnvKey] = shimDirectory
@@ -160,7 +189,8 @@ public enum CustomPingRunner {
         environment base: [String: String],
         timeout: TimeInterval = timeout,
         fileManager: FileManager = .default,
-        loginShell lookup: LoginShell.Lookup = LoginShell.systemLookup)
+        loginShell lookup: LoginShell.Lookup = LoginShell.systemLookup,
+        login: Login = .managed)
         -> ClaudePingRunner.Result
     {
         // Never launched → `ok: false`, nothing to verify (no turn can have run).
@@ -213,12 +243,12 @@ public enum CustomPingRunner {
             guard case let .success(shell) = LoginShell.resolve(lookup: lookup, fileManager: fileManager) else {
                 return .init(ok: false, detail: "custom command unusable: login shell unavailable", transcript: "")
             }
-            let prepared = loginShellEnvironment(env, provider: provider, shimDirectory: shim?.path)
+            let prepared = loginShellEnvironment(env, provider: provider, login: login, shimDirectory: shim?.path)
             env = prepared.env
             executable = shell.path
             arguments = shell.arguments(
                 running: line, provider: provider,
-                reassertsConfigHome: prepared.reassertsConfigHome,
+                configHome: prepared.configHome,
                 prependsProviderBinDir: prepared.prependsProviderBinDir)
             // No executable to anchor a cwd: the shell starts where a login
             // shell in Terminal would, the user's home (`pw_dir`).

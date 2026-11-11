@@ -1,7 +1,10 @@
 import AgentManagerCore
 import SwiftUI
 
-/// Edit an existing agent's label and color (its id and home are fixed).
+/// Edit an existing agent's label and color (its id and home are fixed), and
+/// where its login lives: its managed home, or the provider's default login
+/// (`AppModel.setLoginSource` → `DefaultLoginAccounts`).
+/// Switching leaves the managed home on disk either way, so it's reversible.
 struct EditAgentSheet: View {
     @Bindable var model: AppModel
     let account: Account
@@ -11,6 +14,9 @@ struct EditAgentSheet: View {
     @State private var colorHex: String
     /// `-1` = use app default (1 min); `0` = manual only; else interval seconds.
     @State private var refreshSeconds: Int
+    @State private var loginSource: AccountLoginSource
+    @State private var errorText: String?
+    @State private var saving = false
 
     init(model: AppModel, account: Account) {
         self.model = model
@@ -18,6 +24,7 @@ struct EditAgentSheet: View {
         _label = State(initialValue: account.label)
         _colorHex = State(initialValue: account.color)
         _refreshSeconds = State(initialValue: account.usageRefreshSeconds ?? -1)
+        _loginSource = State(initialValue: account.loginSource)
     }
 
     var body: some View {
@@ -30,6 +37,12 @@ struct EditAgentSheet: View {
                 }
                 row("ID") {
                     Text(account.id).font(.system(.body, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                row("Login") {
+                    LoginSourcePicker(
+                        selection: $loginSource,
+                        provider: account.provider,
+                        defaultOwner: model.defaultLoginOwner(for: account.provider, excludingID: account.id))
                 }
                 row("Color") { ColorField(hex: $colorHex) }
                 row("Usage refresh") {
@@ -48,24 +61,44 @@ struct EditAgentSheet: View {
                 }
             }
 
+            if let errorText {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundStyle(Theme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Spacer()
+                if saving { ProgressView().controlSize(.small) }
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    model.updateAccount(
-                        account,
-                        label: label.trimmingCharacters(in: .whitespaces),
-                        color: colorHex,
-                        usageRefreshSeconds: refreshSeconds == -1 ? nil : refreshSeconds)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Save") { save() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty || saving)
             }
         }
         .padding(20)
         .frame(width: 460)
+    }
+
+    /// Plain fields first (they can't fail), then the login switch, which can:
+    /// a refused switch (default login taken, unusable, or a different person)
+    /// keeps the sheet open with the reason.
+    private func save() {
+        model.updateAccount(
+            account,
+            label: label.trimmingCharacters(in: .whitespaces),
+            color: colorHex,
+            usageRefreshSeconds: refreshSeconds == -1 ? nil : refreshSeconds)
+        guard loginSource != account.loginSource else { dismiss(); return }
+        saving = true
+        errorText = nil
+        Task {
+            let error = await model.setLoginSource(account, to: loginSource)
+            saving = false
+            if let error { errorText = error } else { dismiss() }
+        }
     }
 
     private func row<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {

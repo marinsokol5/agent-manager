@@ -148,6 +148,59 @@ public enum Provider: String, Codable, Sendable, CaseIterable {
         }
     }
 
+    /// Human-facing provider name ("Claude" / "Codex"). Lives in Core (not the
+    /// app) because Core-built messages — the default-login errors — name the
+    /// provider too, and both surfaces must say it the same way.
+    public var displayName: String {
+        switch self {
+        case .claude: "Claude"
+        case .codex: "Codex"
+        }
+    }
+
+    // MARK: The provider's *default* login (default-login accounts)
+
+    /// The Keychain service of the provider's **default** login — the item the
+    /// CLI writes when no config-dir override is set, which is also the one the
+    /// Claude desktop app keeps fresh: exactly `Claude Code-credentials`, with
+    /// no `-<hash>` suffix (managed homes get the suffixed form, see
+    /// `keychainServicePrefix`). `nil` for providers whose default credential
+    /// is a file (Codex: `~/.codex/auth.json`, read via `defaultSourceHome`).
+    ///
+    /// We only ever *read* it — for default-login accounts
+    /// (`AccountLoginSource`). The official CLI we run for such an account
+    /// (with `CLAUDE_CONFIG_DIR` unset) may refresh or rewrite it, exactly as
+    /// a plain `claude` would; we never write or delete it (hard rule 3).
+    public var defaultKeychainService: String? {
+        switch self {
+        case .claude: "Claude Code-credentials"
+        case .codex: nil
+        }
+    }
+
+    /// The identity file of the provider's **default** login. Not always
+    /// `<defaultSourceHome>/<identityFileName>`: with no `CLAUDE_CONFIG_DIR`
+    /// set, Claude Code keeps its global config at `~/.claude.json` — *beside*
+    /// `~/.claude`, not inside it. Codex keeps `auth.json` inside `~/.codex`
+    /// either way. Read-only (identity email for display and the conversion
+    /// identity check).
+    public func defaultIdentityFile(homeDirectory: URL) -> URL {
+        switch self {
+        case .claude: homeDirectory.appendingPathComponent(".claude.json")
+        case .codex: defaultSourceHome(homeDirectory: homeDirectory).appendingPathComponent(identityFileName)
+        }
+    }
+
+    /// Where the user signs the default login in outside Agent Manager, for
+    /// messages that name it (alongside `am run <id>`, which reaches the same
+    /// login for a default-login account).
+    public var defaultLoginClients: String {
+        switch self {
+        case .claude: "the Claude desktop app or a plain “claude”"
+        case .codex: "the Codex app or a plain “codex login”"
+        }
+    }
+
     /// Whether this provider has a first-party *hosted* scheduler that can
     /// anchor the account's window while the Mac sleeps (the cloud-fallback
     /// feature). Claude has routines (claude.ai/code/routines, driven via

@@ -3,7 +3,10 @@ import Foundation
 /// Journey 2 — *run an agent*. Resolves an account to a concrete launch plan:
 /// the account's provider + isolated managed home become the underlying
 /// `claude`/`codex` binary, its passthrough args, and an environment with the
-/// account's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` injected.
+/// account's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` injected. For an account on
+/// the provider's default login that variable is removed instead
+/// (`ChildEnvironment.make(for:base:)`), so `am run <id>` is exactly a plain
+/// `claude` / `codex`.
 ///
 /// This type is pure and side-effect-free (no `exec`, no spawn) so it stays
 /// unit-testable; the CLI takes the `Plan` and `exec`s it, replacing its own
@@ -31,7 +34,8 @@ public struct AccountRunner {
         public let executablePath: String
         /// Verbatim passthrough args (everything after `am run <id> --`).
         public let arguments: [String]
-        /// Child environment with the account's isolation env var injected.
+        /// Child environment with the account's isolation env var injected
+        /// (removed, for a default-login account).
         public let environment: [String: String]
         public let accountID: String
         public let provider: Provider
@@ -54,8 +58,7 @@ public struct AccountRunner {
         guard let account = try store.find(id) else { throw RunError.notFound(id) }
         guard account.status == .connected else { throw RunError.notConnected(account.status) }
 
-        let home = ManagedHome(url: account.homeURL, provider: account.provider)
-        let environment = ChildEnvironment.make(for: home, base: baseEnvironment)
+        let environment = ChildEnvironment.make(for: account, base: baseEnvironment)
         let binary = ChildEnvironment.binary(for: account.provider, environment: environment)
         guard let executablePath = ExecutableResolver.resolve(binary, environment: environment) else {
             throw RunError.binaryNotFound(binary)

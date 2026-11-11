@@ -34,7 +34,9 @@ import Darwin
 /// `CLAUDE_CONFIG_DIR` (it would run as the wrong account), or put another
 /// `claude` ahead of the provider binary on `PATH`. So the `-c` string is a
 /// constant, per-family prologue that re-asserts those three after the
-/// profile has run, followed by the user's own line verbatim. Everything
+/// profile has run, followed by the user's own line verbatim. (For an account
+/// on the provider's default login, "re-assert the home" means *unset* the
+/// isolation variable — see `ConfigHomeClause.unset`.) Everything
 /// variable — the managed home, the run's provider shim directory (one
 /// symlink, never the binary's real directory, so the profile's node/python
 /// stay first: see `ProviderShim`) — travels in namespaced
@@ -87,8 +89,26 @@ public struct LoginShell: Equatable, Sendable {
 
     /// Env var carrying the managed home into the prologue (which re-exports
     /// it as `provider.configHomeEnvKey`). Namespaced so a profile has no
-    /// reason to touch it.
+    /// reason to touch it. For a default-login account it names the default
+    /// home (`~/.claude` / `~/.codex`) — the config home the run really uses —
+    /// and the prologue doesn't read it (it unsets the isolation variable).
     public static let configHomeEnvKey = "AGENT_MANAGER_CONFIG_HOME"
+
+    /// What the prologue does about the provider's isolation variable
+    /// (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) once the profile has run. Picks
+    /// between constant clauses — no value ever enters the string either way.
+    public enum ConfigHomeClause: Sendable, Equatable {
+        /// No clause: nothing was exported to re-assert (never export empty).
+        case untouched
+        /// Managed account: re-export it from `$AGENT_MANAGER_CONFIG_HOME`.
+        case reassert
+        /// Default-login account: remove it, so the CLI uses the default login.
+        /// Claude Code picks its Keychain item from this variable — *any*
+        /// value, `~/.claude` included, selects a suffixed item and another
+        /// `.claude.json` — so absent is the only way to reach the default
+        /// login, and a profile that exports it must not win.
+        case unset
+    }
     /// Env var carrying the run's provider shim directory (`ProviderShim`:
     /// one `claude`/`codex` symlink, nothing else) into the prologue, which
     /// puts it first on `PATH`. Exported only when a binary was resolved and
@@ -181,13 +201,13 @@ public struct LoginShell: Equatable, Sendable {
     public func arguments(
         running line: String,
         provider: Provider,
-        reassertsConfigHome: Bool,
+        configHome: ConfigHomeClause,
         prependsProviderBinDir: Bool)
         -> [String]
     {
         let prologue = Self.prologue(
             family: family, provider: provider,
-            reassertsConfigHome: reassertsConfigHome,
+            configHome: configHome,
             prependsProviderBinDir: prependsProviderBinDir)
         return ["-l", "-c", prologue + line]
     }
@@ -197,6 +217,16 @@ public struct LoginShell: Equatable, Sendable {
     /// the two namespaced keys above — never from a value. Each clause is
     /// present only when the runner exported the var it reads, so a clause can
     /// never set something to empty.
+    ///
+    /// The isolation variable gets one of three constant treatments
+    /// (`ConfigHomeClause`): re-exported from `$AGENT_MANAGER_CONFIG_HOME`
+    /// (managed home), unset (default login), or left alone. Unsetting in fish
+    /// is `set -e -g`: it removes what the inherited environment or the
+    /// profile set. A *universal* `set -Ux CLAUDE_CONFIG_DIR` survives it, and
+    /// unlike an API key it can't safely be masked with an empty value (an
+    /// empty config dir is not reliably the same as unset); erasing it would delete the
+    /// user's stored setting, so that one case is left to them — such a user's
+    /// plain `claude` doesn't reach the default login either.
     ///
     /// fish needs one subtlety POSIX doesn't: a *universal* exported variable
     /// (`set -Ux ANTHROPIC_API_KEY …`, persisted in `fish_variables`) survives
@@ -210,7 +240,7 @@ public struct LoginShell: Equatable, Sendable {
     static func prologue(
         family: Family,
         provider: Provider,
-        reassertsConfigHome: Bool,
+        configHome: ConfigHomeClause,
         prependsProviderBinDir: Bool)
         -> String
     {
@@ -218,11 +248,19 @@ public struct LoginShell: Equatable, Sendable {
         var clauses: [String] = []
         switch family {
         case .posix:
-            if reassertsConfigHome { clauses.append("export \(home)=\"$\(configHomeEnvKey)\"") }
+            switch configHome {
+            case .untouched: break
+            case .reassert: clauses.append("export \(home)=\"$\(configHomeEnvKey)\"")
+            case .unset: clauses.append("unset \(home)")
+            }
             for key in provider.apiKeyEnvironmentKeys { clauses.append("unset \(key)") }
             if prependsProviderBinDir { clauses.append("export PATH=\"$\(providerBinDirEnvKey):$PATH\"") }
         case .fish:
-            if reassertsConfigHome { clauses.append("set -gx \(home) $\(configHomeEnvKey)") }
+            switch configHome {
+            case .untouched: break
+            case .reassert: clauses.append("set -gx \(home) $\(configHomeEnvKey)")
+            case .unset: clauses.append("set -e -g \(home)")
+            }
             for key in provider.apiKeyEnvironmentKeys {
                 clauses.append("set -e -g \(key)")
                 clauses.append("set -q \(key); and set -gx \(key)")

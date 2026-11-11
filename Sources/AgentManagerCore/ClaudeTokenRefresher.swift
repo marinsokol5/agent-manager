@@ -39,9 +39,56 @@ public enum ClaudeTokenRefresher {
         return resets > now
     }
 
-    public static func run(
+    /// Everything that decides *where* a refresh runs, for one account: the
+    /// binary, the environment, and the working directory.
+    ///
+    /// The working directory is part of the contract, not a detail. A refresh
+    /// drives the TUI and answers its trust dialog with Enter, and the CLI
+    /// records that answer in the config it is running under. Left to inherit
+    /// the caller's cwd, that is `/` for the app and for the scheduler's
+    /// children — and a trusted parent folder suppresses the dialog for every
+    /// folder beneath it. Inside a managed home that was merely sloppy; for a
+    /// default-login account (`CLAUDE_CONFIG_DIR` unset) the same keystroke
+    /// would trust `/` in the user's real `~/.claude.json` and switch off
+    /// Claude Code's trust prompt everywhere, desktop app included. So the
+    /// refresh runs where the account's pings run
+    /// (`AccountPinger.workingDirectory`): the managed home, or the workspace
+    /// root for a default-login account.
+    public struct LaunchSpec: Sendable, Equatable {
+        public let binary: String
+        public let environment: [String: String]
+        public let workingDirectory: URL
+    }
+
+    /// Pure: the launch spec for `account`. The environment comes from the
+    /// account-aware builder, so a managed account gets its isolation variable
+    /// and a default-login account has it removed.
+    public static func launchSpec(
+        for account: Account,
+        workspace: Workspace,
+        base: [String: String] = ProcessInfo.processInfo.environment) -> LaunchSpec
+    {
+        let environment = ChildEnvironment.make(for: account, base: base)
+        return LaunchSpec(
+            binary: ChildEnvironment.binary(for: account.provider, environment: environment),
+            environment: environment,
+            workingDirectory: AccountPinger.workingDirectory(for: account, workspace: workspace))
+    }
+
+    /// Run the delegated refresh for `account` — the only entry point callers
+    /// should use, so none can launch it with a hand-built environment or
+    /// without a working directory.
+    public static func run(for account: Account, workspace: Workspace, timeout: TimeInterval = 30) -> Result {
+        let spec = launchSpec(for: account, workspace: workspace)
+        return run(
+            binary: spec.binary, environment: spec.environment,
+            workingDirectory: spec.workingDirectory, timeout: timeout)
+    }
+
+    static func run(
         binary: String,
         environment: [String: String],
+        workingDirectory: URL,
         timeout: TimeInterval = 30)
         -> Result
     {
@@ -51,7 +98,7 @@ public enum ClaudeTokenRefresher {
             // folders under our name — see `Provider.sandboxOptOutArguments`.
             session = try PTYSession(
                 binary: binary, arguments: Provider.claude.sandboxOptOutArguments,
-                environment: environment)
+                environment: environment, workingDirectory: workingDirectory)
         } catch PTYSession.SpawnError.binaryNotFound {
             return Result(ok: false, detail: "claude binary not found on PATH")
         } catch let PTYSession.SpawnError.launchFailed(message) {

@@ -7,7 +7,10 @@ import SwiftUI
 /// anywhere on the header (or the chevron on the right) to expand a drawer that
 /// holds every action — Ping/Launch/Log in plus the management menu — and a
 /// small metadata block. Ping/Launch are disabled unless the account is
-/// `Connected` (matching the design's state machine).
+/// `Connected` (matching the design's state machine). An account on the
+/// provider's default login (`Account.tracksDefaultLogin`) offers exactly the
+/// same actions — they run against the default login — and carries a
+/// "Default login" tag plus a one-line note saying so.
 struct AccountRowView: View {
     @Bindable var model: AppModel
     let account: Account
@@ -26,6 +29,11 @@ struct AccountRowView: View {
 
     private var isBusy: Bool { model.busyAccountIDs.contains(account.id) }
     private var isConnected: Bool { account.status == .connected }
+    private var isDefaultLogin: Bool { account.tracksDefaultLogin }
+    /// The home this row presents: the config home the CLI really uses — the
+    /// default home for a default-login account (its managed `homes/<id>` is
+    /// unused), else the managed home.
+    private var shownHomePath: String { account.configHomeURL().path }
     /// Single-open accordion driven by the model, so the sidebar (and other rows)
     /// can collapse this one and expand another.
     private var isExpanded: Bool { model.expandedAgentID == account.id }
@@ -48,7 +56,9 @@ struct AccountRowView: View {
             Button("Remove & delete home", role: .destructive) { model.remove(account, purge: true) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The managed home is at \(account.home).")
+            Text(isDefaultLogin
+                ? "Only this agent's entry is removed (and, with “delete home”, its leftover managed home at \(account.home), if any). Your default \(account.provider.displayName) login and \(abbreviatingHome(shownHomePath)) are never touched."
+                : "The managed home is at \(account.home).")
         }
         .sheet(isPresented: $showingLogin) {
             LoginSheet(model: model, account: account)
@@ -81,6 +91,16 @@ struct AccountRowView: View {
                         .padding(.vertical, 1)
                         .background(Color.primary.opacity(0.06))
                         .clipShape(Capsule())
+                    if isDefaultLogin {
+                        Text("Default login")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.accent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Theme.accent.opacity(0.12))
+                            .clipShape(Capsule())
+                            .help("Uses your default \(account.provider.displayName) login — the same one as \(account.provider.defaultLoginClients)")
+                    }
                 }
                 HStack(spacing: 6) {
                     Text(account.id)
@@ -204,7 +224,7 @@ struct AccountRowView: View {
                 Button { showingEdit = true } label: {
                     Label("Edit", systemImage: "pencil")
                 }
-                .help("Edit this agent's label, color, and refresh settings")
+                .help("Edit this agent's label, color, refresh settings, and where its login lives")
                 Button { model.togglePinned(account) } label: {
                     Label(account.pinned ? "Unpin from menu bar" : "Pin to menu bar",
                           systemImage: account.pinned ? "pin.slash" : "pin")
@@ -222,11 +242,15 @@ struct AccountRowView: View {
                 Button { model.verify(account) } label: {
                     Label("Verify identity", systemImage: "checkmark.shield")
                 }
-                .help("Check the logged-in identity still matches this account")
+                .help(isDefaultLogin
+                    ? "Check your default login is still signed in as this account"
+                    : "Check the logged-in identity still matches this account")
                 Button { model.revealHome(account) } label: {
                     Label("Reveal home in Finder", systemImage: "folder")
                 }
-                .help("Open this agent's managed config home (\(account.home)) in Finder")
+                .help(isDefaultLogin
+                    ? "Open your default config home (\(shownHomePath)) in Finder"
+                    : "Open this agent's managed config home (\(account.home)) in Finder")
                 Button(role: .destructive) { confirmingRemove = true } label: {
                     Label("Remove", systemImage: "trash")
                 }
@@ -234,6 +258,15 @@ struct AccountRowView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+
+            if isDefaultLogin {
+                Label("Runs and pings use your default \(account.provider.displayName) login. Its config folder is "
+                    + "your own \(abbreviatingHome(shownHomePath)), which Agent Manager never modifies or removes.",
+                    systemImage: "person.crop.circle")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             usageSection
 
@@ -258,10 +291,12 @@ struct AccountRowView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
 
-            touchRow("house", "Config home", abbreviatingHome(account.home))
+            touchRow("house", isDefaultLogin ? "Default home" : "Config home", abbreviatingHome(shownHomePath))
             touchRow("key.horizontal", credentialLabel, credentialValue)
 
-            Text("All local. Tokens never leave this Mac, and your default \(account.provider.displayName) login is never modified or swapped.")
+            Text(isDefaultLogin
+                ? "All local. Tokens never leave this Mac; Agent Manager only reads your default \(account.provider.displayName) login, and anything that changes it is the official CLI, as with a plain \(account.provider.cliBinaryName)."
+                : "All local. Tokens never leave this Mac, and your default \(account.provider.displayName) login is never modified or swapped.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -300,9 +335,12 @@ struct AccountRowView: View {
     private var credentialValue: String {
         switch account.provider {
         case .claude:
+            if isDefaultLogin { return account.effectiveKeychainService ?? "Claude Code-credentials" }
             return account.keychainService ?? "Claude Code-credentials (this home)"
         case .codex:
-            return "\(account.provider.identityFileName) (in home)"
+            return isDefaultLogin
+                ? "\(account.provider.identityFileName) (in default home)"
+                : "\(account.provider.identityFileName) (in home)"
         }
     }
 
@@ -450,7 +488,7 @@ struct AccountRowView: View {
             GridRow {
                 metaLabel("Home")
                 HStack(spacing: 6) {
-                    Text(abbreviatingHome(account.home))
+                    Text(abbreviatingHome(shownHomePath))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -462,7 +500,9 @@ struct AccountRowView: View {
                             .foregroundStyle(copiedHome ? Theme.success : Color.secondary)
                     }
                     .buttonStyle(.borderless)
-                    .help("Copy this agent's home path, shell-escaped to cd into")
+                    .help(isDefaultLogin
+                        ? "Copy your default home's path, shell-escaped to cd into"
+                        : "Copy this agent's home path, shell-escaped to cd into")
                 }
             }
             GridRow {
@@ -539,7 +579,7 @@ struct AccountRowView: View {
     /// space and any metacharacters paste cleanly to cd into) and flash a check.
     private func copyHomePath() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(account.homeShellQuoted, forType: .string)
+        NSPasteboard.general.setString(shownHomePath.singleQuotedForShell, forType: .string)
         copiedHome = true
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.2))

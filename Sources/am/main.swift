@@ -194,7 +194,9 @@ func execReplacing(path: String, arguments: [String], environment: [String: Stri
 /// (its menu-bar/identity color); the status icon + word (e.g. `✅ connected`)
 /// carry connection state. Every managed home lives under one workspace root, so
 /// that root is printed once at the top rather than repeated on each row. An
-/// account whose ping method overrides its provider's ends in `[ping: <method>]`.
+/// account on the provider's default login (it runs against `~/.claude` /
+/// `~/.codex`, not a managed home) is marked `[default login]`, and one whose
+/// ping method overrides its provider's ends in `[ping: <method>]`.
 func runList(_ args: [String]) {
     let color = !hasFlag("--no-color", in: args) && isatty(STDOUT_FILENO) != 0
     do {
@@ -212,7 +214,8 @@ func runList(_ args: [String]) {
                 ? ""
                 : "  [ping: \(prefs.pingMethod(forAccount: account.id, provider: account.provider).rawValue)]"
             let provider = account.provider.rawValue.padding(toLength: 6, withPad: " ", startingAt: 0)
-            print("\(i + 1). \(TerminalColor.dot(hex: account.color, color: color))  \(account.id.padding(toLength: 16, withPad: " ", startingAt: 0)) \(provider)  \(statusIcon(account.status)) \(account.status.rawValue)\(email)\(method)")
+            let login = account.tracksDefaultLogin ? "  [default login]" : ""
+            print("\(i + 1). \(TerminalColor.dot(hex: account.color, color: color))  \(account.id.padding(toLength: 16, withPad: " ", startingAt: 0)) \(provider)  \(statusIcon(account.status)) \(account.status.rawValue)\(email)\(login)\(method)")
         }
     } catch {
         fail("\(error)")
@@ -293,7 +296,7 @@ func runUsage(_ args: [String]) async {
         var rows: [UsageReportRenderer.Row] = []
         for account in targets {
             do {
-                let reading = try await UsageService.fetch(account: account, gate: gate, allowInteraction: true, log: netLog)
+                let reading = try await UsageService.fetch(account: account, gate: gate, allowInteraction: true, workspace: workspace, log: netLog)
                 rows.append(.init(account: account, reading: reading))
             } catch {
                 rows.append(.init(account: account, reading: nil, error: shortUsageError(error)))
@@ -306,7 +309,7 @@ func runUsage(_ args: [String]) async {
 
     let account = targets[0]
     do {
-        let reading = try await UsageService.fetch(account: account, gate: gate, allowInteraction: true, log: netLog)
+        let reading = try await UsageService.fetch(account: account, gate: gate, allowInteraction: true, workspace: workspace, log: netLog)
         print(UsageReportRenderer.render(account: account, reading: reading, clockStyle: clockStyle, color: color))
     } catch {
         print(UsageReportRenderer.renderError(account: account, message: shortUsageError(error), color: color))
@@ -506,7 +509,7 @@ func runPing(_ args: [String]) async {
             post = try? await UsageService.fetch(
                 account: account, gate: UsageRateLimitGate(workspace: workspace),
                 allowInteraction: false, cachedReading: preReading,
-                log: NetworkLog(workspace: workspace))
+                workspace: workspace, log: NetworkLog(workspace: workspace))
             if let post { saveUsageReading(post, for: id, in: cacheStore) }
         }
         switch AnchorVerification.classify(

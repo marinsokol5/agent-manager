@@ -74,14 +74,7 @@ public struct AccountProvisioner {
 
         // Managed home.
         let homeURL = workspace.managedHome(forAccountID: options.id)
-        let home = ManagedHome(url: homeURL, provider: options.provider, fileManager: fileManager)
-        do {
-            try home.create()
-        } catch {
-            audit.append(accountID: options.id, action: "home.create", ok: false, detail: error.localizedDescription)
-            throw ProvisionError.homeCreationFailed(error.localizedDescription)
-        }
-        audit.append(accountID: options.id, action: "home.create", ok: true, detail: homeURL.path)
+        try createHome(id: options.id, provider: options.provider, at: homeURL)
 
         // Resolve the source home up front (default `~/.claude` / `~/.codex`, or a
         // caller override for a separate work/personal config) so we both farm
@@ -107,24 +100,53 @@ public struct AccountProvisioner {
             keychainService: keychainService)
         try store.insert(account)
 
-        // Symlink farm from the source home.
+        try furnishHome(id: options.id, provider: options.provider, sourceHome: sourceHome, managedHome: homeURL)
+        return account
+    }
+
+    /// Lay down a managed home for an *existing* account that has none — the
+    /// switch from the default login back to a managed one
+    /// (`DefaultLoginAccounts.useManagedLogin`) for an account that was created
+    /// tracking the default login and so never had one. A home that already
+    /// exists (an account converted earlier, whose managed home was left on
+    /// disk on purpose) is only topped up: missing links are added, and the
+    /// seeder keeps an existing `.claude.json`.
+    public func prepareHome(for account: Account) throws {
+        let homeURL = account.homeURL
+        try createHome(id: account.id, provider: account.provider, at: homeURL)
+        let homeDirectory = fileManager.homeDirectoryForCurrentUser
+        let sourceHome = URL(fileURLWithPath: account.effectiveSourceHome(homeDirectory: homeDirectory), isDirectory: true)
+        try furnishHome(id: account.id, provider: account.provider, sourceHome: sourceHome, managedHome: homeURL)
+    }
+
+    private func createHome(id: String, provider: Provider, at homeURL: URL) throws {
+        let home = ManagedHome(url: homeURL, provider: provider, fileManager: fileManager)
+        do {
+            try home.create()
+        } catch {
+            audit.append(accountID: id, action: "home.create", ok: false, detail: error.localizedDescription)
+            throw ProvisionError.homeCreationFailed(error.localizedDescription)
+        }
+        audit.append(accountID: id, action: "home.create", ok: true, detail: homeURL.path)
+    }
+
+    /// Symlink farm from the source home, then (Claude) the `.claude.json` seed.
+    private func furnishHome(id: String, provider: Provider, sourceHome: URL, managedHome homeURL: URL) throws {
         if fileManager.fileExists(atPath: sourceHome.path) {
-            let farm = SymlinkFarm(provider: options.provider, sourceHome: sourceHome, managedHome: homeURL, fileManager: fileManager)
+            let farm = SymlinkFarm(provider: provider, sourceHome: sourceHome, managedHome: homeURL, fileManager: fileManager)
             let report = try farm.apply()
-            audit.append(accountID: options.id, action: "symlink.farm", ok: report.failures.isEmpty, detail: report.summary)
+            audit.append(accountID: id, action: "symlink.farm", ok: report.failures.isEmpty, detail: report.summary)
         } else {
-            audit.append(accountID: options.id, action: "symlink.farm", ok: true, detail: "source home \(sourceHome.path) absent; skipped")
+            audit.append(accountID: id, action: "symlink.farm", ok: true, detail: "source home \(sourceHome.path) absent; skipped")
         }
 
         // Seed a clean `.claude.json` so the one-time login skips onboarding/trust.
-        if options.provider == .claude {
+        if provider == .claude {
             let seeded = ClaudeConfigSeeder.seed(
                 sourceHome: sourceHome, managedHome: homeURL, fileManager: fileManager)
             audit.append(
-                accountID: options.id, action: "config.seed", ok: true,
+                accountID: id, action: "config.seed", ok: true,
                 detail: seeded ? "seeded .claude.json (onboarding done, managed home trusted)" : "kept existing .claude.json")
         }
-
-        return account
     }
 }

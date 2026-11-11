@@ -11,7 +11,11 @@ own paid Claude Code and Codex accounts as parallel, isolated, scheduled work
 capacity. Each account gets its own managed config home (`CLAUDE_CONFIG_DIR` /
 `CODEX_HOME`), so you can run several accounts concurrently without touching your
 default login, see live usage per account, and (optionally) schedule pings that
-anchor each account's rolling 5-hour window inside your workday.
+anchor each account's rolling 5-hour window inside your workday. An account can
+instead **use the provider's default login as its home** (`AccountLoginSource`,
+see "Default-login accounts" under Gotchas) — a full account (runs, pings,
+scheduling) whose CLI runs with no isolation variable, exactly like a plain
+`claude` / `codex`.
 
 It is a single Swift package targeting **macOS 14+**, built with **Swift 6** and
 strict concurrency.
@@ -103,14 +107,27 @@ design follows from them.
    *read* credentials the official CLI wrote; we never write or relay them.
    The one narrow carve-out is the `custom` ping method: it runs the user's
    *own* executable instead of driving the CLI ourselves. It gets exactly the
-   environment the built-in drivers get (managed home, API keys stripped), we
+   environment the built-in drivers get (the account's home, API keys
+   stripped), we
    never inspect or relay any credential for it, and whether it anchored is
    still decided only from usage (`AnchorVerification`) — see
    `CustomPingRunner`.
 3. **Isolated homes, never credential-swap.** Each account is its own managed
    `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. We never mutate the user's global default
-   login. The one identity file per provider (`.claude.json` / `auth.json`) stays
-   real and per-account; everything else is symlinked from the shared source home.
+   login ourselves. The one identity file per provider (`.claude.json` /
+   `auth.json`) stays real and per-account; everything else is symlinked from
+   the shared source home. The opt-in exception is a **default-login account**
+   (`Account.tracksDefaultLogin`): its home *is* the default one, and we run
+   the official CLI against it exactly as the user would — the isolation
+   variable **removed** from the child environment (`ChildEnvironment.make(for:base:)`,
+   the only builder runners may use), never set to `~/.claude`. We still never
+   write the credential, and never write, seed, symlink into, or delete any of
+   the default home's files ourselves (`~/.claude`, `~/.claude.json`, the
+   `Claude Code-credentials` item, `~/.codex`) — whatever changes there is the
+   official CLI's doing, as with a plain `claude`. `Account.home` stays a
+   managed `homes/<id>` path even then, precisely so that every writer of
+   `home` (provisioner, symlink farm, seeder, remove/purge) can never be aimed
+   at `~/.claude`.
 4. **Local-only. No backend, no telemetry, no analytics.** Network calls go
    only to the *official* provider endpoints (`api.anthropic.com`,
    `chatgpt.com`), mirroring the real CLI's requests. Two kinds exist:
@@ -138,8 +155,12 @@ design follows from them.
    behind a **constant**, per-family prologue that only names env vars we own
    and references their values (`$AGENT_MANAGER_CONFIG_HOME`,
    `$AGENT_MANAGER_PROVIDER_BIN_DIR`) — no value of ours is ever interpolated
-   into it. Keep it that way: anything new the prologue needs travels as an
-   env var, never as text.
+   into it. For a default-login account the home clause is the constant
+   `unset CLAUDE_CONFIG_DIR` / `set -e -g CLAUDE_CONFIG_DIR` instead
+   (`LoginShell.ConfigHomeClause`). Keep it that way: anything new the
+   prologue needs travels as an env var, never as text. `TerminalLauncher`'s
+   default-login line is likewise constants only
+   (`/usr/bin/env -u CLAUDE_CONFIG_DIR claude /login`).
 6. **Account IDs are filesystem-safe slugs.** Validate with `AccountID.validate`
    (`[A-Za-z0-9_-]`) before an ID is used as a directory name, launchd label, or
    plist path. This is what makes path/XML interpolation safe — keep new code
@@ -183,7 +204,11 @@ design follows from them.
 (`~/Library/Application Support/AgentManager` in production):
 
 - `accounts.json` — account inventory (metadata + identity email + keychain
-  service name; **no secrets**).
+  service name; **no secrets**). Optional `loginSource: "providerDefault"`
+  marks an account whose home is the provider's default login; the key
+  is omitted while `managed` (`Account.encode(to:)`), so inventories that
+  predate it re-encode byte-identically, and a missing or unknown value
+  decodes as `managed`.
 - `schedule.json` — painted work hours + window length + planner knobs
   (parallel lanes, minimum budget-slice length, and the optional
   `firstPingOfDayOnly` mode — keep only each account's earliest ping per
@@ -243,7 +268,13 @@ design follows from them.
   npm/pip or contacts a package registry — it only *resolves* what's there.
 - `audit.log.jsonl`, `activity.jsonl`, `network.jsonl` — the three local logs
   shown in Monitoring.
-- `homes/<id>/` — the managed config home per account (created `0o700`).
+- `homes/<id>/` — the managed config home per account (created `0o700`). A
+  default-login account may have none (created that way) or an unused one
+  (converted — kept on disk so switching back works); it is laid down on the
+  switch back to managed (`AccountProvisioner.prepareHome`). Its runs use the
+  default home instead, so their session history lands in the user's own
+  `~/.claude/projects` (pings under the workspace root's project — the cwd
+  `AccountPinger.workingDirectory` picks for them).
 - The **single** scheduler LaunchAgent — a KeepAlive daemon (`am scheduler run`)
   that fires every account's pings from an in-process queue (`SchedulerDaemon`) —
   in one of two flavors (same launchd label, never both; `Scheduler` picks the
@@ -267,7 +298,10 @@ design follows from them.
 
 Secrets are *not* among these: Claude's token stays in the login Keychain
 (read-only, keyed by config-dir hash); Codex's tokens stay in the per-account
-`auth.json` the CLI wrote inside the `0o700` home.
+`auth.json` the CLI wrote inside the `0o700` home. A default-login account
+reads the unsuffixed `Claude Code-credentials` item / `~/.codex/auth.json`
+instead (`Account.effectiveKeychainService` / `configHomeURL`) — the ones the
+CLI uses with the isolation variable unset.
 
 ## Runbook: what happened last night?
 
@@ -479,7 +513,8 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   instruction about a different interpreter than the one that will run.
 
   `custom` runs the user's own command (say a daily eval) as the anchoring
-  turn, under the account's managed home, with `AGENT_MANAGER_ACCOUNT_ID`,
+  turn, under the account's home (managed, or the default login with the
+  isolation variable unset), with `AGENT_MANAGER_ACCOUNT_ID`,
   `AGENT_MANAGER_PROVIDER`, and the resolved provider binary
   (`AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN`) added, and a
   per-run shim directory first on `PATH` (`ProviderShim`: one `claude` /
@@ -497,9 +532,12 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   `fish` are supported; anything else fails as never launched. The prologue
   exists because the profile runs *after* we set the environment and can
   re-export `ANTHROPIC_API_KEY` (API billing — the window never anchors) or
-  `CLAUDE_CONFIG_DIR` (wrong account): it re-asserts the managed home, the
-  API-key removal, and the shim directory first on `PATH` — once, after the
-  profile and before the line. That is all it guarantees: a zsh/fish the line
+  `CLAUDE_CONFIG_DIR` (wrong account): it re-asserts the managed home (for a
+  default-login account: unsets the variable — `AGENT_MANAGER_CONFIG_HOME`
+  then names the default home, for information only; a fish *universal*
+  `-Ux CLAUDE_CONFIG_DIR` survives that, by design, rather than erasing the
+  user's stored value), the API-key removal, and the shim directory first on
+  `PATH` — once, after the profile and before the line. That is all it guarantees: a zsh/fish the line
   starts (a `#!/bin/zsh` script, `fish -c`) re-reads `.zshenv` /
   `config.fish`, and profile-installed `cd` hooks (mise's `--on-variable PWD`
   handler fires even in non-interactive fish, direnv) can change the
@@ -615,6 +653,58 @@ readings (`resets_at` is exact) and observed/scheduled anchor events
   (`SchedulerDaemon.exactWindowPredates`), never allow a clock tolerance —
   flooring can put an implied anchor a full quantum before the turn that caused
   it, and a tolerance compare reads those real anchors as phantoms.
+- **Default-login accounts: a full account whose home is the default one.**
+  Why they exist: the owner moved to the Claude desktop app, which signs in
+  the *default* login; their main account's managed login went unused, Claude
+  Code ended it at its time limit, and usage tracking died while the default
+  login stayed fresh. So an account may use the default login as its home
+  (`AccountLoginSource.providerDefault`) — and then everything works for it
+  exactly as for a managed account: `am run <id>` *is* a plain `claude`, every
+  ping method, scheduling, Test ping, the window-gated delegated `/status`
+  refresh, cloud routines (`CloudFallbackEngine.keychainAuth` reads the
+  default item + `~/.claude.json`'s org), terminal login / "Log in again", and
+  per-account ping overrides. The mechanism is one rule:
+  **the isolation variable is removed, never set to the default path.**
+  Claude Code derives its Keychain item from `CLAUDE_CONFIG_DIR` — set to
+  anything (`~/.claude` included) it uses `Claude Code-credentials-<hash>` and
+  `<dir>/.claude.json`; only unset does it use `Claude Code-credentials` and
+  `~/.claude.json`, the login the desktop app keeps fresh. So every runner
+  builds its child env with `ChildEnvironment.make(for: Account, base:)`
+  (managed → path injected; default → variable stripped, inherited value
+  included); the `ManagedHome` overload is internal, for the guided login of
+  a freshly provisioned home only. The login-shell prologue unsets it after
+  the profile (`LoginShell.ConfigHomeClause.unset`), `TerminalLauncher` runs
+  `/usr/bin/env -u …`. Reads go through `Account.effectiveKeychainService` /
+  `configHomeURL` / `identityFileURL` (never `keychainService` / `homeURL`
+  directly in a reader). What is *different* from a managed account, on
+  purpose: no isolation (it shares the default login with the desktop app
+  and a plain CLI — a ping or a `/status` refresh there is a turn / refresh
+  of *that* login, possibly racing the desktop app's own refresh, exactly as
+  running `claude` by hand would); session history lands in the user's real
+  `~/.claude/projects`; pings run in the workspace root
+  (`AccountPinger.workingDirectory`) because the managed home may not exist
+  and no folder is pre-trusted for it — the PTY driver dismisses Claude's
+  trust dialog on the first run and the CLI remembers it; and we never
+  provision, farm, reconcile, seed (`ClaudeConfigSeeder` never touches
+  `~/.claude.json`), or delete anything there — remove/purge only deletes
+  `homes/<id>`. Usage errors are the managed ones; only the two whose *text*
+  would mislead are reworded (`UsageFetchError.adapted(for:)` →
+  `.defaultLoginSignedOut` / `.defaultLoginTokenRevoked`), naming both
+  routes: the desktop app / plain CLI, and `am run <id>` (+ `/login` or
+  `login`) — they now sign in the same login. A Codex token is still never
+  refreshed by us (hard rule 2): an aged default token reports the server's
+  `token_expired` verdict just like a managed one. One per provider
+  (`AccountStoreError.defaultLoginTaken`, checked in `AccountStore.insert` /
+  `upsert`). Adding / converting / re-verifying is `DefaultLoginAccounts`:
+  a user action, so the Keychain read is interactive (which also records the
+  `/usr/bin/security` grant for silent background polls), pointing an account
+  at a default login signed in as a different email is refused
+  (`checkIdentity`) — never silently adopted — and Verify identity (also
+  after a terminal login) re-checks the default credential + identity file,
+  not the unused managed home (`reverify`). Switching back to managed keeps
+  the managed home and re-checks its own Keychain item (a blanked one reads
+  `expired`). Note Claude's default identity file is `~/.claude.json`,
+  *beside* `~/.claude` (`Provider.defaultIdentityFile`).
 - **Missing menu-bar item after running a dev *and* a packaged build.** If the
   status item doesn't appear even though the app is running and `menuBarMode`
   isn't `.hidden`, suspect a stale ControlCenter record, not the code. Running a

@@ -224,6 +224,37 @@ final class SchedulerDaemonTests: XCTestCase {
                       "excluded account leaked into the queue: \(status?.upcoming ?? [])")
     }
 
+    /// A connected account on the default login is queued and pinged like any
+    /// other — it is a full account whose home happens to be the default one.
+    /// Its user-set `excludedFromScheduling` still keeps it out, exactly as for
+    /// a managed account.
+    func testDefaultLoginAccountIsQueuedLikeAnyOtherUnlessExcluded() async throws {
+        let ws = try seedWorkspace(ids: ["a1", "a2"])
+        let store = AccountStore(workspace: ws)
+        var a2 = try XCTUnwrap(store.find("a2"))
+        a2.loginSource = .providerDefault
+        try store.upsert(a2)
+
+        let clock = TestClock(date(2026, 7, 6, 4, 50))
+        let recorder = PingRecorder()
+        let daemon = makeDaemon(ws, clock: clock, recorder: recorder)
+        _ = await daemon.tick()
+        let queued = SchedulerStatusStore(workspace: ws).load()?.upcoming.map(\.accountID) ?? []
+        XCTAssertTrue(queued.contains("a2"), "default-login account missing from the queue: \(queued)")
+
+        // Excluded by the user → gone from the queue, like a managed account.
+        a2.excludedFromScheduling = true
+        try store.upsert(a2)
+        clock.now = date(2026, 7, 6, 4, 55)
+        _ = await daemon.tick()
+        let status = SchedulerStatusStore(workspace: ws).load()
+        XCTAssertTrue(status?.upcoming.allSatisfy { $0.accountID == "a1" } ?? false,
+                      "excluded default-login account still queued: \(status?.upcoming ?? [])")
+        clock.now = date(2026, 7, 6, 5, 0, 30)
+        _ = await daemon.tick()
+        XCTAssertEqual(recorder.requests, [.init(accountID: "a1", scheduledFor: date(2026, 7, 6, 5, 0))])
+    }
+
     func testInactiveDaemonFiresNothing() async throws {
         let ws = try seedWorkspace(active: false)
         let clock = TestClock(date(2026, 7, 6, 5, 0, 30))

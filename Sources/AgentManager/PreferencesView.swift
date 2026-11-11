@@ -373,7 +373,7 @@ private extension PingMethod {
             return "Install the \(sdk) once: \(setupCommand ?? "")"
         case .custom:
             let home = provider == .claude ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"
-            return "Runs your own executable — say a daily eval — with \(home) set to the account's home, so real work anchors the window. Arguments only — or, if you tick it, run through your login shell."
+            return "Runs your own executable — say a daily eval — with \(home) set to the account's home (unset for an account on your default login), so real work anchors the window. Arguments only — or, if you tick it, run through your login shell."
         case .routine:
             return "A one-shot claude.ai routine anchors every scheduled slot from Anthropic's cloud. No local ping runs, so a sleeping Mac still anchors."
         }

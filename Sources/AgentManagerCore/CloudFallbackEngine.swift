@@ -160,15 +160,20 @@ public struct CloudFallbackEngine: Sendable {
     }
 
     /// Background (never-prompting) auth read. See the type doc for why there
-    /// is no refresh fallback here.
+    /// is no refresh fallback here. Reads through the account's *effective*
+    /// credential location, so a default-login account's routine is managed
+    /// with the default login's token and `~/.claude.json`'s organization —
+    /// the same claude.ai account its managed home was (the conversion checks
+    /// identity), so a routine armed before a conversion is adopted, not
+    /// duplicated.
     static func keychainAuth(for account: Account) throws -> TriggerClient.Auth {
-        guard let service = account.keychainService else {
+        guard let service = account.effectiveKeychainService else {
             throw TriggerAPIError.keychainAccessDeferred
         }
         guard let blob = ClaudeCredentials.read(keychainService: service, allowInteraction: false) else {
             throw TriggerAPIError.keychainAccessDeferred
         }
-        let identity = ManagedHome(url: account.homeURL, provider: account.provider).identityFileURL
+        let identity = account.identityFileURL()
         guard let org = IdentityVerifier.readOrganizationUuid(at: identity) else {
             throw TriggerAPIError.missingOrganization
         }

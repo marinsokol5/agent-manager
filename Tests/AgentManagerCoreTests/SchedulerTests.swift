@@ -197,6 +197,23 @@ final class SchedulerTests: XCTestCase {
         XCTAssertFalse(try makeScheduler(ws, fake).deactivate().wasActive)
     }
 
+    /// An account on the provider's default login is an ordinary account to
+    /// the scheduler: connected → planned with its own lane; the user's own
+    /// `excludedFromScheduling` → left out, exactly as for a managed one.
+    func testDefaultLoginAccountIsScheduledLikeAnyOther() throws {
+        let ws = try seed(connected: ["a1"], schedule: monSchedule())
+        let store = AccountStore(workspace: ws)
+        try store.insert(Account(id: "desk", label: "desk", provider: .claude, home: ws.managedHome(forAccountID: "desk").path, rank: 1, status: .connected, loginSource: .providerDefault))
+        try store.insert(Account(id: "cx-desk", label: "cx-desk", provider: .codex, home: ws.managedHome(forAccountID: "cx-desk").path, rank: 2, status: .connected, excludedFromScheduling: true, loginSource: .providerDefault))
+        let fake = FakeLaunchctl()
+
+        let scheduler = makeScheduler(ws, fake)
+        XCTAssertEqual(try scheduler.schedulableAccounts().map(\.id), ["a1", "desk"])
+        let report = try scheduler.activate()
+        XCTAssertEqual(report.accountIDs, ["a1", "desk"])
+        XCTAssertTrue(report.accounts.allSatisfy { $0.pingsPerWeek == 2 })
+    }
+
     /// Neither the disconnected ghost nor the connected-but-excluded opt-out
     /// counts as schedulable — with no other accounts, activation is a no-op.
     func testActivateWithNoSchedulableAccountsStaysInactiveWithoutInstalling() throws {

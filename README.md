@@ -38,6 +38,23 @@ The **Source home** effectively groups accounts: everything pointing at the
 same folder shares settings and history, so you can run a few work accounts
 off one source home and your personal ones off another, fully apart.
 
+**Or use your default login instead.** If you mostly use the Claude desktop
+app (or a plain `claude` / `codex`), pick **Login → Your default login** when
+adding an account, or switch an existing one in **Edit**. That account's home
+is then your own login — `~/.claude` + the `Claude Code-credentials` Keychain
+item, or `~/.codex` — instead of a managed home that can quietly expire when
+unused. Everything else works as for any account: `am run claude-ms55` is the
+same as running `claude`, and pings, scheduling, token refresh, cloud routines,
+and Log in all work, against that login. Agent Manager runs the official CLI
+there exactly as you would (it just leaves `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
+unset); it never writes your credentials or edits, links, or deletes anything
+in your default home itself. What differs from a managed account: there is no
+isolation — it is the same login the desktop app uses, so a ping counts against
+it and its session history lands in your own `~/.claude/projects`. One such
+account per provider; switching back to the managed home is always possible
+(the managed home is kept), and switching an account to a default login
+signed in as a different email is refused.
+
 ### 2. Track usage at a glance
 
 Track each account's usage from the menu bar (
@@ -104,7 +121,8 @@ Other shells (tcsh/csh, nu, xonsh, …) aren't supported: pings fail without
 running anything, and the field says so — use an absolute path to a script
 instead. Your profile runs before your command, and Agent Manager re-applies
 its guarantees once, *after* the profile and before your line: the account's
-managed home is set again, the API key is removed again (in fish, a universal
+managed home is set again (or, on your default login, `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` is removed again), the API key is removed again (in fish, a universal
 `set -Ux` key is masked with an empty value rather than erased), and the
 `claude` / `codex` binary goes back to the front of `PATH` — just that one
 binary, through a temporary directory holding only a link to it, so the
@@ -127,7 +145,7 @@ On top of that environment it can rely on:
 
 | Variable | Value |
 | --- | --- |
-| `CLAUDE_CONFIG_DIR` / `CODEX_HOME` | the account's managed home, so `claude` / `codex` run as that account |
+| `CLAUDE_CONFIG_DIR` / `CODEX_HOME` | the account's managed home, so `claude` / `codex` run as that account — **unset** for an account on your default login, so they use that login (with **Run in my login shell**, it is unset again after your profile runs) |
 | `AGENT_MANAGER_ACCOUNT_ID` | the account id |
 | `AGENT_MANAGER_PROVIDER` | `claude` or `codex` |
 | `AGENT_MANAGER_CLAUDE_BIN` / `AGENT_MANAGER_CODEX_BIN` | the CLI binary Agent Manager would run; a bare `claude` / `codex` also resolves to it, through a per-run directory first on `PATH` that holds only that binary (its neighbours, like Homebrew's node, are not promoted) |
@@ -154,7 +172,7 @@ then keeps just its first ping of every workday.
 ## CLI reference
 
 ```
-am list                   list accounts with status + provider
+am list                   list accounts with status + provider ([default login] marks accounts on your default login)
 am run <id> [<args>]      launch a session as <id>; remaining args go to claude/codex
 am usage [<id>]           capacity for connected accounts (--week, --provider, --sort)
 ```
@@ -166,7 +184,9 @@ Everything else is doable only in the app, the CLI handles only running-related 
 - **Isolated homes.** Each account is its own `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
   under the app's folder. Only the identity file (`.claude.json` / `auth.json`) is
   real and per-account; the rest is symlinked from your real config, so accounts
-  share settings and history without stepping on each other's login.
+  share settings and history without stepping on each other's login. The one
+  exception is an account set to use your *default* login: its CLI runs with
+  no isolation variable at all, so it is your plain `claude` / `codex` login.
 - **Official tooling only.** Logins and launches run the real `claude` / `codex`
   binary. Pings use those binaries directly or through their official SDKs —
   or, with the custom method, your own command under the account's home.
@@ -205,10 +225,12 @@ Everything is under `~/Library/Application Support/AgentManager/`:
 | `preferences.json` | display preferences plus separate Claude/Codex ping methods, any per-account overrides (and the custom commands, if you set them) |
 | `sdk-ping/` | SDK helper scripts plus the SDK dependencies you install — `node_modules/` for Claude, `.venv/` for Codex (only when SDK pings are used) |
 | `audit.log.jsonl` / `activity.jsonl` / `network.jsonl` | local logs (auth headers redacted) |
-| `homes/<id>/` | per-account config home (created `0700`) |
+| `homes/<id>/` | per-account config home (created `0700`; unused by an account on your default login) |
 
 Credentials are **not** in any of these. Claude's token stays in the macOS login
-Keychain; Codex's stays in the per-account `auth.json` the official CLI wrote.
+Keychain; Codex's stays in the per-account `auth.json` the official CLI wrote
+(for a default-login account: your own `Claude Code-credentials` item or
+`~/.codex/auth.json`, which Agent Manager only reads).
 
 ## Responsible use
 

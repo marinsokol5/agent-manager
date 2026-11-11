@@ -14,11 +14,19 @@ public struct AccountSet: Codable, Sendable {
 public enum AccountStoreError: Error, Equatable, CustomStringConvertible {
     case unsupportedVersion(Int)
     case duplicateID(String)
+    /// Another account of `provider` already tracks the default login
+    /// (`AccountLoginSource.providerDefault`). One per provider: there is only
+    /// one default login, and two accounts over it would double-count it in
+    /// every usage surface and make "which account is my desktop app?" a
+    /// question with two answers.
+    case defaultLoginTaken(provider: Provider, accountID: String)
 
     public var description: String {
         switch self {
         case let .unsupportedVersion(v): "accounts.json has unsupported version \(v)"
         case let .duplicateID(id): "an account with id '\(id)' already exists"
+        case let .defaultLoginTaken(provider, accountID):
+            "'\(accountID)' already uses your default \(provider.displayName) login — only one account per provider can"
         }
     }
 }
@@ -66,9 +74,31 @@ public struct AccountStore {
         try data.write(to: fileURL, options: [.atomic])
     }
 
+    /// The account (other than `excludingID`) that already tracks `provider`'s
+    /// default login, if any. Pure, so the UI can grey out the option with the
+    /// same rule the store enforces.
+    public static func defaultLoginOwner(
+        provider: Provider, in accounts: [Account], excludingID: String? = nil) -> Account?
+    {
+        accounts.first { $0.provider == provider && $0.tracksDefaultLogin && $0.id != excludingID }
+    }
+
+    /// The store-level guard behind one-default-login-per-provider: every write
+    /// of a single account (`insert` / `upsert`) goes through it, so no flow —
+    /// app, CLI, or a future one — can persist a second one. `save` is left
+    /// unchecked on purpose: it rewrites the whole inventory (reorder, rank
+    /// normalization) and must keep working on a hand-edited file.
+    static func checkDefaultLogin(_ account: Account, against accounts: [Account]) throws {
+        guard account.tracksDefaultLogin,
+              let owner = defaultLoginOwner(provider: account.provider, in: accounts, excludingID: account.id)
+        else { return }
+        throw AccountStoreError.defaultLoginTaken(provider: account.provider, accountID: owner.id)
+    }
+
     /// Insert or replace an account by id, preserving the order of the rest.
     public func upsert(_ account: Account) throws {
         var accounts = try load()
+        try Self.checkDefaultLogin(account, against: accounts)
         if let idx = accounts.firstIndex(where: { $0.id == account.id }) {
             accounts[idx] = account
         } else {
@@ -83,6 +113,7 @@ public struct AccountStore {
         guard !accounts.contains(where: { $0.id == account.id }) else {
             throw AccountStoreError.duplicateID(account.id)
         }
+        try Self.checkDefaultLogin(account, against: accounts)
         accounts.append(account)
         try save(accounts)
     }

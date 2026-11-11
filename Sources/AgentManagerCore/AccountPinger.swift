@@ -79,8 +79,11 @@ public struct AccountPinger {
         guard let account = try store.find(id) else { throw PingError.notFound(id) }
         guard account.status == .connected else { throw PingError.notConnected(account.status) }
 
-        let home = ManagedHome(url: account.homeURL, provider: account.provider, fileManager: fileManager)
-        var environment = ChildEnvironment.make(for: home, base: baseEnvironment)
+        // Managed home injected, or — for a default-login account — the
+        // isolation variable removed, so every driver below runs against the
+        // default login exactly as a plain `claude` / `codex` would.
+        var environment = ChildEnvironment.make(for: account, base: baseEnvironment)
+        let workingDirectory = Self.workingDirectory(for: account, workspace: workspace)
         // A developer shell often exports direct-API keys. Letting those reach a
         // ping would test API billing instead of this managed subscription and,
         // for the programmatic and SDK drivers, make the comparison meaningless.
@@ -109,18 +112,18 @@ public struct AccountPinger {
             case .claude:
                 rawResult = ClaudePingRunner.run(
                     binary: binary, environment: environment,
-                    workingDirectory: home.url, timeout: timeout)
+                    workingDirectory: workingDirectory, timeout: timeout)
             case .codex:
                 rawResult = CodexPingRunner.run(
                     binary: binary, environment: environment,
-                    workingDirectory: home.url, timeout: timeout)
+                    workingDirectory: workingDirectory, timeout: timeout)
             }
         case .headless:
             rawResult = HeadlessPingRunner.run(
                 provider: account.provider,
                 binary: binary,
                 environment: environment,
-                workingDirectory: home.url,
+                workingDirectory: workingDirectory,
                 timeout: timeout,
                 fileManager: fileManager)
         case .sdk:
@@ -128,7 +131,7 @@ public struct AccountPinger {
                 provider: account.provider,
                 binary: binary,
                 environment: environment,
-                workingDirectory: home.url,
+                workingDirectory: workingDirectory,
                 workspace: workspace,
                 timeout: timeout,
                 fileManager: fileManager)
@@ -148,7 +151,8 @@ public struct AccountPinger {
                 environment: environment,
                 timeout: customTimeout,
                 fileManager: fileManager,
-                loginShell: loginShellLookup)
+                loginShell: loginShellLookup,
+                login: customLogin(for: account))
         }
         let result = ClaudePingRunner.Result(
             ok: rawResult.ok,
@@ -158,6 +162,34 @@ public struct AccountPinger {
             mayHaveRunTurns: rawResult.mayHaveRunTurns)
         audit.append(accountID: id, action: "ping", ok: result.ok, detail: result.detail)
         return result
+    }
+
+    /// Where the built-in drivers run the CLI. A managed account runs in its
+    /// own managed home — the directory `ClaudeConfigSeeder` pre-trusted, so
+    /// Claude's trust dialog never appears. A default-login account's managed
+    /// home may not exist (an account created on the default login never had
+    /// one) and the seeder never touches `~/.claude.json`, so it runs in the
+    /// workspace root instead: a directory that always exists (the inventory
+    /// was just read from it), that we own, and that keeps these runs' session
+    /// history under one project of their own in the user's `~/.claude/projects`
+    /// rather than mixed into their home directory's. Nothing is created in the
+    /// default home for it. The one-time trust dialog there is dismissed by the
+    /// PTY driver (`ClaudePingRunner`), which the official CLI then remembers in
+    /// `~/.claude.json` as it would for any folder the user trusts; headless,
+    /// SDK, and Codex runs never show one.
+    static func workingDirectory(for account: Account, workspace: Workspace) -> URL {
+        account.tracksDefaultLogin ? workspace.root : account.homeURL
+    }
+
+    /// The custom runner's view of which login this run uses — what its
+    /// login-shell prologue does about the isolation variable after the user's
+    /// profile ran. The default home is resolved from the child's own `HOME`,
+    /// the same variable the CLI resolves `~/.claude` / `~/.codex` from.
+    func customLogin(for account: Account) -> CustomPingRunner.Login {
+        guard account.tracksDefaultLogin else { return .managed }
+        let home = baseEnvironment["HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? fileManager.homeDirectoryForCurrentUser
+        return .providerDefault(configHome: account.configHomeURL(homeDirectory: home).path)
     }
 
     /// The Activity screen reads this: ✓/✗ + whether a window actually anchored.

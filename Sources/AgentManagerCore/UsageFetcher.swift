@@ -32,6 +32,18 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
     /// Thrown on background reads too, so no surface keeps showing the dead
     /// session's cached numbers as if they were live.
     case loginEnded(accountID: String, reason: String?)
+    /// `.loginEnded` for an account on the provider's **default** login
+    /// (`AccountLoginSource.providerDefault`). Same problem, but the managed
+    /// text is wrong here: it warns that the desktop app and a plain `claude`
+    /// use a *separate* login, while for this account they are the very login
+    /// it uses. Both routes fix it — the desktop app / a plain `claude`, or
+    /// `am run <id>` and `/login` — so the text names both.
+    case defaultLoginSignedOut(accountID: String, reason: String?)
+    /// `.tokenRevoked` for a default-login Codex account: the managed text
+    /// warns *against* `codex login` (it signs in `~/.codex`), which is exactly
+    /// where this account's login lives — so here it and `am run <id> login`
+    /// are both the right fix.
+    case defaultLoginTokenRevoked(accountID: String, lastRefresh: Date?)
     case rateLimited(retryAfter: Date?)
     case serverError(Int)
     /// A background read needs the Keychain prompt we won't show; keep cached
@@ -57,6 +69,10 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
             Self.tokenRevokedMessage(accountID: accountID, lastRefresh: lastRefresh)
         case let .loginEnded(accountID, reason):
             Self.loginEndedMessage(accountID: accountID, reason: reason)
+        case let .defaultLoginSignedOut(accountID, reason):
+            Self.defaultLoginSignedOutMessage(accountID: accountID, reason: reason)
+        case let .defaultLoginTokenRevoked(accountID, lastRefresh):
+            Self.defaultLoginTokenRevokedMessage(accountID: accountID, lastRefresh: lastRefresh)
         case .keychainAccessDeferred:
             "Click “Refresh usage” to allow Keychain access."
         case .refreshDeferred:
@@ -77,9 +93,48 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
     /// waiting for the cached reading to age.
     public var requiresLogin: Bool {
         switch self {
-        case .loginEnded, .tokenRevoked, .unauthorized: true
+        case .loginEnded, .tokenRevoked, .unauthorized,
+             .defaultLoginSignedOut, .defaultLoginTokenRevoked: true
         default: false
         }
+    }
+
+    /// This error as `account` should see it: for a default-login account the
+    /// two managed-home variants whose *text* sends the user to the wrong place
+    /// (`.loginEnded` says the desktop app is a separate login, `.tokenRevoked`
+    /// warns against `~/.codex`) become their default-login twins. Behavior is
+    /// identical either way — only the words differ. Every other error, and
+    /// every managed account, passes through unchanged.
+    public func adapted(for account: Account) -> UsageFetchError {
+        guard account.tracksDefaultLogin else { return self }
+        switch self {
+        case let .loginEnded(accountID, reason):
+            return .defaultLoginSignedOut(accountID: accountID, reason: reason)
+        case let .tokenRevoked(accountID, lastRefresh):
+            return .defaultLoginTokenRevoked(accountID: accountID, lastRefresh: lastRefresh)
+        default: return self
+        }
+    }
+
+    /// `.defaultLoginSignedOut`'s text: one message, both routes — they sign
+    /// in the same default login.
+    static func defaultLoginSignedOutMessage(accountID: String, reason: String?) -> String {
+        let why = reason == "time_limit"
+            ? "Claude Code ended your default login (it reached its time limit)."
+            : "Your default Claude login is signed out."
+        return why + " Log in again in \(Provider.claude.defaultLoginClients), or run “am run \(accountID)”"
+            + " and use /login — both sign in your default login, which this account uses."
+    }
+
+    /// `.defaultLoginTokenRevoked`'s text, with `now` injected for tests.
+    static func defaultLoginTokenRevokedMessage(accountID: String, lastRefresh: Date?, now: Date = Date()) -> String {
+        var message = "OpenAI revoked your default Codex login's token (token_expired). Log in again with"
+            + " \(Provider.codex.defaultLoginClients) or “am run \(accountID) login” — both sign in ~/.codex,"
+            + " which this account uses."
+        if let lastRefresh {
+            message += " ~/.codex/auth.json was last refreshed \(ageLabel(since: lastRefresh, now: now))."
+        }
+        return message
     }
 
     /// `.loginEnded`'s text. `time_limit` is the CLI's reason for a login that
@@ -146,7 +201,8 @@ enum RetryAfter {
 // MARK: - Claude
 
 /// Fetches Claude OAuth usage from `https://api.anthropic.com/api/oauth/usage`.
-/// Requires `account.keychainService` to be set (populated at login time).
+/// Requires `account.effectiveKeychainService` (the managed item, populated at
+/// login time, or the provider's default item for a default-login account).
 public enum ClaudeUsageFetcher {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private static let betaHeader = "oauth-2025-04-20"
@@ -255,7 +311,9 @@ public enum ClaudeUsageFetcher {
 // MARK: - Codex
 
 /// Fetches Codex usage from the ChatGPT backend (`/wham/usage` or `/api/codex/usage`).
-/// Reads the access token from `auth.json` in the account's managed home.
+/// Reads the access token from `auth.json` in the account's config home —
+/// the managed `CODEX_HOME`, or `~/.codex` for a default-login account
+/// (`Account.configHomeURL`), read-only either way.
 public enum CodexUsageFetcher {
     private static let defaultBaseURL = "https://chatgpt.com/backend-api"
     private static let usagePath = "/wham/usage"
@@ -269,7 +327,15 @@ public enum CodexUsageFetcher {
         if !userInitiated, let until = await gate.blockedUntil(accountID: account.id) {
             throw UsageFetchError.rateLimited(retryAfter: until)
         }
-        let authURL = account.homeURL.appendingPathComponent("auth.json")
+        // A default-login account is treated exactly like a managed one from
+        // here on, aged token included: we never refresh a Codex token
+        // ourselves (hard rule 2), so whatever the server says about it —
+        // `token_expired` → `.tokenRevoked` — is reported as for any account.
+        // Its pings and `am run` drive the official CLI against this login
+        // (`CODEX_HOME` unset), which refreshes the token as it goes, so a
+        // scheduled account ages no more than a managed one.
+        let configHome = account.configHomeURL()
+        let authURL = configHome.appendingPathComponent("auth.json")
         guard
             let blob = try? Data(contentsOf: authURL),
             let root = try? JSONSerialization.jsonObject(with: blob) as? [String: Any],
@@ -284,7 +350,7 @@ public enum CodexUsageFetcher {
             ?? (tokens["account_id"] as? String)
             ?? (root["account_id"] as? String)
 
-        let url = resolveURL(homeURL: account.homeURL)
+        let url = resolveURL(homeURL: configHome)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 30
@@ -316,6 +382,7 @@ public enum CodexUsageFetcher {
                 body: data,
                 accountID: account.id,
                 lastRefresh: (root["last_refresh"] as? String).flatMap(parseLastRefresh))
+                .adapted(for: account)
         case 429:
             // Report the *effective* block, not the raw `Retry-After` — the server
             // sends `Retry-After: 0`, so the header would read "retry now" while the

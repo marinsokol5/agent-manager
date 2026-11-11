@@ -22,6 +22,10 @@ public struct AddAccountFlow {
         public var reservedHours: Double?
         public var loginTimeout: TimeInterval
         public var openBrowser: Bool
+        /// `.providerDefault` skips steps 1–3 entirely — no managed home, no
+        /// symlink farm, no guided login — and only verifies the provider's
+        /// default login by reading it (`DefaultLoginAccounts.add`).
+        public var loginSource: AccountLoginSource
 
         public init(
             id: String,
@@ -32,7 +36,8 @@ public struct AddAccountFlow {
             rank: Int? = nil,
             reservedHours: Double? = nil,
             loginTimeout: TimeInterval = 180,
-            openBrowser: Bool = true)
+            openBrowser: Bool = true,
+            loginSource: AccountLoginSource = .managed)
         {
             self.id = id
             self.label = label
@@ -43,6 +48,7 @@ public struct AddAccountFlow {
             self.reservedHours = reservedHours
             self.loginTimeout = loginTimeout
             self.openBrowser = openBrowser
+            self.loginSource = loginSource
         }
     }
 
@@ -80,8 +86,20 @@ public struct AddAccountFlow {
         self.audit = AuditLog(workspace: workspace, fileManager: fileManager)
     }
 
+    /// `probe` is only consulted for a default-login add (injectable for tests).
     @discardableResult
-    public func run(_ options: Options, onEvent: @escaping (Event) -> Void) throws -> Account {
+    public func run(
+        _ options: Options,
+        probe: DefaultLoginProbe = .live(),
+        onEvent: @escaping (Event) -> Void) throws -> Account
+    {
+        if options.loginSource == .providerDefault {
+            let account = try DefaultLoginAccounts(workspace: workspace, fileManager: fileManager, probe: probe).add(
+                id: options.id, label: options.label, color: options.color,
+                provider: options.provider, rank: options.rank)
+            onEvent(.verified(connected: true, detail: "using your default \(options.provider.displayName) login"))
+            return account
+        }
         // 1–2. Create the account (managed home + symlink farm), persisted
         // logged-out. Add is independent of login.
         let provisioner = AccountProvisioner(workspace: workspace, fileManager: fileManager)

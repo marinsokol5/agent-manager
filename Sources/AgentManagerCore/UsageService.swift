@@ -14,12 +14,19 @@ import Foundation
 /// `.refreshDeferred` and the caller keeps its cached usage. Any future
 /// background caller must pass the account's last cached reading to get
 /// refreshes at all; omitting it means "never anchor".
+///
+/// A default-login account (`Account.tracksDefaultLogin`) goes through exactly
+/// the same path against its own login: the credential is read from the
+/// default item (`effectiveKeychainService` / `configHomeURL`), and the
+/// delegated refresh runs `claude /status` with `CLAUDE_CONFIG_DIR` unset
+/// (`ChildEnvironment.make(for:base:)`) under the same window gate.
 public enum UsageService {
     public static func fetch(
         account: Account,
         gate: UsageRateLimitGate,
         allowInteraction: Bool = true,
         cachedReading: UsageReading? = nil,
+        workspace: Workspace = .standard(),
         log: NetworkLog? = nil) async throws -> UsageReading
     {
         switch account.provider {
@@ -27,13 +34,14 @@ public enum UsageService {
             return try await CodexUsageFetcher.fetch(account: account, gate: gate, userInitiated: allowInteraction, log: log)
 
         case .claude:
-            guard let service = account.keychainService else { throw UsageFetchError.keychainReadFailed }
+            guard let service = account.effectiveKeychainService else { throw UsageFetchError.keychainReadFailed }
             var creds: ClaudeCredentials.Blob
             switch ClaudeCredentials.status(keychainService: service, allowInteraction: allowInteraction) {
             case let .valid(blob): creds = blob
             // A blanked login can't be refreshed — say so rather than spawn
             // `/status` (or report an unreadable store).
-            case let .signedOut(reason): throw UsageFetchError.loginEnded(accountID: account.id, reason: reason)
+            case let .signedOut(reason):
+                throw UsageFetchError.loginEnded(accountID: account.id, reason: reason).adapted(for: account)
             case nil: throw UsageFetchError.tokenDecodeFailed
             }
             let mayRefresh = ClaudeTokenRefresher.mayRefresh(
@@ -42,14 +50,14 @@ public enum UsageService {
                 // Expired token and no refresh allowed → don't fire the doomed
                 // 401 poll either; fail soft and keep whatever the caller has.
                 guard mayRefresh else { throw UsageFetchError.refreshDeferred }
-                if let refreshed = refreshToken(account, allowInteraction) { creds = refreshed }
+                if let refreshed = refreshToken(account, workspace, allowInteraction) { creds = refreshed }
             }
             do {
                 return try await ClaudeUsageFetcher.fetch(
                     account: account, accessToken: creds.accessToken, gate: gate, userInitiated: allowInteraction, log: log)
             } catch UsageFetchError.unauthorized {
                 guard mayRefresh else { throw UsageFetchError.refreshDeferred }
-                guard let refreshed = refreshToken(account, allowInteraction),
+                guard let refreshed = refreshToken(account, workspace, allowInteraction),
                       !ClaudeCredentials.needsRefresh(refreshed) else { throw UsageFetchError.unauthorized }
                 return try await ClaudeUsageFetcher.fetch(
                     account: account, accessToken: refreshed.accessToken, gate: gate, userInitiated: allowInteraction, log: log)
@@ -60,12 +68,11 @@ public enum UsageService {
     /// Delegated refresh: ask the Claude CLI to refresh via `/status` (no usage
     /// turn), then re-read. NOTE: this blocks (drives a PTY) — fine for the CLI's
     /// one-shot use; the menu bar runs its own refresh off the main actor.
-    private static func refreshToken(_ account: Account, _ allowInteraction: Bool) -> ClaudeCredentials.Blob? {
-        let home = ManagedHome(url: account.homeURL, provider: account.provider)
-        let env = ChildEnvironment.make(for: home)
-        let binary = ChildEnvironment.binary(for: account.provider, environment: env)
-        _ = ClaudeTokenRefresher.run(binary: binary, environment: env)
-        return account.keychainService.flatMap {
+    private static func refreshToken(
+        _ account: Account, _ workspace: Workspace, _ allowInteraction: Bool) -> ClaudeCredentials.Blob?
+    {
+        _ = ClaudeTokenRefresher.run(for: account, workspace: workspace)
+        return account.effectiveKeychainService.flatMap {
             ClaudeCredentials.read(keychainService: $0, allowInteraction: allowInteraction)
         }
     }

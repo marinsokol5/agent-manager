@@ -73,22 +73,22 @@ final class LoginShellTests: XCTestCase {
         let zsh = LoginShell(path: "/bin/zsh", family: .posix, homeDirectory: "/Users/x")
         XCTAssertEqual(
             zsh.arguments(running: "cd ~/evals && npm run eval", provider: .claude,
-                          reassertsConfigHome: true, prependsProviderBinDir: true),
+                          configHome: .reassert, prependsProviderBinDir: true),
             ["-l", "-c",
              #"export CLAUDE_CONFIG_DIR="$AGENT_MANAGER_CONFIG_HOME"; unset ANTHROPIC_API_KEY; export PATH="$AGENT_MANAGER_PROVIDER_BIN_DIR:$PATH"; cd ~/evals && npm run eval"#])
         XCTAssertEqual(
             zsh.arguments(running: "x", provider: .codex,
-                          reassertsConfigHome: true, prependsProviderBinDir: true)[2],
+                          configHome: .reassert, prependsProviderBinDir: true)[2],
             #"export CODEX_HOME="$AGENT_MANAGER_CONFIG_HOME"; unset OPENAI_API_KEY; export PATH="$AGENT_MANAGER_PROVIDER_BIN_DIR:$PATH"; x"#)
         // No binary resolved: no PATH clause (it would prepend an empty entry).
         XCTAssertEqual(
             zsh.arguments(running: "x", provider: .claude,
-                          reassertsConfigHome: true, prependsProviderBinDir: false)[2],
+                          configHome: .reassert, prependsProviderBinDir: false)[2],
             #"export CLAUDE_CONFIG_DIR="$AGENT_MANAGER_CONFIG_HOME"; unset ANTHROPIC_API_KEY; x"#)
         // No managed home in the environment: never export it empty.
         XCTAssertEqual(
             zsh.arguments(running: "x", provider: .claude,
-                          reassertsConfigHome: false, prependsProviderBinDir: false)[2],
+                          configHome: .untouched, prependsProviderBinDir: false)[2],
             "unset ANTHROPIC_API_KEY; x")
     }
 
@@ -96,12 +96,12 @@ final class LoginShellTests: XCTestCase {
         let fish = LoginShell(path: "/opt/homebrew/bin/fish", family: .fish, homeDirectory: "/Users/x")
         XCTAssertEqual(
             fish.arguments(running: "cd ~/evals; and npm run eval", provider: .claude,
-                           reassertsConfigHome: true, prependsProviderBinDir: true),
+                           configHome: .reassert, prependsProviderBinDir: true),
             ["-l", "-c",
              "set -gx CLAUDE_CONFIG_DIR $AGENT_MANAGER_CONFIG_HOME; set -e -g ANTHROPIC_API_KEY; set -q ANTHROPIC_API_KEY; and set -gx ANTHROPIC_API_KEY; set -gx PATH $AGENT_MANAGER_PROVIDER_BIN_DIR $PATH; cd ~/evals; and npm run eval"])
         XCTAssertEqual(
             fish.arguments(running: "x", provider: .codex,
-                           reassertsConfigHome: true, prependsProviderBinDir: false)[2],
+                           configHome: .reassert, prependsProviderBinDir: false)[2],
             "set -gx CODEX_HOME $AGENT_MANAGER_CONFIG_HOME; set -e -g OPENAI_API_KEY; set -q OPENAI_API_KEY; and set -gx OPENAI_API_KEY; x")
     }
 
@@ -119,14 +119,14 @@ final class LoginShellTests: XCTestCase {
         let prepared = CustomPingRunner.loginShellEnvironment(env, provider: .claude, shimDirectory: shim.path)
         XCTAssertEqual(prepared.env[LoginShell.configHomeEnvKey], hostileHome.path)
         XCTAssertEqual(prepared.env[LoginShell.providerBinDirEnvKey], shim.path)
-        XCTAssertTrue(prepared.reassertsConfigHome)
+        XCTAssertEqual(prepared.configHome, .reassert)
         XCTAssertTrue(prepared.prependsProviderBinDir)
 
         for family in [LoginShell.Family.posix, .fish] {
             for provider in Provider.allCases {
                 let prologue = LoginShell.prologue(
                     family: family, provider: provider,
-                    reassertsConfigHome: true, prependsProviderBinDir: true)
+                    configHome: .reassert, prependsProviderBinDir: true)
                 XCTAssertFalse(prologue.contains(hostileHome.path))
                 XCTAssertFalse(prologue.contains("/"), "no path of any kind in: \(prologue)")
                 // Only identifiers, `$NAME` references, and fixed punctuation.

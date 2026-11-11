@@ -1241,6 +1241,7 @@ public actor SchedulerDaemon {
                 gate: UsageRateLimitGate(workspace: workspace, fileManager: fileManager),
                 allowInteraction: false,
                 cachedReading: nil,
+                workspace: workspace,
                 log: NetworkLog(workspace: workspace))
             else { return nil }
 

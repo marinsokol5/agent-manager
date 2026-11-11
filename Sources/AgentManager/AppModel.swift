@@ -459,8 +459,80 @@ final class AppModel {
         return nil
     }
 
+    /// Add an agent whose home is the provider's *default* login
+    /// (`DefaultLoginAccounts.add`): nothing is provisioned and no login runs —
+    /// the default credential is verified (a user action, so the one Keychain
+    /// prompt may show, which also records the read grant for later silent
+    /// polls) and the agent is saved connected. Off-main because that
+    /// Keychain read can block on the prompt. Returns an error to show in the
+    /// sheet, or `nil` once the agent exists.
+    func addDefaultLoginAccount(label: String, id: String, color: String, provider: Provider) async -> String? {
+        let ws = workspace
+        let error = await offMain { () -> String? in
+            do { _ = try DefaultLoginAccounts(workspace: ws).add(id: id, label: label, color: color, provider: provider); return nil }
+            catch { return "\(error)" }
+        }
+        reload()
+        if let error { return error }
+        statusMessage = "added \(label) — on your default \(provider.displayName) login"
+        if let account = accounts.first(where: { $0.id == id }) { refreshUsage(for: account) }
+        return nil
+    }
+
+    /// The account that already tracks `provider`'s default login (other than
+    /// `excludingID`), if any — what greys out the "default login" choice in
+    /// the add/edit sheets, by the same rule the store enforces.
+    func defaultLoginOwner(for provider: Provider, excludingID: String? = nil) -> Account? {
+        AccountStore.defaultLoginOwner(provider: provider, in: accounts, excludingID: excludingID)
+    }
+
+    /// Switch an account between its managed home and the default login (the
+    /// Edit sheet's Login choice), via `DefaultLoginAccounts`. Switching to the
+    /// default verifies it (user action: may prompt once) and refuses a
+    /// different person; switching back re-verifies the managed home. Either
+    /// way the account's usage error state is reset and, if it ends up
+    /// connected, usage is refreshed from the new source. Returns the error to
+    /// show, or `nil` on success.
+    func setLoginSource(_ account: Account, to source: AccountLoginSource) async -> String? {
+        guard account.loginSource != source else { return nil }
+        let ws = workspace, id = account.id
+        // Verify / ping load-modify-save the whole account; switching under
+        // one would be silently undone by its later save (and our cleanup
+        // below would clear *its* busy flag).
+        guard !busyAccountIDs.contains(id) else {
+            return "\(account.label) is busy — try again when its current action finishes."
+        }
+        busyAccountIDs.insert(id)
+        let error = await offMain { () -> String? in
+            let accounts = DefaultLoginAccounts(workspace: ws)
+            do {
+                switch source {
+                case .providerDefault: _ = try accounts.useDefaultLogin(id)
+                case .managed: _ = try accounts.useManagedLogin(id)
+                }
+                return nil
+            } catch {
+                return "\(error)"
+            }
+        }
+        busyAccountIDs.remove(id)
+        reload()
+        if let error { return error }
+        usageErrors.removeValue(forKey: id)
+        usageLoginRequired.remove(id)
+        if let current = accounts.first(where: { $0.id == id }) {
+            statusMessage = source == .providerDefault
+                ? "\(current.label) now uses your default \(current.provider.displayName) login"
+                : "\(current.label) uses its managed home again (\(current.status.rawValue))"
+            refreshUsage(for: current)
+        }
+        return nil
+    }
+
     /// Open Terminal to log this account in, and optimistically mark it
-    /// connecting. The user verifies afterwards.
+    /// connecting. The user verifies afterwards. For a default-login account
+    /// the login runs with the isolation variable removed, so it signs in the
+    /// default login (`TerminalLauncher.loginCommand`).
     func loginInTerminal(_ account: Account) {
         guard TerminalLauncher.login(account: account) else {
             statusMessage = "could not open Terminal"
@@ -522,7 +594,10 @@ final class AppModel {
     /// per-account "Reconcile config links" button.)
     func reconcileAll() {
         let ws = workspace
-        let ids = accounts.map(\.id)
+        // A default-login account's managed home is unused (and may not
+        // exist): reconciling would create it and farm links into it for
+        // nothing. Its default home is never ours to touch.
+        let ids = accounts.filter { !$0.tracksDefaultLogin }.map(\.id)
         guard !ids.isEmpty else { return }
         Task {
             await offMain {
@@ -742,7 +817,9 @@ final class AppModel {
             return try await CodexUsageFetcher.fetch(
                 account: account, gate: usageGate, userInitiated: userInitiated, log: networkLog)
         case .claude:
-            guard let service = account.keychainService else { throw UsageFetchError.keychainReadFailed }
+            // The *effective* item: a default-login account reads the
+            // provider's unsuffixed default item (`Account.effectiveKeychainService`).
+            guard let service = account.effectiveKeychainService else { throw UsageFetchError.keychainReadFailed }
             // Read the credential ONCE. Background reads are no-UI (never prompt);
             // only a user-initiated refresh may pop the dialog.
             var credentials: ClaudeCredentials.Blob
@@ -752,7 +829,7 @@ final class AppModel {
             // background poll (this is not a deferred Keychain grant), and
             // don't try a refresh — there is no refresh token left to use.
             case let .signedOut(reason):
-                throw UsageFetchError.loginEnded(accountID: account.id, reason: reason)
+                throw UsageFetchError.loginEnded(accountID: account.id, reason: reason).adapted(for: account)
             case nil:
                 // Couldn't read silently — keep cached usage unless the user asked.
                 throw userInitiated ? UsageFetchError.tokenDecodeFailed : UsageFetchError.keychainAccessDeferred
@@ -790,7 +867,9 @@ final class AppModel {
     /// `/status`, no usage turn), gated by a per-account cooldown so a broken
     /// token can't make us spawn `claude` repeatedly. Returns the re-read
     /// credential (one Keychain read), or `nil` if skipped/unreadable. The
-    /// blocking PTY work runs off-main.
+    /// blocking PTY work runs off-main. A default-login account is refreshed
+    /// the same way, with `CLAUDE_CONFIG_DIR` unset (`ChildEnvironment.make(for:base:)`),
+    /// and re-read from the default item.
     private func refreshClaudeToken(_ account: Account, userInitiated: Bool) async -> ClaudeCredentials.Blob? {
         let id = account.id, now = Date()
         if !userInitiated, let until = claudeRefreshCooldownUntil[id], now < until { return nil }
@@ -802,16 +881,12 @@ final class AppModel {
         else { return nil }
 
         statusMessage = "\(account.label): refreshing token via Claude Code…"
-        let result = await offMain { () -> ClaudeTokenRefresher.Result in
-            let home = ManagedHome(url: account.homeURL, provider: account.provider)
-            let env = ChildEnvironment.make(for: home)
-            let binary = ChildEnvironment.binary(for: account.provider, environment: env)
-            return ClaudeTokenRefresher.run(binary: binary, environment: env)
-        }
+        let ws = workspace
+        let result = await offMain { ClaudeTokenRefresher.run(for: account, workspace: ws) }
 
         // One read to pick up the new token and judge freshness; back off 5 min on
         // success, 30 s otherwise. Background reads stay no-UI.
-        let blob = account.keychainService.flatMap {
+        let blob = account.effectiveKeychainService.flatMap {
             ClaudeCredentials.read(keychainService: $0, allowInteraction: userInitiated)
         }
         let fresh = !ClaudeCredentials.needsRefresh(blob)
@@ -821,8 +896,11 @@ final class AppModel {
         return blob
     }
 
+    /// Reveal the config home the CLI actually uses for this account — the
+    /// managed home, or the default `~/.claude` / `~/.codex` for a
+    /// default-login account (whose managed home may not even exist).
     func revealHome(_ account: Account) {
-        NSWorkspace.shared.activateFileViewerSelecting([account.homeURL])
+        NSWorkspace.shared.activateFileViewerSelecting([account.configHomeURL()])
     }
 
     /// Suggest a unique slug id from a label (for the add sheet).
@@ -848,6 +926,14 @@ final class AppModel {
     private nonisolated static func verifyAndPersist(ws: Workspace, id: String) -> String {
         let store = AccountStore(workspace: ws)
         guard var acct = (try? store.find(id)) ?? nil else { return "not found" }
+        // Default login: re-check the default credential + identity file (not
+        // the unused managed home) and that it's still the same person
+        // (`DefaultLoginAccounts.reverify`) — also what a terminal login of a
+        // default-login account is verified with.
+        if acct.tracksDefaultLogin {
+            do { return try DefaultLoginAccounts(workspace: ws).reverify(id) }
+            catch { return "\(error)" }
+        }
         let home = ManagedHome(url: acct.homeURL, provider: acct.provider)
         let result = IdentityVerifier.verify(provider: acct.provider, home: home, keychainBaseline: nil)
         AuditLog(workspace: ws).append(accountID: id, action: "verify", ok: result.connected, detail: result.detail)
@@ -864,6 +950,7 @@ final class AppModel {
 
     private nonisolated static func reconcile(ws: Workspace, id: String) -> String {
         guard let account = (try? AccountStore(workspace: ws).find(id)) ?? nil else { return "not found" }
+        guard !account.tracksDefaultLogin else { return "default login; skipped" }
         // Share from the folder this account actually tracks (its `sourceHome`,
         // default `~/.claude` / `~/.codex`), not always the provider default.
         let source = URL(fileURLWithPath: account.effectiveSourceHome(), isDirectory: true)

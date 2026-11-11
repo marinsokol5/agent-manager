@@ -13,11 +13,54 @@ public enum AccountStatus: String, Codable, Sendable {
     case expired
 }
 
+/// Where an account's login lives — the one thing that differs between the two
+/// kinds of account Agent Manager tracks.
+///
+/// `.managed` is the original model: the account owns an isolated home
+/// (`homes/<id>`, its own `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, its own Keychain
+/// item `Claude Code-credentials-<hash>`) and we drive the official CLI inside
+/// it for login, pings, and token refresh.
+///
+/// `.providerDefault` exists because of a real outage: the owner moved to the
+/// Claude desktop app, which signs in the provider's *default* login (`~/.claude`
+/// + `~/.claude.json`, Keychain item exactly `Claude Code-credentials`). The
+/// managed login of their main account then went unused, Claude Code ended it
+/// at its time limit, and usage tracking died — while the default login, the
+/// one actually in use, stayed perfectly fresh. A default-login account is a
+/// fully functional account **whose home is that default one**: `am run <id>`
+/// is the same as running a plain `claude`, and every ping method, scheduling,
+/// Test ping, the delegated `/status` refresh, cloud routines, and the
+/// terminal login all work for it exactly as for a managed account — against
+/// the default login.
+///
+/// How "the home is the default one" is implemented: the child environment has
+/// the provider's isolation variable (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`)
+/// **removed**, never set to `~/.claude`. Claude Code derives its Keychain item
+/// from that variable: when it is set — to anything, `~/.claude` included — it
+/// uses `Claude Code-credentials-<hash>` and `<dir>/.claude.json`; only with it
+/// unset does it use the unsuffixed `Claude Code-credentials` and
+/// `~/.claude.json`, the login the desktop app keeps fresh. See
+/// `ChildEnvironment.make(for:base:)`, the one place that decides it.
+///
+/// What stays different, on purpose: we never provision, symlink, seed, or
+/// delete anything in the default home ourselves (hard rule 3) — only the
+/// official CLI we run writes there, as it would for the user.
+public enum AccountLoginSource: String, Codable, Sendable, CaseIterable {
+    case managed
+    case providerDefault
+}
+
 /// A managed, isolated agent account.
 ///
 /// `home` is the account's `CLAUDE_CONFIG_DIR` (a directory under the app's
 /// managed `homes/`). `id` is a filesystem-safe slug used both as the account
-/// key and as the managed-home directory name.
+/// key and as the managed-home directory name. `home` stays that managed path
+/// even for a default-login account (`loginSource == .providerDefault`): lots
+/// of code writes into or deletes `home` (provisioner, symlink farm, config
+/// seeder, remove-account), so pointing it at `~/.claude` would aim all of that
+/// at the user's real login. Reads go through `effectiveKeychainService` /
+/// `configHomeURL` / `identityFileURL` instead, and CLI children get their
+/// environment from `ChildEnvironment.make(for:base:)`.
 public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var id: String
     public var label: String
@@ -62,6 +105,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     /// `nil` → the app default (`defaultUsageRefreshSeconds`, 5 min); `0` →
     /// manual only (no auto-refresh); any positive value → that interval.
     public var usageRefreshSeconds: Int?
+    /// Where this account's login lives (see `AccountLoginSource`). Omitted
+    /// from `accounts.json` while `.managed`, so every inventory written before
+    /// this existed re-encodes byte-identically until the user picks the
+    /// default login for an account; a missing key decodes as `.managed`.
+    public var loginSource: AccountLoginSource
     public var createdAt: Date
     public var lastVerifiedAt: Date?
 
@@ -95,6 +143,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         pinned: Bool = true,
         excludedFromScheduling: Bool = false,
         usageRefreshSeconds: Int? = nil,
+        loginSource: AccountLoginSource = .managed,
         createdAt: Date = Date(),
         lastVerifiedAt: Date? = nil)
     {
@@ -112,6 +161,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.pinned = pinned
         self.excludedFromScheduling = excludedFromScheduling
         self.usageRefreshSeconds = usageRefreshSeconds
+        self.loginSource = loginSource
         self.createdAt = createdAt
         self.lastVerifiedAt = lastVerifiedAt
     }
@@ -152,8 +202,81 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? true
         excludedFromScheduling = try c.decodeIfPresent(Bool.self, forKey: .excludedFromScheduling) ?? false
         usageRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .usageRefreshSeconds)
+        // Forgiving: absent *or* unrecognized (a value from a newer build) reads
+        // as `.managed`, never as a failed inventory load.
+        loginSource = (try? c.decodeIfPresent(AccountLoginSource.self, forKey: .loginSource)) ?? .managed
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         lastVerifiedAt = try c.decodeIfPresent(Date.self, forKey: .lastVerifiedAt)
+    }
+
+    /// Spelled out because both coding directions are hand-written now (the
+    /// compiler only synthesizes keys while one of them is synthesized).
+    enum CodingKeys: String, CodingKey {
+        case id, label, color, provider, home, sourceHome, rank, reservedHours, status
+        case identityEmail, keychainService, pinned, excludedFromScheduling, usageRefreshSeconds
+        case loginSource, createdAt, lastVerifiedAt
+    }
+
+    /// Mirrors what the synthesized encoder wrote before `loginSource` existed
+    /// (optionals via `encodeIfPresent`), plus `loginSource` only when it isn't
+    /// `.managed` — the byte-identical-inventory guarantee on that property.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(label, forKey: .label)
+        try c.encode(color, forKey: .color)
+        try c.encode(provider, forKey: .provider)
+        try c.encode(home, forKey: .home)
+        try c.encodeIfPresent(sourceHome, forKey: .sourceHome)
+        try c.encodeIfPresent(rank, forKey: .rank)
+        try c.encodeIfPresent(reservedHours, forKey: .reservedHours)
+        try c.encode(status, forKey: .status)
+        try c.encodeIfPresent(identityEmail, forKey: .identityEmail)
+        try c.encodeIfPresent(keychainService, forKey: .keychainService)
+        try c.encode(pinned, forKey: .pinned)
+        try c.encode(excludedFromScheduling, forKey: .excludedFromScheduling)
+        try c.encodeIfPresent(usageRefreshSeconds, forKey: .usageRefreshSeconds)
+        if loginSource != .managed { try c.encode(loginSource, forKey: .loginSource) }
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encodeIfPresent(lastVerifiedAt, forKey: .lastVerifiedAt)
+    }
+
+    // MARK: Login source
+
+    /// Whether this account uses the provider's default login as its home
+    /// (see `AccountLoginSource.providerDefault`).
+    public var tracksDefaultLogin: Bool { loginSource == .providerDefault }
+
+    /// The Keychain service the official CLI keeps this account's Claude login
+    /// in, and so the one usage reads (and the post-refresh re-read) use. A
+    /// default-login account's is the provider's unsuffixed default item —
+    /// what the CLI picks with `CLAUDE_CONFIG_DIR` unset; the stored
+    /// `keychainService` (the managed home's item) is kept untouched so the
+    /// account can be switched back.
+    public var effectiveKeychainService: String? {
+        tracksDefaultLogin ? provider.defaultKeychainService : keychainService
+    }
+
+    /// The config home the CLI actually uses for this account: the managed
+    /// home, or the provider's default (`~/.claude` / `~/.codex`) for a
+    /// default-login account. Credential *files* (Codex's `auth.json` and
+    /// `config.toml`) are read from here, the app reveals it, and a custom
+    /// ping's `AGENT_MANAGER_CONFIG_HOME` names it. Never pass it to anything
+    /// that writes, deletes, or symlinks: for a default-login account it is the
+    /// user's own folder, and only the official CLI may write there.
+    public func configHomeURL(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL
+    {
+        tracksDefaultLogin ? provider.defaultSourceHome(homeDirectory: homeDirectory) : homeURL
+    }
+
+    /// The identity file this account's email / org UUID are read from.
+    public func identityFileURL(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL
+    {
+        tracksDefaultLogin
+            ? provider.defaultIdentityFile(homeDirectory: homeDirectory)
+            : homeURL.appendingPathComponent(provider.identityFileName)
     }
 }
 

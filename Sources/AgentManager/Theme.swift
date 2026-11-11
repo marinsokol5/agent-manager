@@ -145,12 +145,3 @@ extension AccountStatus {
         }
     }
 }
-
-extension Provider {
-    var displayName: String {
-        switch self {
-        case .claude: "Claude"
-        case .codex: "Codex"
-        }
-    }
-}
