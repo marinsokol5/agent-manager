@@ -183,6 +183,16 @@ struct AccountRowView: View {
                     }
                     .disabled(isBusy)
                     .help("Anchor this account's 5h window with a tiny interactive turn")
+
+                    // Still `connected` on paper, but the provider says the
+                    // login is over — offer the fix where the error is shown.
+                    if model.usageLoginRequired.contains(account.id) {
+                        Button { showingLogin = true } label: {
+                            Label("Log in again", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .help("This account's login ended — log in again")
+                    }
                 } else {
                     Button { showingLogin = true } label: {
                         Label("Log in", systemImage: "rectangle.portrait.and.arrow.right")
@@ -331,6 +341,15 @@ struct AccountRowView: View {
                     usageBar(title: "Weekly · 7d",
                              remainingPercent: reading.effectiveSecondaryRemainingPercent(),
                              resetsAt: reading.secondaryResetsAt)
+                }
+                // The bars above are the last *cached* reading; when refreshing
+                // is failing, say so right under them instead of only when
+                // there is nothing cached.
+                if let problem = model.usageProblem(for: account.id) {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             } else {
                 Text(model.usageErrors[account.id] ?? "Fetching usage…")

@@ -199,6 +199,24 @@ final class AppModel {
     /// refreshed per-account on its own cadence.
     var usageReadings: [String: UsageReading] = [:]
     var usageErrors: [String: String] = [:]
+    /// Accounts whose last usage fetch failed in a way only a fresh login fixes
+    /// (`UsageFetchError.requiresLogin`). Drives the immediate "sign in" state
+    /// and the row's Log in button for an account that still reads `connected`.
+    var usageLoginRequired: Set<String> = []
+
+    /// Why this account's displayed usage can't be trusted right now, or `nil`
+    /// when it can. The menu bar used to keep showing the last cached reading
+    /// through any failure — and since an expired 5h window reads as "100%
+    /// left", a dead login looked like a full, healthy session. A failing
+    /// refresh now counts as a problem as soon as it needs a login, there is
+    /// nothing cached, or the cached reading has gone stale; a transient
+    /// failure over a recent reading stays quiet so the percent doesn't flicker.
+    func usageProblem(for id: String, now: Date = Date()) -> String? {
+        guard let message = usageErrors[id] else { return nil }
+        if usageLoginRequired.contains(id) { return message }
+        guard let reading = usageReadings[id] else { return message }
+        return reading.isStale(now: now) ? message : nil
+    }
     /// On-disk last-known usage, so the menu bar shows numbers without an eager
     /// network fetch on every launch.
     private let usageCache: UsageCache
@@ -697,6 +715,7 @@ final class AppModel {
                 let reading = try await loadUsage(for: account, userInitiated: userInitiated)
                 usageReadings[id] = reading
                 usageErrors.removeValue(forKey: id)
+                usageLoginRequired.remove(id)
                 usageCache.save(usageReadings)
             } catch UsageFetchError.keychainAccessDeferred {
                 // Background read can't prompt; keep cached usage. Only nudge the
@@ -708,6 +727,11 @@ final class AppModel {
                 let msg = error.localizedDescription
                 fputs("[usage] \(id): \(msg)\n", stderr)
                 usageErrors[id] = msg
+                if (error as? UsageFetchError)?.requiresLogin == true {
+                    usageLoginRequired.insert(id)
+                } else {
+                    usageLoginRequired.remove(id)
+                }
             }
         }
     }
@@ -721,7 +745,15 @@ final class AppModel {
             guard let service = account.keychainService else { throw UsageFetchError.keychainReadFailed }
             // Read the credential ONCE. Background reads are no-UI (never prompt);
             // only a user-initiated refresh may pop the dialog.
-            guard var credentials = ClaudeCredentials.read(keychainService: service, allowInteraction: userInitiated) else {
+            var credentials: ClaudeCredentials.Blob
+            switch ClaudeCredentials.status(keychainService: service, allowInteraction: userInitiated) {
+            case let .valid(blob): credentials = blob
+            // The read worked and the login is gone: report it even on a
+            // background poll (this is not a deferred Keychain grant), and
+            // don't try a refresh — there is no refresh token left to use.
+            case let .signedOut(reason):
+                throw UsageFetchError.loginEnded(accountID: account.id, reason: reason)
+            case nil:
                 // Couldn't read silently — keep cached usage unless the user asked.
                 throw userInitiated ? UsageFetchError.tokenDecodeFailed : UsageFetchError.keychainAccessDeferred
             }

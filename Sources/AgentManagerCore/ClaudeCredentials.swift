@@ -6,14 +6,42 @@ import Foundation
 /// `ClaudeTokenRefresher`); duplicating the OAuth refresh here would make us a
 /// second writer that has to mirror refresh-token rotation atomically.
 public enum ClaudeCredentials {
-    public struct Blob: Sendable {
+    public struct Blob: Sendable, Equatable {
         public let accessToken: String
         public let expiresAt: Date?
     }
 
+    /// What the credential item says about this account's login.
+    ///
+    /// `.signedOut` exists because "the item is readable but holds no token" is
+    /// a different fact from "we couldn't read the item", and conflating them
+    /// hid a real outage: Claude Code gives a login a hard lifetime
+    /// (`refreshTokenExpiresAt`), and when it runs out the CLI keeps the item
+    /// but blanks it — `accessToken: ""`, `expiresAt: 0`, and
+    /// `loginEnded: "time_limit"`. Read as "undecodable", a background poll
+    /// took that for a deferred Keychain grant and kept showing day-old cached
+    /// usage forever. No refresh can revive such a login (the refresh token is
+    /// gone too), so callers must surface it — even on a background read — and
+    /// never answer it with a delegated `/status`.
+    public enum Status: Sendable, Equatable {
+        case valid(Blob)
+        /// The CLI's own `loginEnded` reason when it left one (`"time_limit"`),
+        /// else `nil` (e.g. a plain `/logout`). A label, never a secret.
+        case signedOut(reason: String?)
+    }
+
     public static func read(keychainService service: String, allowInteraction: Bool = false) -> Blob? {
+        guard case let .valid(blob) = status(keychainService: service, allowInteraction: allowInteraction)
+        else { return nil }
+        return blob
+    }
+
+    /// One Keychain read, classified. `nil` = the item couldn't be read (absent,
+    /// not granted, or not JSON) — the only case a background caller may treat
+    /// as "deferred, keep cached usage".
+    public static func status(keychainService service: String, allowInteraction: Bool = false) -> Status? {
         guard let data = readData(service: service, allowInteraction: allowInteraction) else { return nil }
-        return parse(data)
+        return classify(data)
     }
 
     /// Strategy-aware raw read. See `KeychainReadStrategy` for the full rationale.
@@ -54,11 +82,21 @@ public enum ClaudeCredentials {
     }
 
     static func parse(_ data: Data) -> Blob? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = root["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String, !token.isEmpty
-        else { return nil }
-        return Blob(accessToken: token, expiresAt: parseExpiry(oauth["expiresAt"]))
+        guard case let .valid(blob) = classify(data) else { return nil }
+        return blob
+    }
+
+    /// Pure classifier for the credential JSON. Any well-formed blob without a
+    /// usable access token is `.signedOut` — that covers the blanked
+    /// `claudeAiOauth` the CLI leaves when a login ends, and an item that only
+    /// still holds `mcpOAuth` entries after a logout. Only non-JSON is `nil`.
+    static func classify(_ data: Data) -> Status? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let oauth = root["claudeAiOauth"] as? [String: Any]
+        guard let token = oauth?["accessToken"] as? String, !token.isEmpty else {
+            return .signedOut(reason: oauth?["loginEnded"] as? String)
+        }
+        return .valid(Blob(accessToken: token, expiresAt: parseExpiry(oauth?["expiresAt"])))
     }
 
     /// True when the token is missing, already expired, or within `margin` of

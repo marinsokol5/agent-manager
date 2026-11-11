@@ -255,6 +255,57 @@ final class ParsingTests: XCTestCase {
         XCTAssertEqual(blob.expiresAt, Date(timeIntervalSince1970: expMillis / 1000))
     }
 
+    /// The blob Claude Code leaves when a login reaches its time limit: the item
+    /// still reads, but the tokens are blanked. That is "signed out", not
+    /// "undecodable" — the distinction is what lets a background poll report it.
+    func testClaudeCredentialsClassifiesEndedLoginAsSignedOut() {
+        let ended = #"""
+        {"mcpOAuth":{"x|1":{"accessToken":"mcp-token"}},
+         "claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,
+                          "refreshTokenExpiresAt":1794332372000,"loginEnded":"time_limit",
+                          "subscriptionType":"max"}}
+        """#
+        XCTAssertEqual(ClaudeCredentials.classify(Data(ended.utf8)), .signedOut(reason: "time_limit"))
+        XCTAssertNil(ClaudeCredentials.parse(Data(ended.utf8)))
+
+        // A logout that leaves only MCP entries (or no reason) is signed out too.
+        let mcpOnly = #"{"mcpOAuth":{"x|1":{"accessToken":"mcp-token"}}}"#
+        XCTAssertEqual(ClaudeCredentials.classify(Data(mcpOnly.utf8)), .signedOut(reason: nil))
+
+        // Only non-JSON is "couldn't read"; a live token is valid.
+        XCTAssertNil(ClaudeCredentials.classify(Data("not json".utf8)))
+        let live = #"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","expiresAt":1782392410000}}"#
+        guard case .valid = ClaudeCredentials.classify(Data(live.utf8)) else {
+            return XCTFail("a blob with an access token must classify as valid")
+        }
+    }
+
+    func testLoginEndedErrorNamesTheManagedLoginAndRequiresLogin() {
+        let timeLimit = UsageFetchError.loginEnded(accountID: "claude-ms55", reason: "time_limit")
+        let message = timeLimit.errorDescription ?? ""
+        XCTAssertTrue(message.contains("time limit"))
+        XCTAssertTrue(message.contains("am run claude-ms55"))
+        XCTAssertTrue(UsageFetchError.loginEnded(accountID: "a", reason: nil)
+            .errorDescription?.contains("signed out") ?? false)
+
+        XCTAssertTrue(timeLimit.requiresLogin)
+        XCTAssertTrue(UsageFetchError.unauthorized.requiresLogin)
+        XCTAssertFalse(UsageFetchError.rateLimited(retryAfter: nil).requiresLogin)
+        XCTAssertFalse(UsageFetchError.refreshDeferred.requiresLogin)
+    }
+
+    func testUsageReadingStalenessAndDayFreshnessLabel() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        func reading(age: TimeInterval) -> UsageReading {
+            UsageReading(primaryUsedPercent: 0, primaryResetsAt: nil, secondaryUsedPercent: 0,
+                         secondaryResetsAt: nil, fetchedAt: now.addingTimeInterval(-age))
+        }
+        XCTAssertFalse(reading(age: 600).isStale(now: now))
+        XCTAssertTrue(reading(age: 3601).isStale(now: now))
+        XCTAssertEqual(reading(age: 27 * 3600).freshnessLabel(now: now), "27h ago")
+        XCTAssertEqual(reading(age: 3 * 86400 + 5).freshnessLabel(now: now), "3d ago")
+    }
+
     func testClaudeCredentialsNeedsRefreshHonorsMarginAndUnknowns() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         func blob(_ exp: Date?) -> ClaudeCredentials.Blob { .init(accessToken: "t", expiresAt: exp) }

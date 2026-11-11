@@ -28,8 +28,13 @@ public enum UsageService {
 
         case .claude:
             guard let service = account.keychainService else { throw UsageFetchError.keychainReadFailed }
-            guard var creds = ClaudeCredentials.read(keychainService: service, allowInteraction: allowInteraction) else {
-                throw UsageFetchError.tokenDecodeFailed
+            var creds: ClaudeCredentials.Blob
+            switch ClaudeCredentials.status(keychainService: service, allowInteraction: allowInteraction) {
+            case let .valid(blob): creds = blob
+            // A blanked login can't be refreshed — say so rather than spawn
+            // `/status` (or report an unreadable store).
+            case let .signedOut(reason): throw UsageFetchError.loginEnded(accountID: account.id, reason: reason)
+            case nil: throw UsageFetchError.tokenDecodeFailed
             }
             let mayRefresh = ClaudeTokenRefresher.mayRefresh(
                 userInitiated: allowInteraction, lastReading: cachedReading)

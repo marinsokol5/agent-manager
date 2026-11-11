@@ -90,11 +90,24 @@ public struct UsageReading: Codable, Sendable, Equatable {
         return "resets in \(minutes)m"
     }
 
-    /// Freshness label: "Xs ago" / "Xm ago" / "Xh ago".
+    /// How old a reading may get, *while refreshes are failing*, before surfaces
+    /// stop presenting it as current. An hour rides out a 429 backoff or a
+    /// network blip (so the percent doesn't flicker away) but not an outage.
+    public static let staleAfter: TimeInterval = 3600
+
+    /// Whether this reading is too old to present as current. Only meaningful
+    /// alongside a failing refresh: an old reading with *no* error is the
+    /// by-design quiet state (e.g. a deferred token refresh overnight).
+    public func isStale(now: Date = Date(), maxAge: TimeInterval = UsageReading.staleAfter) -> Bool {
+        now.timeIntervalSince(fetchedAt) > maxAge
+    }
+
+    /// Freshness label: "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago" (days from 48h).
     public func freshnessLabel(now: Date = Date()) -> String {
         let age = Int(now.timeIntervalSince(fetchedAt))
         if age < 60 { return "\(age)s ago" }
         if age < 3600 { return "\(age / 60)m ago" }
-        return "\(age / 3600)h ago"
+        if age < 172_800 { return "\(age / 3600)h ago" }
+        return "\(age / 86400)d ago"
     }
 }

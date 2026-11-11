@@ -23,6 +23,15 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
     /// `auth.json`'s own `last_refresh` stamp — a timestamp, not a secret — so
     /// a re-login that landed elsewhere shows up as a file that kept aging.
     case tokenRevoked(accountID: String, lastRefresh: Date?)
+    /// Claude only: the credential item is readable but the CLI has blanked it
+    /// — the login is over (see `ClaudeCredentials.Status.signedOut`). Its own
+    /// case, not `.tokenDecodeFailed`, for the same reason `.tokenRevoked`
+    /// exists: the fix is a login in *this account's managed home*, and a
+    /// working default login (the Claude desktop app, a plain `claude`) makes
+    /// it look like nothing is wrong — those use a different Keychain item.
+    /// Thrown on background reads too, so no surface keeps showing the dead
+    /// session's cached numbers as if they were live.
+    case loginEnded(accountID: String, reason: String?)
     case rateLimited(retryAfter: Date?)
     case serverError(Int)
     /// A background read needs the Keychain prompt we won't show; keep cached
@@ -46,6 +55,8 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
             "Usage API rejected the token (401/403) — re-login this account."
         case let .tokenRevoked(accountID, lastRefresh):
             Self.tokenRevokedMessage(accountID: accountID, lastRefresh: lastRefresh)
+        case let .loginEnded(accountID, reason):
+            Self.loginEndedMessage(accountID: accountID, reason: reason)
         case .keychainAccessDeferred:
             "Click “Refresh usage” to allow Keychain access."
         case .refreshDeferred:
@@ -59,6 +70,26 @@ public enum UsageFetchError: Error, LocalizedError, Sendable {
         case let .serverError(code):
             "Usage API returned HTTP \(code)."
         }
+    }
+
+    /// Whether the only fix is logging this account in again — waiting or
+    /// retrying never clears it, so surfaces flag it immediately instead of
+    /// waiting for the cached reading to age.
+    public var requiresLogin: Bool {
+        switch self {
+        case .loginEnded, .tokenRevoked, .unauthorized: true
+        default: false
+        }
+    }
+
+    /// `.loginEnded`'s text. `time_limit` is the CLI's reason for a login that
+    /// reached its fixed lifetime; anything else reads as a plain sign-out.
+    static func loginEndedMessage(accountID: String, reason: String?) -> String {
+        let why = reason == "time_limit"
+            ? "Claude Code ended this account's login (it reached its time limit)."
+            : "This account is signed out of Claude Code."
+        return why + " Log in again with the app's Log in button, or run “am run \(accountID)” and use /login"
+            + " — the Claude desktop app and a plain “claude” use a separate login."
     }
 
     /// `.tokenRevoked`'s text, with `now` injected so tests can pin the age.

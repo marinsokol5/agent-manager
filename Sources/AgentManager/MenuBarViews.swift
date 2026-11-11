@@ -24,6 +24,8 @@ struct MergedMenuView: View {
                         MergedAgentRow(
                             account: account,
                             reading: model.usageReadings[account.id],
+                            problem: model.usageProblem(for: account.id),
+                            needsLogin: model.usageLoginRequired.contains(account.id),
                             isRecommended: account.id == recommendedID)
                     }
                 }
@@ -51,6 +53,10 @@ struct MergedMenuView: View {
 private struct MergedAgentRow: View {
     let account: Account
     let reading: UsageReading?
+    /// Non-nil when the reading can't be trusted (see `AppModel.usageProblem`):
+    /// the row then shows why instead of a percent.
+    var problem: String? = nil
+    var needsLogin: Bool = false
     let isRecommended: Bool
 
     var body: some View {
@@ -62,12 +68,17 @@ private struct MergedAgentRow: View {
                 Text(account.label)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                SessionSummary(reading: reading,
-                               isRecommended: isRecommended,
-                               tint: Color(hex: account.color))
+                if problem != nil {
+                    UsageProblemLine(needsLogin: needsLogin, reading: reading)
+                } else {
+                    SessionSummary(reading: reading,
+                                   isRecommended: isRecommended,
+                                   tint: Color(hex: account.color))
+                }
             }
+            .help(problem ?? "")
             Spacer(minLength: 0)
-            PercentBadge(remaining: reading?.effectivePrimaryRemainingPercent())
+            PercentBadge(remaining: problem == nil ? reading?.effectivePrimaryRemainingPercent() : nil)
         }
     }
 }
@@ -114,6 +125,28 @@ private struct SessionSummary: View {
     }
 }
 
+/// One-line stand-in for the session summary when usage can't be refreshed:
+/// what's wrong, and how old the last good reading is.
+private struct UsageProblemLine: View {
+    let needsLogin: Bool
+    let reading: UsageReading?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9))
+            Text(text).font(.system(size: 11, weight: .medium))
+        }
+        .foregroundStyle(Theme.warning)
+        .lineLimit(1)
+    }
+
+    private var text: String {
+        let lead = needsLogin ? "Signed out — log in again" : "Can't refresh usage"
+        guard let reading else { return lead }
+        return "\(lead) · last \(reading.freshnessLabel())"
+    }
+}
+
 /// Individual dropdown: the full picture for one agent — identity + both windows.
 struct IndividualMenuView: View {
     let account: Account
@@ -121,6 +154,7 @@ struct IndividualMenuView: View {
     let close: () -> Void
 
     private var reading: UsageReading? { model.usageReadings[account.id] }
+    private var problem: String? { model.usageProblem(for: account.id) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -128,22 +162,40 @@ struct IndividualMenuView: View {
                 .padding(.horizontal, 14)
                 .padding(.top, 13)
 
+            if let problem {
+                // The reading is not current: say why, and blank the windows
+                // below rather than present the last numbers as live.
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+                    Text(problem)
+                        .font(.system(size: 11.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(Theme.warning)
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+            }
+
             VStack(alignment: .leading, spacing: 12) {
                 UsageWindowRow(
                     title: "Session", subtitle: "5-hour window",
-                    remaining: reading?.effectivePrimaryRemainingPercent(), resetsAt: reading?.primaryResetsAt)
+                    remaining: problem == nil ? reading?.effectivePrimaryRemainingPercent() : nil,
+                    resetsAt: problem == nil ? reading?.primaryResetsAt : nil)
                 UsageWindowRow(
                     title: "Weekly", subtitle: "7-day window",
-                    remaining: reading?.effectiveSecondaryRemainingPercent(), resetsAt: reading?.secondaryResetsAt)
+                    remaining: problem == nil ? reading?.effectiveSecondaryRemainingPercent() : nil,
+                    resetsAt: problem == nil ? reading?.secondaryResetsAt : nil)
             }
             .padding(.horizontal, 14)
             .padding(.top, 12)
             .padding(.bottom, 4)
 
             if let reading {
-                Text("Updated \(reading.freshnessLabel())")
+                Text(problem == nil
+                    ? "Updated \(reading.freshnessLabel())"
+                    : "Last updated \(reading.freshnessLabel()) — not current")
                     .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(problem == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Theme.warning))
                     .padding(.horizontal, 14)
                     .padding(.bottom, 2)
             }

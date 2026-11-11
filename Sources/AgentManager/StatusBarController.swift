@@ -150,9 +150,14 @@ final class StatusBarController {
             if let id = entry.accountID, let account = model.accounts.first(where: { $0.id == id }) {
                 // Expiry-aware: once the 5h window has reset, show a full window
                 // (100%) rather than the finished window's stale figure.
-                let percent = model.usageReadings[id]?.effectivePrimaryRemainingPercent()
+                // A reading we can't refresh is not shown as a number at all:
+                // "!" under the glyph instead of a confident stale percent
+                // (see `AppModel.usageProblem`).
+                let label = model.usageProblem(for: id) != nil
+                    ? "!"
+                    : model.usageReadings[id]?.effectivePrimaryRemainingPercent().map { "\($0)%" }
                 setButtonImage(
-                    Self.brandPercentImage(brand: brandGlyph(for: account.provider), percent: percent),
+                    Self.brandPercentImage(brand: brandGlyph(for: account.provider), label: label),
                     for: button)
             } else {
                 // Merged (and the empty-state fallback) shows just the agents
@@ -220,11 +225,11 @@ final class StatusBarController {
     /// `.imageAbove` overlaps the two — drawing them ourselves (glyph pinned top,
     /// % flush bottom, in black so the template mask keeps full alpha) lets the
     /// system tint it bright white and keeps both crisp.
-    private static func brandPercentImage(brand: NSImage, percent: Int?) -> NSImage {
+    private static func brandPercentImage(brand: NSImage, label: String?) -> NSImage {
         let height = NSStatusBar.system.thickness // typically 22pt
         let glyphSize: CGFloat = 11
 
-        guard let percent else {
+        guard let label else {
             // No reading yet — center the glyph on its own.
             let image = NSImage(size: NSSize(width: glyphSize + 2, height: height))
             image.lockFocus()
@@ -238,7 +243,7 @@ final class StatusBarController {
 
         let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
-        let attributed = NSAttributedString(string: "\(percent)%", attributes: attributes)
+        let attributed = NSAttributedString(string: label, attributes: attributes)
         let textSize = attributed.size()
         let width = max(glyphSize, ceil(textSize.width)) + 2
 
